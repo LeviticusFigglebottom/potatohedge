@@ -10,6 +10,7 @@ import PriceChart from '@/components/charts/PriceChart';
 import GEXChart from '@/components/charts/GEXChart';
 import OptionsChainTable from '@/components/options/OptionsChainTable';
 import InterpretationsPanel from '@/components/dashboard/InterpretationsPanel';
+import RecommendationsPanel from '@/components/dashboard/RecommendationsPanel';
 import DealerTab from '@/components/dashboard/DealerTab';
 import VolatilityTab from '@/components/dashboard/VolatilityTab';
 import { Activity, Zap } from 'lucide-react';
@@ -27,6 +28,7 @@ function OverviewTab() {
         </div>
       </div>
       <InterpretationsPanel />
+      <RecommendationsPanel />
     </div>
   );
 }

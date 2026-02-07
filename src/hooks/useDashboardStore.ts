@@ -44,6 +44,22 @@ export interface SnapshotData {
 
 export type TabId = 'overview' | 'chain' | 'dealer' | 'volatility';
 
+export interface RecommendationData {
+  symbol: string;
+  spotPrice: number;
+  overallBias: 'bullish' | 'bearish' | 'neutral';
+  biasScore: number;
+  volRegime: 'high' | 'mid' | 'low';
+  gammaRegime: 'long' | 'short' | 'neutral';
+  signals: { name: string; direction: string; weight: number; description: string }[];
+  trades: {
+    strategy: string; direction: string; confidence: string; score: number;
+    expiration: string; strikes: string; entry: string; risk: string;
+    reasoning: string[]; tags: string[];
+  }[];
+  warnings: string[];
+}
+
 interface DashboardStore {
   activeTab: TabId;
   setActiveTab: (tab: TabId) => void;
@@ -56,6 +72,7 @@ interface DashboardStore {
   interval: Interval;
   multiGEX: MultiGEXData | null;
   snapshot: SnapshotData | null;
+  recommendations: RecommendationData | null;
   loading: Record<string, boolean>;
   error: string | null;
   lastUpdate: number;
@@ -69,6 +86,7 @@ interface DashboardStore {
   fetchChain: () => Promise<void>;
   fetchMultiGEX: () => Promise<void>;
   fetchSnapshot: () => Promise<void>;
+  fetchRecommendations: () => Promise<void>;
   loadSymbol: (s: string) => Promise<void>;
 }
 
@@ -84,7 +102,7 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
 
   symbol: 'SPY', quote: null, history: [], chain: null,
   expirations: [], selectedExpiration: null, interval: '1D',
-  multiGEX: null, snapshot: null,
+  multiGEX: null, snapshot: null, recommendations: null,
   loading: {}, error: null, lastUpdate: 0,
 
   setSymbol: (symbol) => set({ symbol: symbol.toUpperCase() }),
@@ -143,12 +161,21 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     } catch (e) { set(s => ({ loading: { ...s.loading, snapshot: false }, error: (e as Error).message })); }
   },
 
+  fetchRecommendations: async () => {
+    set(s => ({ loading: { ...s.loading, recommendations: true } }));
+    try {
+      const recommendations = await api(`/api/market/recommendations?symbol=${get().symbol}`);
+      set(s => ({ recommendations, loading: { ...s.loading, recommendations: false } }));
+    } catch (e) { set(s => ({ loading: { ...s.loading, recommendations: false }, error: (e as Error).message })); }
+  },
+
   loadSymbol: async (symbol: string) => {
     set({
       symbol: symbol.toUpperCase(), quote: null, history: [], chain: null,
-      expirations: [], selectedExpiration: null, multiGEX: null, snapshot: null, error: null,
+      expirations: [], selectedExpiration: null, multiGEX: null, snapshot: null,
+      recommendations: null, error: null,
     });
     await Promise.allSettled([get().fetchQuote(), get().fetchHistory(), get().fetchExpirations()]);
-    Promise.allSettled([get().fetchMultiGEX(), get().fetchSnapshot()]);
+    Promise.allSettled([get().fetchMultiGEX(), get().fetchSnapshot(), get().fetchRecommendations()]);
   },
 }));

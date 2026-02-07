@@ -1,7 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getOptionsSnapshot } from '@/lib/providers/polygon';
 import { getEquityHistory } from '@/lib/providers/polygon';
-import { computeIVRankPercentile, computeHistoricalVolatility, interpretIV, type IVContext } from '@/lib/math/analytics';
+import { getOptionsChain, getExpirations } from '@/lib/providers/tradier';
+import {
+  computeIVRankPercentile,
+  computeHistoricalVolatility,
+  interpretIV,
+  type IVContext,
+} from '@/lib/math/analytics';
 
 export const maxDuration = 30;
 
@@ -11,69 +17,114 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'symbol required' }, { status: 400 });
   }
 
+  const ticker = symbol.toUpperCase();
+
   try {
-    // Fetch Polygon options snapshot + historical equity data in parallel
-    const [snapshot, historyBars] = await Promise.all([
-      getOptionsSnapshot(symbol.toUpperCase()).catch(() => []),
+    // Fetch all data sources in parallel:
+    // 1. Tradier nearest chain (reliable ORATS IV)
+    // 2. Polygon equity history (for HV computation)
+    // 3. Polygon options snapshot (for term structure + skew surface)
+    const [expirations, historyBars, polygonSnapshot] = await Promise.all([
+      getExpirations(ticker).catch(() => []),
       getEquityHistory(
-        symbol.toUpperCase(), 1, 'day',
-        new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+        ticker, 1, 'day',
+        new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
         new Date().toISOString().split('T')[0]
       ).catch(() => []),
+      getOptionsSnapshot(ticker).catch(() => []),
     ]);
 
-    const spotPrice = snapshot[0]?.underlying_asset?.price || 0;
+    // Fetch nearest 3 Tradier chains for ATM IV across expirations
+    const nearExps = expirations.slice(0, 3);
+    const tradierChains = await Promise.all(
+      nearExps.map(e => getOptionsChain(ticker, e.date).catch(() => null))
+    ).then(chains => chains.filter((c): c is NonNullable<typeof c> => c !== null));
 
-    // Compute current ATM IV from snapshot
-    const atm = snapshot
-      .filter(o => Math.abs(o.details.strike_price - spotPrice) / spotPrice < 0.03 && o.implied_volatility > 0)
-      .sort((a, b) => Math.abs(a.details.strike_price - spotPrice) - Math.abs(b.details.strike_price - spotPrice));
+    const spotPrice = tradierChains[0]?.underlyingPrice ||
+      polygonSnapshot[0]?.underlying_asset?.price || 0;
 
-    const currentIV = atm.length > 0
-      ? atm.slice(0, 4).reduce((s, o) => s + o.implied_volatility, 0) / Math.min(4, atm.length)
-      : 0;
+    // ── Current ATM IV from Tradier (primary, reliable) ──
+    let currentIV = 0;
+    const tradierATMIVs: number[] = [];
 
-    // Extract IV time series from snapshot expirations as proxy
-    // For proper IV history we'd need historical chain data; use snapshot variance as approximation
-    const ivByExpiration = new Map<string, number[]>();
-    for (const opt of snapshot) {
-      if (opt.implied_volatility > 0 && opt.implied_volatility < 3) {
-        const exp = opt.details.expiration_date;
-        if (!ivByExpiration.has(exp)) ivByExpiration.set(exp, []);
-        ivByExpiration.get(exp)!.push(opt.implied_volatility);
+    for (const chain of tradierChains.slice(0, 1)) { // nearest expiration only
+      const allOpts = [...chain.calls, ...chain.puts];
+      const atm = allOpts
+        .filter(o =>
+          Math.abs(o.strike - spotPrice) / spotPrice < 0.02 &&
+          o.impliedVolatility > 0.01 &&
+          o.impliedVolatility < 3
+        )
+        .sort((a, b) =>
+          Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice)
+        );
+      for (const o of atm.slice(0, 6)) {
+        tradierATMIVs.push(o.impliedVolatility);
       }
     }
 
-    // IV term structure (ATM IV per expiration)
+    if (tradierATMIVs.length > 0) {
+      currentIV = tradierATMIVs.reduce((s, v) => s + v, 0) / tradierATMIVs.length;
+    }
+
+    // ── IV Term Structure from Tradier chains ──
     const termStructure: { expiration: string; dte: number; atmIV: number }[] = [];
-    const now = new Date();
-    for (const [exp, ivs] of ivByExpiration.entries()) {
-      const dte = Math.ceil((new Date(exp).getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
-      if (dte <= 0 || dte > 365) continue;
+    for (const chain of tradierChains) {
+      const allOpts = [...chain.calls, ...chain.puts];
+      const atm = allOpts
+        .filter(o =>
+          Math.abs(o.strike - spotPrice) / spotPrice < 0.03 &&
+          o.impliedVolatility > 0.01
+        )
+        .sort((a, b) =>
+          Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice)
+        );
+      if (atm.length > 0) {
+        const atmIV = atm.slice(0, 4).reduce((s, o) => s + o.impliedVolatility, 0) / Math.min(4, atm.length);
+        const dte = atm[0].dte;
+        termStructure.push({ expiration: chain.expiration, dte, atmIV });
+      }
+    }
 
-      // Find near-ATM options for this expiration
-      const expOpts = snapshot.filter(o =>
-        o.details.expiration_date === exp &&
-        Math.abs(o.details.strike_price - spotPrice) / spotPrice < 0.05 &&
-        o.implied_volatility > 0
-      );
-      if (expOpts.length === 0) continue;
+    // Supplement term structure from Polygon snapshot for longer-dated
+    if (polygonSnapshot.length > 0) {
+      const coveredExps = new Set(termStructure.map(t => t.expiration));
+      const now = new Date();
+      const ivByExp = new Map<string, { ivs: number[]; dte: number }>();
 
-      const atmIV = expOpts.reduce((s, o) => s + o.implied_volatility, 0) / expOpts.length;
-      termStructure.push({ expiration: exp, dte, atmIV });
+      for (const opt of polygonSnapshot) {
+        if (opt.implied_volatility > 0.01 && opt.implied_volatility < 3) {
+          const exp = opt.details.expiration_date;
+          if (coveredExps.has(exp)) continue;
+          if (Math.abs(opt.details.strike_price - spotPrice) / spotPrice > 0.05) continue;
+
+          const dte = Math.ceil((new Date(exp).getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+          if (dte <= 0 || dte > 365) continue;
+
+          if (!ivByExp.has(exp)) ivByExp.set(exp, { ivs: [], dte });
+          ivByExp.get(exp)!.ivs.push(opt.implied_volatility);
+        }
+      }
+
+      for (const [exp, data] of ivByExp.entries()) {
+        if (data.ivs.length > 0) {
+          const atmIV = data.ivs.reduce((s, v) => s + v, 0) / data.ivs.length;
+          termStructure.push({ expiration: exp, dte: data.dte, atmIV });
+        }
+      }
     }
     termStructure.sort((a, b) => a.dte - b.dte);
 
-    // Historical volatility from equity closes
+    // ── Historical Volatility from Polygon equity bars ──
     const closes = historyBars.map(b => b.c).reverse(); // newest first
     const hv20 = computeHistoricalVolatility(closes, 20);
     const hv60 = computeHistoricalVolatility(closes, 60);
 
-    // Simulate historical IV from HV with a premium (rough approximation)
-    // In production, you'd use Polygon historical options data or ORATS
+    // ── IV Rank/Percentile ──
+    // Build historical IV proxy from HV with typical premium
     const historicalIVs = closes.slice(0, 252).map((_, i) => {
       const localHV = computeHistoricalVolatility(closes.slice(i), 20);
-      return localHV * 1.15; // typical IV premium over HV
+      return localHV > 0 ? localHV * 1.15 : 0; // typical IV premium
     }).filter(v => v > 0);
 
     const ivMetrics = computeIVRankPercentile(currentIV, historicalIVs);
@@ -92,36 +143,80 @@ export async function GET(request: NextRequest) {
     };
     ivContext.interpretation = interpretIV(ivContext);
 
-    // Skew surface data (strike vs IV for each expiration)
-    const skewSurface: { expiration: string; dte: number; points: { strike: number; iv: number; type: string; delta: number }[] }[] = [];
-    for (const [exp, _] of ivByExpiration.entries()) {
-      const dte = Math.ceil((new Date(exp).getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
-      if (dte <= 0 || dte > 90) continue;
+    // ── Skew Surface from Tradier chains (reliable) + Polygon supplement ──
+    const skewSurface: {
+      expiration: string; dte: number;
+      points: { strike: number; iv: number; type: string; delta: number }[];
+    }[] = [];
 
-      const expOpts = snapshot
-        .filter(o => o.details.expiration_date === exp && o.implied_volatility > 0 && o.implied_volatility < 3)
-        .map(o => ({
-          strike: o.details.strike_price,
-          iv: o.implied_volatility,
-          type: o.details.contract_type,
-          delta: o.greeks?.delta ?? 0,
-        }))
-        .sort((a, b) => a.strike - b.strike);
-
-      if (expOpts.length > 3) {
-        skewSurface.push({ expiration: exp, dte, points: expOpts });
+    // Primary: Tradier chains
+    for (const chain of tradierChains) {
+      const points: { strike: number; iv: number; type: string; delta: number }[] = [];
+      for (const c of chain.calls) {
+        if (c.impliedVolatility > 0.01 && c.impliedVolatility < 3 &&
+            c.strike >= spotPrice * 0.85 && c.strike <= spotPrice * 1.15) {
+          points.push({ strike: c.strike, iv: c.impliedVolatility, type: 'call', delta: c.delta });
+        }
+      }
+      for (const p of chain.puts) {
+        if (p.impliedVolatility > 0.01 && p.impliedVolatility < 3 &&
+            p.strike >= spotPrice * 0.85 && p.strike <= spotPrice * 1.15) {
+          points.push({ strike: p.strike, iv: p.impliedVolatility, type: 'put', delta: p.delta });
+        }
+      }
+      if (points.length > 3) {
+        points.sort((a, b) => a.strike - b.strike);
+        skewSurface.push({
+          expiration: chain.expiration,
+          dte: chain.calls[0]?.dte ?? chain.puts[0]?.dte ?? 0,
+          points,
+        });
       }
     }
+
+    // Supplement: Polygon snapshot for additional expirations
+    if (polygonSnapshot.length > 0) {
+      const coveredExps = new Set(skewSurface.map(s => s.expiration));
+      const now = new Date();
+      const byExp = new Map<string, { points: typeof skewSurface[0]['points']; dte: number }>();
+
+      for (const opt of polygonSnapshot) {
+        const exp = opt.details.expiration_date;
+        if (coveredExps.has(exp)) continue;
+        if (opt.implied_volatility <= 0.01 || opt.implied_volatility >= 3) continue;
+        if (opt.details.strike_price < spotPrice * 0.85 || opt.details.strike_price > spotPrice * 1.15) continue;
+
+        const dte = Math.ceil((new Date(exp).getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+        if (dte <= 0 || dte > 90) continue;
+
+        if (!byExp.has(exp)) byExp.set(exp, { points: [], dte });
+        byExp.get(exp)!.points.push({
+          strike: opt.details.strike_price,
+          iv: opt.implied_volatility,
+          type: opt.details.contract_type,
+          delta: opt.greeks?.delta ?? 0,
+        });
+      }
+
+      for (const [exp, data] of byExp.entries()) {
+        if (data.points.length > 3) {
+          data.points.sort((a, b) => a.strike - b.strike);
+          skewSurface.push({ expiration: exp, dte: data.dte, points: data.points });
+        }
+      }
+    }
+
     skewSurface.sort((a, b) => a.dte - b.dte);
 
     return NextResponse.json({
-      symbol: symbol.toUpperCase(),
+      symbol: ticker,
       spotPrice,
       iv: ivContext,
       termStructure,
-      skewSurface: skewSurface.slice(0, 6), // Nearest 6 expirations
+      skewSurface: skewSurface.slice(0, 8),
       historicalVol: { hv20, hv60 },
-      snapshotCount: snapshot.length,
+      snapshotCount: polygonSnapshot.length,
+      tradierChainsUsed: tradierChains.length,
       timestamp: Date.now(),
     });
   } catch (error) {
