@@ -370,13 +370,19 @@ export default function MetricExplorer() {
           />
         </>
       ) : (
-        <div className="px-4 py-12 text-center">
-          <div className="text-sm font-mono text-text-muted mb-2">
-            Metric history will build over time
+        <div className="px-4 py-8 text-center space-y-3">
+          <div className="text-sm font-mono text-text-muted">
+            Accumulating metric history
           </div>
-          <p className="text-xs font-mono text-text-muted/60 max-w-md mx-auto leading-relaxed">
-            Each day you use the dashboard, today&apos;s metrics are saved locally.
-            Come back tomorrow to start seeing historical trends for {def.label} and every other metric.
+          <p className="text-xs font-mono text-text-muted/60 max-w-lg mx-auto leading-relaxed">
+            Historical options metrics (PCR, volume, GEX, dealer exposure) are not available
+            through market data APIs — they can only be computed from live chain data.
+            Each day you visit, today&apos;s metrics are saved to your browser&apos;s local storage.
+            After 2+ days, charts will appear here showing {def.label} and all other metrics over time
+            with averages and a price overlay.
+          </p>
+          <p className="text-[10px] font-mono text-text-muted/40">
+            Today&apos;s snapshot has been saved. History builds automatically with daily use.
           </p>
         </div>
       )}
