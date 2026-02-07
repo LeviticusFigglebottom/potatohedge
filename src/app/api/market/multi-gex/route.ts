@@ -128,8 +128,12 @@ export async function GET(request: NextRequest) {
     // OI concentration
     const oiAnalysis = analyzeOIConcentration(nearestChain.calls, nearestChain.puts);
 
-    // Volume context (using first chain vs rough averages)
-    const volumeCtx = interpretVolume(totalCallVol, totalPutVol, totalCallVol, totalPutVol, aggPCR);
+    // Volume context — use OI-based PCR as accumulated baseline.
+    // OI reflects historical positioning, volume reflects today's flow.
+    // Estimate average daily volume as ~5% of OI (typical turnover ratio).
+    const avgBaseCallVol = totalCallOI > 0 ? Math.round(totalCallOI * 0.05) : totalCallVol;
+    const avgBasePutVol = totalPutOI > 0 ? Math.round(totalPutOI * 0.05) : totalPutVol;
+    const volumeCtx = interpretVolume(totalCallVol, totalPutVol, avgBaseCallVol, avgBasePutVol, aggOIPCR);
 
     // Dealer positioning interpretation
     const dealerCtx = interpretDealerPositioning(

@@ -37,22 +37,49 @@ export default function AnalyticsCards() {
   const iv = snapshot?.iv;
   const pcr = vol ? vol.volumePCR : 0;
 
-  // PCR context
+  const ctx = multiGEX?.context;
+
+  // PCR context — compare today's volume PCR to accumulated OI PCR
+  const oiPCR = vol?.oiPCR ?? 0;
   let pcrColor = 'text-text-primary';
   let pcrSub = 'Neutral range';
   if (pcr > 1.2) { pcrColor = 'text-accent-red'; pcrSub = 'Elevated puts — bearish/hedging'; }
   else if (pcr > 0.9) { pcrColor = 'text-accent-amber'; pcrSub = 'Slightly put-heavy'; }
   else if (pcr < 0.6) { pcrColor = 'text-accent-green'; pcrSub = 'Strong call dominance'; }
   else if (pcr < 0.8) { pcrColor = 'text-accent-green'; pcrSub = 'Call-heavy flow'; }
+  // Add OI PCR comparison
+  if (oiPCR > 0 && Math.abs(pcr - oiPCR) / oiPCR > 0.15) {
+    const shift = pcr > oiPCR ? 'more bearish' : 'more bullish';
+    pcrSub += ` (${shift} vs OI: ${oiPCR.toFixed(2)})`;
+  }
 
   const gexPositive = (gex?.totalGEX ?? 0) >= 0;
   const spot = multiGEX?.spotPrice ?? 0;
   const maxPainDist = spot > 0 && multiGEX?.maxPain ? ((multiGEX.maxPain.strike - spot) / spot * 100) : 0;
 
+  // Volume context from multi-gex
+  const volCtx = ctx?.volume;
+  let callVolSub = vol ? `${((vol.totalCallVol / Math.max(1, vol.totalCallVol + vol.totalPutVol)) * 100).toFixed(0)}% of total` : '';
+  let putVolSub = vol ? `${((vol.totalPutVol / Math.max(1, vol.totalCallVol + vol.totalPutVol)) * 100).toFixed(0)}% of total` : '';
+  if (volCtx) {
+    if (volCtx.callVolRatio > 1.5) callVolSub += ` · ${volCtx.callVolRatio.toFixed(1)}x avg`;
+    else if (volCtx.callVolRatio < 0.6) callVolSub += ` · ${(volCtx.callVolRatio * 100).toFixed(0)}% of avg`;
+    if (volCtx.putVolRatio > 1.5) putVolSub += ` · ${volCtx.putVolRatio.toFixed(1)}x avg`;
+    else if (volCtx.putVolRatio < 0.6) putVolSub += ` · ${(volCtx.putVolRatio * 100).toFixed(0)}% of avg`;
+  }
+
+  // IV context
+  let ivSub = '';
+  if (iv) {
+    ivSub = `${(iv.currentIV * 100).toFixed(0)}% IV (${(iv.iv52wLow * 100).toFixed(0)}-${(iv.iv52wHigh * 100).toFixed(0)}% range)`;
+    if (iv.ivHvRatio < 0.8) ivSub += ' · IV < HV';
+    else if (iv.ivHvRatio > 1.3) ivSub += ' · IV > HV';
+  }
+
   return (
     <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2 animate-fade-in">
       <StatCard icon={BarChart3} label="Vol P/C" value={pcr.toFixed(3)} subtext={pcrSub} color={pcrColor} />
-      <StatCard icon={Activity} label="OI P/C" value={(vol?.oiPCR ?? 0).toFixed(3)}
+      <StatCard icon={Activity} label="OI P/C" value={oiPCR.toFixed(3)}
         subtext={vol ? `C:${formatNumber(vol.totalCallOI, 0)} P:${formatNumber(vol.totalPutOI, 0)}` : ''} />
       <StatCard icon={Target} label="Max Pain" value={multiGEX?.maxPain ? formatCurrency(multiGEX.maxPain.strike) : '—'}
         subtext={`${maxPainDist > 0 ? '+' : ''}${maxPainDist.toFixed(1)}% from spot`} color="text-accent-cyan" />
@@ -66,15 +93,15 @@ export default function AnalyticsCards() {
         color={(gex?.totalDEX ?? 0) < 0 ? 'text-accent-amber' : 'text-text-primary'} />
       <StatCard icon={Thermometer} label="IV Rank"
         value={iv ? `${iv.ivRank}` : '—'}
-        subtext={iv ? `${(iv.currentIV * 100).toFixed(0)}% IV (${(iv.iv52wLow * 100).toFixed(0)}-${(iv.iv52wHigh * 100).toFixed(0)}% range)` : ''}
+        subtext={ivSub}
         color={iv && iv.ivRank > 70 ? 'text-accent-red' : iv && iv.ivRank < 30 ? 'text-accent-green' : 'text-accent-purple'} />
       <StatCard icon={Gauge} label="Call Vol"
         value={vol ? formatNumber(vol.totalCallVol, 0) : '—'}
-        subtext={vol ? `${((vol.totalCallVol / Math.max(1, vol.totalCallVol + vol.totalPutVol)) * 100).toFixed(0)}% of total` : ''}
+        subtext={callVolSub}
         color="text-accent-green" />
       <StatCard icon={AlertTriangle} label="Put Vol"
         value={vol ? formatNumber(vol.totalPutVol, 0) : '—'}
-        subtext={vol ? `${((vol.totalPutVol / Math.max(1, vol.totalCallVol + vol.totalPutVol)) * 100).toFixed(0)}% of total` : ''}
+        subtext={putVolSub}
         color="text-accent-red" />
     </div>
   );

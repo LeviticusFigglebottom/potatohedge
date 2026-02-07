@@ -39,10 +39,11 @@ export interface SnapshotData {
   termStructure: { expiration: string; dte: number; atmIV: number }[];
   skewSurface: { expiration: string; dte: number; points: { strike: number; iv: number; type: string; delta: number }[] }[];
   historicalVol: { hv20: number; hv60: number };
+  ivTimeSeries?: { time: number; hv20: number; ivProxy: number; ivRank: number }[];
   snapshotCount: number;
 }
 
-export type TabId = 'overview' | 'chain' | 'dealer' | 'volatility';
+export type TabId = 'overview' | 'chain' | 'dealer' | 'volatility' | 'analytics';
 
 export interface RecommendationData {
   symbol: string;

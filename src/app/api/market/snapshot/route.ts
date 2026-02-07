@@ -226,6 +226,46 @@ export async function GET(request: NextRequest) {
 
     skewSurface.sort((a, b) => a.dte - b.dte);
 
+    // ── Historical IV/HV time series for Analytics tab ──
+    // Walk forward through chronological bars computing rolling HV20 and IV proxy
+    const ivTimeSeries: { time: number; hv20: number; ivProxy: number; ivRank: number }[] = [];
+    const barChronological = [...historyBars].sort((a, b) => a.t - b.t);
+    const closesChron = barChronological.map(b => b.c);
+    if (closesChron.length > 25) {
+      for (let i = 21; i < closesChron.length; i++) {
+        const window = closesChron.slice(i - 20, i + 1);
+        const returns: number[] = [];
+        for (let j = 1; j < window.length; j++) {
+          if (window[j - 1] > 0 && window[j] > 0) {
+            returns.push(Math.log(window[j] / window[j - 1]));
+          }
+        }
+        if (returns.length < 2) continue;
+        const mean = returns.reduce((s, r) => s + r, 0) / returns.length;
+        const variance = returns.reduce((s, r) => s + (r - mean) ** 2, 0) / (returns.length - 1);
+        const localHV = Math.sqrt(variance * 252);
+        const localIVProxy = localHV * 1.15;
+
+        // IV rank at this point: compare to all prior IV proxies
+        const priorIVs = ivTimeSeries.map(p => p.ivProxy);
+        let rank = 50;
+        if (priorIVs.length >= 20) {
+          const recent252 = priorIVs.slice(-252);
+          const high = Math.max(...recent252);
+          const low = Math.min(...recent252);
+          rank = high > low ? Math.round(((localIVProxy - low) / (high - low)) * 100) : 50;
+          rank = Math.max(0, Math.min(100, rank));
+        }
+
+        ivTimeSeries.push({
+          time: Math.floor(barChronological[i].t / 1000),
+          hv20: localHV,
+          ivProxy: localIVProxy,
+          ivRank: rank,
+        });
+      }
+    }
+
     return NextResponse.json({
       symbol: ticker,
       spotPrice,
@@ -233,6 +273,7 @@ export async function GET(request: NextRequest) {
       termStructure,
       skewSurface: skewSurface.slice(0, 8),
       historicalVol: { hv20, hv60 },
+      ivTimeSeries: ivTimeSeries.slice(-252),
       snapshotCount: polygonSnapshot.length,
       tradierChainsUsed: tradierChains.length,
       timestamp: Date.now(),
