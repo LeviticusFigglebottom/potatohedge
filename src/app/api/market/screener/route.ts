@@ -167,7 +167,7 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
 
     const totalGEX = aggExposures.reduce((s, e) => s + e.netGEX, 0);
     const totalDEX = aggExposures.reduce((s, e) => s + e.netDEX, 0);
-    const gammaFlip = findGammaFlip(aggExposures);
+    const gammaFlip = findGammaFlip(aggExposures, spotPrice);
     const callWall = findCallWall(aggExposures);
     const putWall = findPutWall(aggExposures);
 
@@ -248,6 +248,8 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
       oiPCR,
       totalCallVol,
       totalPutVol,
+      totalCallOI,
+      totalPutOI,
       ivRank: ivMetrics.ivRank,
       ivPercentile: ivMetrics.ivPercentile,
       currentIV,

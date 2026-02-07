@@ -65,6 +65,8 @@ export interface RecommendationInput {
   oiPCR: number;
   totalCallVol: number;
   totalPutVol: number;
+  totalCallOI: number;
+  totalPutOI: number;
   // IV
   ivRank: number;
   ivPercentile: number;
@@ -164,24 +166,29 @@ function scoreSignals(input: RecommendationInput): Signal[] {
 
   // 3. Call/Put Wall Proximity — measured in ATR
   //    Skip walls >20% from price — just far-OTM OI clusters, not real levels
+  //    OI confidence: walls only meaningful when total OI is significant
+  const totalOI = input.totalCallOI + input.totalPutOI;
+  const wallOIConfidence = totalOI < 5000 ? 0 : totalOI < 20000 ? (totalOI - 5000) / 15000 : 1;
+
   if (input.callWall !== null) {
     const distPct = (input.callWall - spotPrice) / spotPrice * 100;
     const absDistPct = Math.abs(distPct);
     const distATR = atrPercent > 0 ? distPct / atrPercent : 99;
-    if (absDistPct <= 20) {
+    if (absDistPct <= 20 && wallOIConfidence > 0) {
+      const thinNote = wallOIConfidence < 1 ? ' (thin OI — low confidence)' : '';
       if (distPct > 0 && distATR < 1.5) {
         signals.push({
           name: 'Call Wall Proximity',
           direction: 'bearish',
-          weight: -0.2,
-          description: `Call Wall at $${input.callWall} is ${distATR.toFixed(1)} ATR overhead (${distPct.toFixed(1)}%) — strong resistance within ~${Math.ceil(distATR)} day range`,
+          weight: -0.2 * wallOIConfidence,
+          description: `Call Wall at $${input.callWall} is ${distATR.toFixed(1)} ATR overhead (${distPct.toFixed(1)}%)${thinNote} — strong resistance within ~${Math.ceil(distATR)} day range`,
         });
       } else if (distPct < 0) {
         signals.push({
           name: 'Call Wall Breach',
           direction: 'bullish',
-          weight: 0.3,
-          description: `Above Call Wall ($${input.callWall}) — dealers chasing, squeeze potential`,
+          weight: 0.3 * wallOIConfidence,
+          description: `Above Call Wall ($${input.callWall})${thinNote} — dealers chasing, squeeze potential`,
         });
       }
     }
@@ -191,20 +198,21 @@ function scoreSignals(input: RecommendationInput): Signal[] {
     const distPct = (spotPrice - input.putWall) / spotPrice * 100;
     const absDistPct = Math.abs(distPct);
     const distATR = atrPercent > 0 ? distPct / atrPercent : 99;
-    if (absDistPct <= 20) {
+    if (absDistPct <= 20 && wallOIConfidence > 0) {
+      const thinNote = wallOIConfidence < 1 ? ' (thin OI — low confidence)' : '';
       if (distPct > 0 && distATR < 1.5) {
         signals.push({
           name: 'Put Wall Proximity',
           direction: 'bullish',
-          weight: 0.2,
-          description: `Put Wall at $${input.putWall} is ${distATR.toFixed(1)} ATR below (${distPct.toFixed(1)}%) — strong support within ~${Math.ceil(distATR)} day range`,
+          weight: 0.2 * wallOIConfidence,
+          description: `Put Wall at $${input.putWall} is ${distATR.toFixed(1)} ATR below (${distPct.toFixed(1)}%)${thinNote} — strong support within ~${Math.ceil(distATR)} day range`,
         });
       } else if (distPct < 0) {
         signals.push({
           name: 'Put Wall Breach',
           direction: 'bearish',
-          weight: -0.3,
-          description: `Below Put Wall ($${input.putWall}) — support broken, downside accelerates`,
+          weight: -0.3 * wallOIConfidence,
+          description: `Below Put Wall ($${input.putWall})${thinNote} — support broken, downside accelerates`,
         });
       }
     }

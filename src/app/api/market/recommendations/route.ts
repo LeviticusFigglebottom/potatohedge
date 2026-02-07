@@ -147,7 +147,7 @@ export async function GET(request: NextRequest) {
 
     const totalGEX = aggExposures.reduce((s, e) => s + e.netGEX, 0);
     const totalDEX = aggExposures.reduce((s, e) => s + e.netDEX, 0);
-    const gammaFlip = findGammaFlip(aggExposures);
+    const gammaFlip = findGammaFlip(aggExposures, spotPrice);
     const callWall = findCallWall(aggExposures);
     const putWall = findPutWall(aggExposures);
 
@@ -215,6 +215,8 @@ export async function GET(request: NextRequest) {
       oiPCR,
       totalCallVol,
       totalPutVol,
+      totalCallOI,
+      totalPutOI,
       ivRank: ivMetrics.ivRank,
       ivPercentile: ivMetrics.ivPercentile,
       currentIV,

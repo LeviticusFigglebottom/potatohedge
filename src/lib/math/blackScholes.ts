@@ -361,12 +361,20 @@ export function computeDealerExposureFromChain(
  * Below gamma flip: dealers short gamma (amplified moves).
  * Above gamma flip: dealers long gamma (suppressed moves).
  */
-export function findGammaFlip(exposures: StrikeExposure[]): number | null {
+export function findGammaFlip(exposures: StrikeExposure[], spotPrice?: number): number | null {
   if (exposures.length < 2) return null;
 
-  for (let i = 1; i < exposures.length; i++) {
-    const prev = exposures[i - 1];
-    const curr = exposures[i];
+  // Only consider strikes within a reasonable range of spot (40%–200%)
+  // to avoid nonsense flips at $1 on a $15 stock or $5 on a $100 stock
+  const filtered = spotPrice
+    ? exposures.filter(e => e.strike >= spotPrice * 0.4 && e.strike <= spotPrice * 2.0)
+    : exposures;
+
+  if (filtered.length < 2) return null;
+
+  for (let i = 1; i < filtered.length; i++) {
+    const prev = filtered[i - 1];
+    const curr = filtered[i];
 
     // Cumulative GEX from puts (below) to calls (above)
     if (prev.netGEX <= 0 && curr.netGEX > 0) {
