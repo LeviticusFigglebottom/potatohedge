@@ -245,6 +245,26 @@ export default function AIAnalysisPanel() {
                 </p>
               </div>
               <Sparkles className={`w-4 h-4 ${multiGEX ? 'text-purple-400/60' : 'text-text-muted/40'}`} />
+        <button
+          onClick={runAnalysis}
+          disabled={!multiGEX}
+          className={`w-full group relative overflow-hidden rounded-lg border transition-all duration-300 ${
+            multiGEX
+              ? 'border-purple-500/40 hover:border-purple-400/60 bg-gradient-to-r from-purple-500/10 via-bg-secondary to-purple-500/10 hover:from-purple-500/20 hover:via-purple-500/5 hover:to-purple-500/20 cursor-pointer'
+              : 'border-border/30 bg-bg-secondary opacity-50 cursor-not-allowed'
+          }`}
+        >
+          <div className="px-6 py-4 flex items-center justify-center gap-3">
+            <Brain className={`w-5 h-5 ${multiGEX ? 'text-purple-400 group-hover:text-purple-300' : 'text-text-muted'}`} />
+            <div className="text-left">
+              <span className={`text-sm font-semibold ${multiGEX ? 'text-purple-300 group-hover:text-purple-200' : 'text-text-muted'}`}>
+                Ask Claude to Analyze {symbol}
+              </span>
+              <p className="text-xs text-text-muted mt-0.5">
+                {multiGEX
+                  ? 'Sends all GEX, IV, flow, dealer, volatility, and correlation data to Claude for deep analysis'
+                  : 'Waiting for market data to load...'}
+              </p>
             </div>
             {multiGEX && (
               <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-500">
@@ -313,6 +333,8 @@ export default function AIAnalysisPanel() {
                     ? 'bg-cyan-500/10 text-cyan-300/60 border-cyan-500/20'
                     : 'bg-purple-500/10 text-purple-300/60 border-purple-500/20'
                 }`}>
+              {['GEX/DEX', 'IV Rank', 'Term Structure', 'Skew', 'PCR', 'ATR', 'Key Levels', 'Correlations'].map(tag => (
+                <span key={tag} className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-300/60 border border-purple-500/20">
                   {tag}
                 </span>
               ))}
