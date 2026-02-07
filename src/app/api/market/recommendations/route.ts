@@ -7,12 +7,12 @@ import {
   findCallWall,
   findPutWall,
   computeMaxPain,
-  computePCR,
 } from '@/lib/math/blackScholes';
 import {
   computeHistoricalVolatility,
   computeIVRankPercentile,
   computeSkew,
+  computeStockProfile,
 } from '@/lib/math/analytics';
 import {
   generateRecommendations,
@@ -30,7 +30,6 @@ export async function GET(request: NextRequest) {
   const ticker = symbol.toUpperCase();
 
   try {
-    // Fetch all data in parallel
     const [quote, expirations, historyBars] = await Promise.all([
       getQuote(ticker),
       getExpirations(ticker),
@@ -44,7 +43,6 @@ export async function GET(request: NextRequest) {
     const spotPrice = quote.last;
     const nearExps = expirations.slice(0, 4);
 
-    // Fetch chains for nearest expirations
     const chains = await Promise.all(
       nearExps.map(e => getOptionsChain(ticker, e.date).catch(() => null))
     ).then(c => c.filter((x): x is NonNullable<typeof x> => x !== null));
@@ -62,7 +60,6 @@ export async function GET(request: NextRequest) {
       )
     );
 
-    // Aggregate by strike
     const byStrike = new Map<number, typeof allExposures[0]>();
     for (const e of allExposures) {
       const existing = byStrike.get(e.strike);
@@ -83,14 +80,12 @@ export async function GET(request: NextRequest) {
     const callWall = findCallWall(aggExposures);
     const putWall = findPutWall(aggExposures);
 
-    // Max pain from nearest expiration
     const nearChain = chains[0];
     const maxPain = computeMaxPain(
       nearChain.calls.map(c => ({ strike: c.strike, openInterest: c.openInterest })),
       nearChain.puts.map(p => ({ strike: p.strike, openInterest: p.openInterest }))
     );
 
-    // PCR across all expirations
     const totalCallVol = chains.reduce((s, c) => s + c.calls.reduce((sv, o) => sv + o.volume, 0), 0);
     const totalPutVol = chains.reduce((s, c) => s + c.puts.reduce((sv, o) => sv + o.volume, 0), 0);
     const totalCallOI = chains.reduce((s, c) => s + c.calls.reduce((sv, o) => sv + o.openInterest, 0), 0);
@@ -98,7 +93,7 @@ export async function GET(request: NextRequest) {
     const volumePCR = totalCallVol > 0 ? totalPutVol / totalCallVol : 1;
     const oiPCR = totalCallOI > 0 ? totalPutOI / totalCallOI : 1;
 
-    // IV from nearest chain ATM options
+    // ATM IV from nearest chain
     const atmOpts = [...nearChain.calls, ...nearChain.puts]
       .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < 0.02 && o.impliedVolatility > 0.01)
       .sort((a, b) => Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice));
@@ -106,11 +101,10 @@ export async function GET(request: NextRequest) {
       ? atmOpts.slice(0, 4).reduce((s, o) => s + o.impliedVolatility, 0) / Math.min(4, atmOpts.length)
       : 0;
 
-    // HV from Polygon equity history
+    // HV + IV Rank
     const closes = historyBars.map(b => b.c).reverse();
     const hvCurrent = computeHistoricalVolatility(closes, 20);
 
-    // IV Rank
     const historicalIVs = closes.slice(0, 252).map((_, i) => {
       const hv = computeHistoricalVolatility(closes.slice(i), 20);
       return hv > 0 ? hv * 1.15 : 0;
@@ -118,10 +112,16 @@ export async function GET(request: NextRequest) {
     const ivMetrics = computeIVRankPercentile(currentIV, historicalIVs);
     const ivHvRatio = hvCurrent > 0 ? currentIV / hvCurrent : 1;
 
-    // Skew
     const skew = computeSkew(nearChain.calls, nearChain.puts, spotPrice);
 
-    // Build input
+    // ── Stock Profile: ATR, daily sigma, avg range ──
+    // historyBars are chronological (oldest first) from Polygon
+    const profile = computeStockProfile(
+      historyBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c })),
+      spotPrice,
+      hvCurrent
+    );
+
     const input: RecommendationInput = {
       symbol: ticker,
       spotPrice,
@@ -143,6 +143,10 @@ export async function GET(request: NextRequest) {
       skewBias: skew.skewBias,
       skewRatio: skew.skewRatio,
       changePercent: quote.changePct,
+      atr14: profile.atr14,
+      atrPercent: profile.atrPercent,
+      dailySigma: profile.dailySigma,
+      avgDailyRangePct: profile.avgDailyRangePct,
       nearestExp: nearExps[0]?.date || '',
       nearestDTE: nearExps[0]?.dte || 0,
       weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
@@ -150,7 +154,6 @@ export async function GET(request: NextRequest) {
     };
 
     const recommendations = generateRecommendations(input);
-
     return NextResponse.json(recommendations);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';

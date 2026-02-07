@@ -144,6 +144,11 @@ export async function GET(request: NextRequest) {
     ivContext.interpretation = interpretIV(ivContext);
 
     // ── Skew Surface from Tradier chains (reliable) + Polygon supplement ──
+    // Key: filter out deep OTM garbage IVs that create 287% spikes
+    // Use ATM IV as anchor — cap skew IVs at 3x ATM IV
+    const maxSkewIV = currentIV > 0 ? Math.max(currentIV * 3, 1.0) : 3;
+    const minDeltaFilter = 0.03; // skip contracts with |delta| < 3% (deep OTM garbage)
+
     const skewSurface: {
       expiration: string; dte: number;
       points: { strike: number; iv: number; type: string; delta: number }[];
@@ -153,14 +158,16 @@ export async function GET(request: NextRequest) {
     for (const chain of tradierChains) {
       const points: { strike: number; iv: number; type: string; delta: number }[] = [];
       for (const c of chain.calls) {
-        if (c.impliedVolatility > 0.01 && c.impliedVolatility < 3 &&
-            c.strike >= spotPrice * 0.85 && c.strike <= spotPrice * 1.15) {
+        if (c.impliedVolatility > 0.01 && c.impliedVolatility < maxSkewIV &&
+            Math.abs(c.delta) > minDeltaFilter &&
+            c.strike >= spotPrice * 0.88 && c.strike <= spotPrice * 1.12) {
           points.push({ strike: c.strike, iv: c.impliedVolatility, type: 'call', delta: c.delta });
         }
       }
       for (const p of chain.puts) {
-        if (p.impliedVolatility > 0.01 && p.impliedVolatility < 3 &&
-            p.strike >= spotPrice * 0.85 && p.strike <= spotPrice * 1.15) {
+        if (p.impliedVolatility > 0.01 && p.impliedVolatility < maxSkewIV &&
+            Math.abs(p.delta) > minDeltaFilter &&
+            p.strike >= spotPrice * 0.88 && p.strike <= spotPrice * 1.12) {
           points.push({ strike: p.strike, iv: p.impliedVolatility, type: 'put', delta: p.delta });
         }
       }
@@ -183,8 +190,10 @@ export async function GET(request: NextRequest) {
       for (const opt of polygonSnapshot) {
         const exp = opt.details.expiration_date;
         if (coveredExps.has(exp)) continue;
-        if (opt.implied_volatility <= 0.01 || opt.implied_volatility >= 3) continue;
-        if (opt.details.strike_price < spotPrice * 0.85 || opt.details.strike_price > spotPrice * 1.15) continue;
+        if (opt.implied_volatility <= 0.01 || opt.implied_volatility >= maxSkewIV) continue;
+        if (opt.details.strike_price < spotPrice * 0.88 || opt.details.strike_price > spotPrice * 1.12) continue;
+        // Filter deep OTM via delta
+        if (opt.greeks?.delta !== undefined && Math.abs(opt.greeks.delta) < minDeltaFilter) continue;
 
         const dte = Math.ceil((new Date(exp).getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
         if (dte <= 0 || dte > 90) continue;

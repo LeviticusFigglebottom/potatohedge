@@ -176,12 +176,22 @@ export default function RecommendationsPanel() {
 
   return (
     <div className="space-y-4 animate-fade-in">
-      {/* Header: Bias + Regimes */}
+      {/* Header: Bias + Regimes + Stock Context */}
       <div className="panel p-4">
         <div className="flex flex-col md:flex-row items-center justify-between gap-4">
           <BiasGauge score={recommendations.biasScore} bias={recommendations.overallBias} />
           <RegimeBadges volRegime={recommendations.volRegime} gammaRegime={recommendations.gammaRegime} />
         </div>
+        {(recommendations.stockContext || recommendations.moveContext) && (
+          <div className="mt-3 pt-3 border-t border-border/30 space-y-1">
+            {recommendations.stockContext && (
+              <p className="text-xs font-mono text-text-muted text-center">{recommendations.stockContext}</p>
+            )}
+            {recommendations.moveContext && (
+              <p className="text-xs font-mono text-text-secondary text-center">{recommendations.moveContext}</p>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Warnings */}

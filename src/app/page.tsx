@@ -91,7 +91,7 @@ export default function DashboardPage() {
       {/* Footer */}
       <footer className="border-t border-border mt-8">
         <div className="max-w-[1920px] mx-auto px-4 py-3 flex items-center justify-between text-xs font-mono text-text-muted">
-          <span>Optix v0.2.0 — Options Analytics Dashboard</span>
+          <span>Optix v0.4.0 — Options Analytics Dashboard</span>
           <span>Tradier • Polygon.io • GEX/Vanna/Charm computed locally</span>
         </div>
       </footer>

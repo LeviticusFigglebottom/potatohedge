@@ -401,6 +401,104 @@ export function analyzeOIConcentration(
   };
 }
 
+// ─── ATR & Stock Profile ──────────────────────────────────
+
+export interface StockProfile {
+  atr14: number;           // 14-day ATR in dollars
+  atrPercent: number;      // ATR as % of price
+  dailySigma: number;      // 1σ daily move in % (from HV20)
+  avgDailyRange: number;   // Average |high-low|/close over 20 days
+  avgDailyRangePct: number;
+  typicalMoveThreshold: number; // Moves below this are "normal" (1.5σ)
+  bigMoveThreshold: number;     // Moves above this are "abnormal" (2.5σ)
+}
+
+/**
+ * Compute ATR (Average True Range) — the REAL measure of how much
+ * a stock typically moves. Uses high, low, close data.
+ * bars should be oldest-first (chronological).
+ */
+export function computeATR(
+  bars: { h: number; l: number; c: number }[],
+  period: number = 14
+): number {
+  if (bars.length < period + 1) return 0;
+  const trs: number[] = [];
+  for (let i = 1; i < bars.length; i++) {
+    const tr = Math.max(
+      bars[i].h - bars[i].l,
+      Math.abs(bars[i].h - bars[i - 1].c),
+      Math.abs(bars[i].l - bars[i - 1].c)
+    );
+    trs.push(tr);
+  }
+  // EMA-style ATR
+  let atr = trs.slice(0, period).reduce((s, v) => s + v, 0) / period;
+  for (let i = period; i < trs.length; i++) {
+    atr = (atr * (period - 1) + trs[i]) / period;
+  }
+  return atr;
+}
+
+/**
+ * Compute a full stock profile — tells you what's "normal" for THIS ticker
+ */
+export function computeStockProfile(
+  bars: { o: number; h: number; l: number; c: number }[],
+  currentPrice: number,
+  hv20: number
+): StockProfile {
+  const atr14 = computeATR(bars, 14);
+  const atrPercent = currentPrice > 0 ? (atr14 / currentPrice) * 100 : 0;
+
+  // Daily sigma from annualized HV: dailyσ = HV / √252
+  const dailySigma = hv20 / Math.sqrt(252) * 100; // as percent
+
+  // Average daily range from last 20 bars
+  const recentBars = bars.slice(-20);
+  const ranges = recentBars.map(b => Math.abs(b.h - b.l) / b.c * 100);
+  const avgDailyRange = recentBars.length > 0
+    ? recentBars.reduce((s, b) => s + Math.abs(b.h - b.l), 0) / recentBars.length
+    : 0;
+  const avgDailyRangePct = ranges.length > 0
+    ? ranges.reduce((s, v) => s + v, 0) / ranges.length
+    : 0;
+
+  return {
+    atr14,
+    atrPercent,
+    dailySigma,
+    avgDailyRange,
+    avgDailyRangePct,
+    typicalMoveThreshold: dailySigma * 1.5,   // moves < 1.5σ are normal
+    bigMoveThreshold: dailySigma * 2.5,        // moves > 2.5σ are abnormal
+  };
+}
+
+/**
+ * Contextualize an intraday move for a specific stock
+ */
+export function contextualizeMove(
+  changePercent: number,
+  profile: StockProfile
+): { sigma: number; isNormal: boolean; isBig: boolean; description: string } {
+  const absChange = Math.abs(changePercent);
+  const sigma = profile.dailySigma > 0 ? absChange / profile.dailySigma : 0;
+  const isNormal = absChange <= profile.typicalMoveThreshold;
+  const isBig = absChange >= profile.bigMoveThreshold;
+
+  let description: string;
+  if (isBig) {
+    description = `${changePercent > 0 ? '+' : ''}${changePercent.toFixed(1)}% move is ${sigma.toFixed(1)}σ — abnormally large for ${profile.atrPercent.toFixed(1)}% ATR stock. Avg daily range: ${profile.avgDailyRangePct.toFixed(1)}%.`;
+  } else if (!isNormal) {
+    description = `${changePercent > 0 ? '+' : ''}${changePercent.toFixed(1)}% move is ${sigma.toFixed(1)}σ — above average but not extreme for this stock (ATR ${profile.atrPercent.toFixed(1)}%).`;
+  } else {
+    description = `${changePercent > 0 ? '+' : ''}${changePercent.toFixed(1)}% move is ${sigma.toFixed(1)}σ — within normal range for this stock (ATR ${profile.atrPercent.toFixed(1)}%).`;
+  }
+
+  return { sigma, isNormal, isBig, description };
+}
+
 // ─── Helpers ───────────────────────────────────────────────
 
 function abbreviate(n: number): string {

@@ -58,6 +58,8 @@ export interface RecommendationData {
     reasoning: string[]; tags: string[];
   }[];
   warnings: string[];
+  moveContext: string;
+  stockContext: string;
 }
 
 interface DashboardStore {
