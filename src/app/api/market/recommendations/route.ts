@@ -164,17 +164,23 @@ export async function GET(request: NextRequest) {
     const volumePCR = totalCallVol > 0 ? totalPutVol / totalCallVol : 1;
     const oiPCR = totalCallOI > 0 ? totalPutOI / totalCallOI : 1;
 
-    // ATM IV from nearest chain
+    // ATM IV from nearest chain — adaptive tolerance for low-priced stocks
+    const atmTolerance = spotPrice < 20 ? 0.10 : spotPrice < 50 ? 0.05 : 0.02;
     const atmOpts = [...nearChain.calls, ...nearChain.puts]
-      .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < 0.02 && o.impliedVolatility > 0.01)
+      .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < atmTolerance && o.impliedVolatility > 0.01)
       .sort((a, b) => Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice));
-    const currentIV = atmOpts.length > 0
+    let currentIV = atmOpts.length > 0
       ? atmOpts.slice(0, 4).reduce((s, o) => s + o.impliedVolatility, 0) / Math.min(4, atmOpts.length)
       : 0;
 
     // HV + IV Rank
     const closes = historyBars.map(b => b.c).reverse();
     const hvCurrent = computeHistoricalVolatility(closes, 20);
+
+    // If ATM IV came back as 0 (missing data), fall back to HV * 1.15 as proxy
+    if (currentIV === 0 && hvCurrent > 0) {
+      currentIV = hvCurrent * 1.15;
+    }
 
     const historicalIVs = closes.slice(0, 252).map((_, i) => {
       const hv = computeHistoricalVolatility(closes.slice(i), 20);
