@@ -20,7 +20,7 @@ function StatCard({ icon: Icon, label, value, subtext, color, subtle }: {
 }
 
 export default function AnalyticsCards() {
-  const { multiGEX, snapshot, loading } = useDashboardStore();
+  const { multiGEX, snapshot, loading, recommendations } = useDashboardStore();
 
   if ((loading.multiGEX || loading.snapshot) && !multiGEX && !snapshot) {
     return (
@@ -38,6 +38,7 @@ export default function AnalyticsCards() {
   const pcr = vol ? vol.volumePCR : 0;
 
   const ctx = multiGEX?.context;
+  const spot = multiGEX?.spotPrice ?? 0;
 
   // PCR context — compare today's volume PCR to accumulated OI PCR
   const oiPCR = vol?.oiPCR ?? 0;
@@ -54,17 +55,36 @@ export default function AnalyticsCards() {
   }
 
   const gexPositive = (gex?.totalGEX ?? 0) >= 0;
-  const spot = multiGEX?.spotPrice ?? 0;
   const maxPainDist = spot > 0 && multiGEX?.maxPain ? ((multiGEX.maxPain.strike - spot) / spot * 100) : 0;
 
-  // Volume context from multi-gex
-  const volCtx = ctx?.volume;
-  let callVolSub = vol ? `${((vol.totalCallVol / Math.max(1, vol.totalCallVol + vol.totalPutVol)) * 100).toFixed(0)}% of total` : '';
-  let putVolSub = vol ? `${((vol.totalPutVol / Math.max(1, vol.totalCallVol + vol.totalPutVol)) * 100).toFixed(0)}% of total` : '';
-  // Note: volume ratios vs average are not shown since we lack
-  // historical daily options volume data. PCR divergence is more meaningful.
+  // GEX subtext with gamma flip distance
+  let gexSub = gexPositive ? 'Long γ — mean-reversion' : 'Short γ — amplified moves';
+  if (gex?.gammaFlip && spot > 0) {
+    const flipDist = ((spot - gex.gammaFlip) / spot * 100);
+    const above = flipDist > 0;
+    gexSub += ` · γF ${above ? '+' : ''}${flipDist.toFixed(1)}%`;
+  }
 
-  // IV context
+  // DEX subtext with wall context
+  let dexSub = gex && gex.totalDEX < 0 ? 'Short δ — dealers must buy' : 'Long δ — dealers may sell';
+  if (spot > 0) {
+    const parts: string[] = [];
+    if (gex?.callWall) {
+      const dist = ((gex.callWall - spot) / spot * 100);
+      if (dist > 0 && dist < 5) parts.push(`CW ${dist.toFixed(1)}% above`);
+    }
+    if (gex?.putWall) {
+      const dist = ((spot - gex.putWall) / spot * 100);
+      if (dist > 0 && dist < 5) parts.push(`PW ${dist.toFixed(1)}% below`);
+    }
+    if (parts.length > 0) dexSub += ` · ${parts.join(', ')}`;
+  }
+
+  // Volume context
+  const callVolSub = vol ? `${((vol.totalCallVol / Math.max(1, vol.totalCallVol + vol.totalPutVol)) * 100).toFixed(0)}% of total` : '';
+  const putVolSub = vol ? `${((vol.totalPutVol / Math.max(1, vol.totalCallVol + vol.totalPutVol)) * 100).toFixed(0)}% of total` : '';
+
+  // IV context with regime cross-reference
   let ivSub = '';
   if (iv) {
     ivSub = `${(iv.currentIV * 100).toFixed(0)}% IV (${(iv.iv52wLow * 100).toFixed(0)}-${(iv.iv52wHigh * 100).toFixed(0)}% range)`;
@@ -81,11 +101,11 @@ export default function AnalyticsCards() {
         subtext={`${maxPainDist > 0 ? '+' : ''}${maxPainDist.toFixed(1)}% from spot`} color="text-accent-cyan" />
       <StatCard icon={gexPositive ? TrendingUp : TrendingDown} label="Net GEX"
         value={gex ? `${gex.totalGEX >= 0 ? '+' : ''}${formatNumber(gex.totalGEX)}` : '—'}
-        subtext={gexPositive ? 'Long γ — mean-reversion' : 'Short γ — amplified moves'}
+        subtext={gexSub}
         color={gexPositive ? 'text-accent-green' : 'text-accent-red'} />
       <StatCard icon={Zap} label="Net DEX"
         value={gex ? `${gex.totalDEX >= 0 ? '+' : ''}${formatNumber(gex.totalDEX)}` : '—'}
-        subtext={gex && gex.totalDEX < 0 ? 'Short δ — dealers must buy' : 'Long δ — dealers may sell'}
+        subtext={dexSub}
         color={(gex?.totalDEX ?? 0) < 0 ? 'text-accent-amber' : 'text-text-primary'} />
       <StatCard icon={Thermometer} label="IV Rank"
         value={iv ? `${iv.ivRank}` : '—'}

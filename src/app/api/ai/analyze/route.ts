@@ -84,6 +84,43 @@ interface AnalysisRequest {
   warnings: string[];
   moveContext: string;
   stockContext: string;
+
+  // Correlations
+  correlations: {
+    beta: number;
+    marketCorrelation: number;
+    alpha30d: number;
+    alpha90d: number;
+    drawdownRatio: number;
+    rallyRatio: number;
+    ivRegime: {
+      lowVolAvg20d: number;
+      highVolAvg20d: number;
+      lowVolWinRate: number;
+      insight: string;
+    };
+    volPricing: {
+      overPricingRate: number;
+      avgImpliedMove: number;
+      avgRealizedMove: number;
+      insight: string;
+    };
+    meanReversion: {
+      bounceRateAfterDrops: number;
+      pullbackRateAfterRallies: number;
+      avgRecovery5d: number;
+      insight: string;
+    };
+    sectorRelative: {
+      sectorETF: string;
+      sectorCorrelation: number;
+      relativeStrength30d: number;
+      divergenceDays: number;
+      insight: string;
+    } | null;
+    anomalies: string[];
+    strongestInsights: string[];
+  } | null;
 }
 
 export async function POST(request: NextRequest) {
@@ -211,6 +248,23 @@ OUR ENGINE'S CONTEXTUAL ANALYSIS
 
 ${d.warnings.length > 0 ? `WARNINGS: ${d.warnings.join(' | ')}` : ''}
 
+${d.correlations ? `HISTORICAL CORRELATIONS & CROSS-REFERENCES (~500 days)
+• Beta: ${d.correlations.beta.toFixed(2)} | Market Correlation: ${d.correlations.marketCorrelation.toFixed(2)}
+• 30d Alpha: ${d.correlations.alpha30d > 0 ? '+' : ''}${(d.correlations.alpha30d * 100).toFixed(1)}% | 90d Alpha: ${d.correlations.alpha90d > 0 ? '+' : ''}${(d.correlations.alpha90d * 100).toFixed(1)}%
+• Drawdown behavior: ${d.correlations.drawdownRatio.toFixed(1)}x SPY during selloffs | Rally behavior: ${d.correlations.rallyRatio.toFixed(1)}x SPY during rallies
+• IV Regime: Low-vol 20d avg ${(d.correlations.ivRegime.lowVolAvg20d * 100).toFixed(1)}% | High-vol 20d avg ${(d.correlations.ivRegime.highVolAvg20d * 100).toFixed(1)}% | Low-vol 5d win rate: ${(d.correlations.ivRegime.lowVolWinRate * 100).toFixed(0)}%
+• Vol Pricing: Options overpriced ${(d.correlations.volPricing.overPricingRate * 100).toFixed(0)}% of the time | Avg implied 5d move: ${(d.correlations.volPricing.avgImpliedMove * 100).toFixed(2)}% vs realized: ${(d.correlations.volPricing.avgRealizedMove * 100).toFixed(2)}%
+• Mean Reversion: ${(d.correlations.meanReversion.bounceRateAfterDrops * 100).toFixed(0)}% bounce rate after 2σ+ drops | ${(d.correlations.meanReversion.pullbackRateAfterRallies * 100).toFixed(0)}% pullback rate after 2σ+ rallies | Avg 5d recovery: ${(d.correlations.meanReversion.avgRecovery5d * 100).toFixed(2)}%
+${d.correlations.sectorRelative ? `• Sector (${d.correlations.sectorRelative.sectorETF}): Correlation ${d.correlations.sectorRelative.sectorCorrelation.toFixed(2)} | Rel strength 30d: ${d.correlations.sectorRelative.relativeStrength30d > 0 ? '+' : ''}${(d.correlations.sectorRelative.relativeStrength30d * 100).toFixed(1)}% | ${d.correlations.sectorRelative.divergenceDays} divergence days in 60d` : ''}
+${d.correlations.anomalies.length > 0 ? `• Anomalies: ${d.correlations.anomalies.join(' | ')}` : ''}
+• Strongest Signals: ${d.correlations.strongestInsights.join(' | ')}
+
+CORRELATION INSIGHTS
+• ${d.correlations.ivRegime.insight}
+• ${d.correlations.volPricing.insight}
+• ${d.correlations.meanReversion.insight}
+${d.correlations.sectorRelative ? `• ${d.correlations.sectorRelative.insight}` : ''}` : ''}
+
 ═══════════════════════════════════════════
 YOUR TASK
 ═══════════════════════════════════════════
@@ -227,6 +281,7 @@ Based on ALL the above data, provide 2-4 specific options trade recommendations.
 
 Also provide:
 - A brief **Market Regime Summary** (2-3 sentences synthesizing all the data into a cohesive picture)
+- **Historical Context** — reference the correlation data: how does this stock typically behave in the current vol regime? Is the current IV fairly priced based on historical over/under-pricing patterns? Does the mean-reversion tendency favor any strategy? How is it performing vs its sector?
 - **What to Watch** — key levels or events that would invalidate the thesis
 - Rate your overall **conviction level** (1-10) and explain why
 

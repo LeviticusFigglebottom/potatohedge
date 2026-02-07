@@ -1,11 +1,10 @@
 'use client';
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { createChart, type IChartApi, type ISeriesApi, type IPriceLine, type CandlestickData, type HistogramData, ColorType, CrosshairMode } from 'lightweight-charts';
-import { useDashboardStore } from '@/hooks/useDashboardStore';
+import { createChart, type IChartApi, type ISeriesApi, type CandlestickData, type HistogramData, ColorType, CrosshairMode } from 'lightweight-charts';
+import { useDashboardStore, type MultiGEXData } from '@/hooks/useDashboardStore';
 import type { Interval } from '@/types/market';
 
-// Range presets: each maps to a default interval + time window
 type RangePreset = '1D' | '1W' | '1M' | '3M' | '1Y' | 'ALL';
 
 const RANGE_CONFIG: { label: string; value: RangePreset; interval: Interval; seconds: number }[] = [
@@ -14,7 +13,7 @@ const RANGE_CONFIG: { label: string; value: RangePreset; interval: Interval; sec
   { label: '1M',  value: '1M',  interval: '1D', seconds: 30 * 24 * 60 * 60 },
   { label: '3M',  value: '3M',  interval: '1D', seconds: 90 * 24 * 60 * 60 },
   { label: '1Y',  value: '1Y',  interval: '1D', seconds: 365 * 24 * 60 * 60 },
-  { label: 'ALL', value: 'ALL', interval: '1D', seconds: 0 }, // 0 = fitContent
+  { label: 'ALL', value: 'ALL', interval: '1D', seconds: 0 },
 ];
 
 const INTERVALS: { label: string; value: Interval }[] = [
@@ -26,23 +25,63 @@ const INTERVALS: { label: string; value: Interval }[] = [
   { label: '1M', value: '1M' },
 ];
 
+interface LevelOverlay {
+  label: string;
+  price: number;
+  color: string;
+  y: number;
+}
+
 export default function PriceChart() {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
-  const priceLinesRef = useRef<IPriceLine[]>([]);
+  const multiGEXRef = useRef<MultiGEXData | null>(null);
   const historyRef = useRef(useDashboardStore.getState().history);
 
   const { history, interval, setInterval, loading, symbol, multiGEX } = useDashboardStore();
   const [activeRange, setActiveRange] = useState<RangePreset>('1Y');
+  const [levelOverlays, setLevelOverlays] = useState<LevelOverlay[]>([]);
+  const [chartHeight, setChartHeight] = useState(400);
 
-  // Keep historyRef in sync for use in the range change callback
+  // Keep refs in sync
   useEffect(() => { historyRef.current = history; }, [history]);
+  useEffect(() => { multiGEXRef.current = multiGEX; }, [multiGEX]);
 
-  // Initialize chart
+  // Compute GEX level overlay positions from series.priceToCoordinate
+  // This is called from chart event handlers via refs (no stale closures)
+  const updateLevelOverlays = useCallback(() => {
+    const series = candleSeriesRef.current;
+    const gex = multiGEXRef.current;
+    if (!series || !gex?.aggregated) {
+      setLevelOverlays([]);
+      return;
+    }
+
+    const agg = gex.aggregated;
+    const levels: { label: string; price: number; color: string }[] = [];
+
+    if (agg.gammaFlip) levels.push({ label: 'γ Flip', price: agg.gammaFlip, color: '#ffaa00' });
+    if (agg.callWall) levels.push({ label: 'Call Wall', price: agg.callWall, color: '#00e676' });
+    if (agg.putWall) levels.push({ label: 'Put Wall', price: agg.putWall, color: '#ff3d57' });
+    if (gex.maxPain?.strike) levels.push({ label: 'Max Pain', price: gex.maxPain.strike, color: '#00d4ff' });
+
+    const positioned: LevelOverlay[] = [];
+    for (const l of levels) {
+      const y = series.priceToCoordinate(l.price);
+      if (y !== null && y > 10 && y < chartHeight - 40) {
+        positioned.push({ ...l, y });
+      }
+    }
+    setLevelOverlays(positioned);
+  }, [chartHeight]);
+
+  // Initialize chart (runs once)
   useEffect(() => {
     if (!chartContainerRef.current) return;
+
+    const isIntraday = ['1min', '5min', '15min'].includes(interval);
 
     const chart = createChart(chartContainerRef.current, {
       layout: {
@@ -67,11 +106,31 @@ export default function PriceChart() {
       },
       timeScale: {
         borderColor: '#2a2a3d',
-        timeVisible: true,
+        timeVisible: isIntraday,
         secondsVisible: false,
-        fixRightEdge: true,
       },
       handleScroll: { vertTouchDrag: false },
+    });
+
+    chartRef.current = chart;
+
+    // Update overlays when chart view changes (scroll / zoom)
+    chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+      requestAnimationFrame(() => {
+        updateLevelOverlays();
+      });
+    });
+
+    // Also update on crosshair move (catches y-axis rescaling from interaction)
+    let rafPending = false;
+    chart.subscribeCrosshairMove(() => {
+      if (!rafPending) {
+        rafPending = true;
+        requestAnimationFrame(() => {
+          updateLevelOverlays();
+          rafPending = false;
+        });
+      }
     });
 
     const candleSeries = chart.addCandlestickSeries({
@@ -83,55 +142,25 @@ export default function PriceChart() {
       wickDownColor: '#ff3d5788',
     });
 
+    // Volume on a dedicated overlay scale — completely separate from price axis
     const volumeSeries = chart.addHistogramSeries({
       color: '#00d4ff15',
       priceFormat: { type: 'volume' },
-      priceScaleId: '',
+      priceScaleId: 'volume_overlay',
     });
 
     volumeSeries.priceScale().applyOptions({
       scaleMargins: { top: 0.8, bottom: 0 },
     });
 
-    chartRef.current = chart;
     candleSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
-
-    // Dynamic price line visibility: hide GEX levels when they fall outside
-    // the visible candle range to prevent y-axis compression when zoomed in.
-    chart.timeScale().subscribeVisibleLogicalRangeChange((logicalRange) => {
-      if (!logicalRange || priceLinesRef.current.length === 0) return;
-      const data = historyRef.current;
-      if (!data.length) return;
-
-      const from = Math.max(0, Math.floor(logicalRange.from));
-      const to = Math.min(data.length - 1, Math.ceil(logicalRange.to));
-      if (from > to) return;
-
-      let minP = Infinity, maxP = -Infinity;
-      for (let i = from; i <= to; i++) {
-        if (data[i]) {
-          minP = Math.min(minP, data[i].low);
-          maxP = Math.max(maxP, data[i].high);
-        }
-      }
-      if (minP === Infinity) return;
-
-      const priceRange = maxP - minP;
-      // Allow price lines within 60% of the visible price range as padding
-      const pad = Math.max(priceRange * 0.6, (maxP + minP) * 0.005);
-
-      for (const line of priceLinesRef.current) {
-        const price = line.options().price;
-        const inRange = price >= minP - pad && price <= maxP + pad;
-        line.applyOptions({ lineVisible: inRange, axisLabelVisible: inRange });
-      }
-    });
 
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const { width, height } = entry.contentRect;
         chart.applyOptions({ width, height });
+        setChartHeight(height);
       }
     });
     resizeObserver.observe(chartContainerRef.current);
@@ -139,9 +168,17 @@ export default function PriceChart() {
     return () => {
       resizeObserver.disconnect();
       chart.remove();
-      priceLinesRef.current = [];
     };
   }, []);
+
+  // Adapt timeVisible to interval changes (daily bars don't need HH:MM labels)
+  useEffect(() => {
+    if (!chartRef.current) return;
+    const isIntraday = ['1min', '5min', '15min'].includes(interval);
+    chartRef.current.applyOptions({
+      timeScale: { timeVisible: isIntraday },
+    });
+  }, [interval]);
 
   // Update candle/volume data when history changes
   useEffect(() => {
@@ -165,56 +202,15 @@ export default function PriceChart() {
     volumeSeriesRef.current.setData(volumes);
 
     applyRangeZoom(activeRange);
+
+    // Update overlays after data settles
+    requestAnimationFrame(() => updateLevelOverlays());
   }, [history]);
 
-  // Separate effect for GEX price lines — remove old ones before adding new
+  // Update overlays when GEX levels change
   useEffect(() => {
-    const series = candleSeriesRef.current;
-    if (!series) return;
-
-    for (const line of priceLinesRef.current) {
-      try { series.removePriceLine(line); } catch { /* already removed */ }
-    }
-    priceLinesRef.current = [];
-
-    if (!multiGEX?.aggregated || !history.length) return;
-
-    const agg = multiGEX.aggregated;
-
-    if (agg.gammaFlip) {
-      const line = series.createPriceLine({
-        price: agg.gammaFlip,
-        color: '#ffaa00',
-        lineWidth: 1,
-        lineStyle: 2,
-        axisLabelVisible: true,
-        title: 'γ Flip',
-      });
-      priceLinesRef.current.push(line);
-    }
-    if (agg.callWall) {
-      const line = series.createPriceLine({
-        price: agg.callWall,
-        color: '#00e676',
-        lineWidth: 1,
-        lineStyle: 2,
-        axisLabelVisible: true,
-        title: 'Call Wall',
-      });
-      priceLinesRef.current.push(line);
-    }
-    if (agg.putWall) {
-      const line = series.createPriceLine({
-        price: agg.putWall,
-        color: '#ff3d57',
-        lineWidth: 1,
-        lineStyle: 2,
-        axisLabelVisible: true,
-        title: 'Put Wall',
-      });
-      priceLinesRef.current.push(line);
-    }
-  }, [multiGEX, history.length]);
+    requestAnimationFrame(() => updateLevelOverlays());
+  }, [multiGEX]);
 
   useEffect(() => {
     if (history.length > 0) {
@@ -309,6 +305,30 @@ export default function PriceChart() {
           </div>
         )}
         <div ref={chartContainerRef} className="w-full h-full" />
+
+        {/* GEX Level Overlays — rendered as HTML, zero interaction with chart auto-scale */}
+        {levelOverlays.map((level) => (
+          <div key={level.label} className="absolute left-0 pointer-events-none" style={{ top: level.y, right: 0 }}>
+            <div
+              className="absolute left-0 h-0"
+              style={{
+                right: 55,
+                borderTop: `1px dashed ${level.color}`,
+              }}
+            />
+            <div
+              className="absolute text-[10px] font-mono px-1 rounded whitespace-nowrap"
+              style={{
+                right: 56,
+                top: -9,
+                color: level.color,
+                backgroundColor: `${level.color}20`,
+              }}
+            >
+              {level.label} ${level.price.toFixed(2)}
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );
