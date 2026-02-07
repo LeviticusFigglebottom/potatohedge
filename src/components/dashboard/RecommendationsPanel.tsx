@@ -4,6 +4,7 @@ import { useDashboardStore } from '@/hooks/useDashboardStore';
 import {
   Crosshair, TrendingUp, TrendingDown, Minus, AlertTriangle,
   ChevronRight, Shield, Zap, Target, ArrowUpRight, ArrowDownRight, Circle,
+  BarChart3, Activity,
 } from 'lucide-react';
 
 function BiasGauge({ score, bias }: { score: number; bias: string }) {
@@ -46,6 +47,67 @@ function RegimeBadges({ volRegime, gammaRegime }: { volRegime: string; gammaRegi
       </div>
       <div className={`badge ${gammaRegime === 'long' ? 'badge-green' : gammaRegime === 'short' ? 'badge-red' : 'badge-cyan'}`}>
         γ: {gammaRegime === 'long' ? 'Long Gamma' : gammaRegime === 'short' ? 'Short Gamma' : 'Neutral'}
+      </div>
+    </div>
+  );
+}
+
+function SignalConvergence({ signals }: { signals: { name: string; direction: string; weight: number; description: string }[] }) {
+  // Group signals into categories for cross-reference analysis
+  const categories: { label: string; names: string[]; icon: React.ElementType }[] = [
+    { label: 'GEX', names: ['GEX Regime', 'Gamma Flip', 'Dealer Delta'], icon: Shield },
+    { label: 'Flow', names: ['Volume P/C Ratio', 'Skew'], icon: BarChart3 },
+    { label: 'Levels', names: ['Call Wall Proximity', 'Call Wall Breach', 'Put Wall Proximity', 'Put Wall Breach', 'Max Pain Magnet'], icon: Target },
+    { label: 'Vol', names: ['IV Rank', 'IV/HV Spread'], icon: Activity },
+    { label: 'Mom', names: ['Momentum'], icon: TrendingUp },
+  ];
+
+  const catSummary = categories.map(cat => {
+    const matching = signals.filter(s => cat.names.includes(s.name));
+    if (matching.length === 0) return { ...cat, dir: 'neutral' as string, wt: 0 };
+    const totalWt = matching.reduce((s, sig) => s + sig.weight, 0);
+    const dir = totalWt > 0.05 ? 'bullish' : totalWt < -0.05 ? 'bearish' : 'neutral';
+    return { ...cat, dir, wt: totalWt };
+  });
+
+  const bullishCount = catSummary.filter(c => c.dir === 'bullish').length;
+  const bearishCount = catSummary.filter(c => c.dir === 'bearish').length;
+  const total = catSummary.filter(c => c.dir !== 'neutral').length;
+  const alignment = total > 0 ? Math.max(bullishCount, bearishCount) / total : 0;
+  const dominant = bullishCount > bearishCount ? 'bullish' : bearishCount > bullishCount ? 'bearish' : 'mixed';
+
+  let alignLabel = 'Mixed signals';
+  let alignColor = 'text-accent-amber';
+  if (alignment >= 0.75) {
+    alignLabel = dominant === 'bullish' ? 'Strong bullish alignment' : 'Strong bearish alignment';
+    alignColor = dominant === 'bullish' ? 'text-accent-green' : 'text-accent-red';
+  } else if (alignment >= 0.5) {
+    alignLabel = dominant === 'bullish' ? 'Moderate bullish lean' : dominant === 'bearish' ? 'Moderate bearish lean' : 'Conflicting signals';
+    alignColor = dominant === 'mixed' ? 'text-accent-amber' : dominant === 'bullish' ? 'text-accent-green/70' : 'text-accent-red/70';
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-mono text-text-muted uppercase tracking-wider">Signal Convergence</span>
+        <span className={`text-xs font-mono font-semibold ${alignColor}`}>{alignLabel}</span>
+      </div>
+      <div className="flex gap-1.5">
+        {catSummary.map(cat => {
+          const CatIcon = cat.icon;
+          const bg = cat.dir === 'bullish' ? 'bg-green-500/15 border-green-500/30 text-green-400'
+            : cat.dir === 'bearish' ? 'bg-red-500/15 border-red-500/30 text-red-400'
+            : 'bg-bg-tertiary border-border/30 text-text-muted';
+          return (
+            <div key={cat.label} className={`flex items-center gap-1 px-2 py-1 rounded border text-[10px] font-mono ${bg}`}>
+              <CatIcon className="w-3 h-3" />
+              <span>{cat.label}</span>
+              <span className="font-semibold">
+                {cat.dir === 'bullish' ? '↑' : cat.dir === 'bearish' ? '↓' : '–'}
+              </span>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -180,7 +242,10 @@ export default function RecommendationsPanel() {
       <div className="panel p-4">
         <div className="flex flex-col md:flex-row items-center justify-between gap-4">
           <BiasGauge score={recommendations.biasScore} bias={recommendations.overallBias} />
-          <RegimeBadges volRegime={recommendations.volRegime} gammaRegime={recommendations.gammaRegime} />
+          <div className="flex flex-col gap-3 items-center md:items-end">
+            <RegimeBadges volRegime={recommendations.volRegime} gammaRegime={recommendations.gammaRegime} />
+            <SignalConvergence signals={recommendations.signals} />
+          </div>
         </div>
         {(recommendations.stockContext || recommendations.moveContext) && (
           <div className="mt-3 pt-3 border-t border-border/30 space-y-1">

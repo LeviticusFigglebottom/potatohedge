@@ -33,14 +33,15 @@ export default function PriceChart() {
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const priceLinesRef = useRef<IPriceLine[]>([]);
   const historyRef = useRef(useDashboardStore.getState().history);
+  const visibleRangeRef = useRef<{ from: number; to: number } | null>(null);
 
   const { history, interval, setInterval, loading, symbol, multiGEX } = useDashboardStore();
   const [activeRange, setActiveRange] = useState<RangePreset>('1Y');
 
-  // Keep historyRef in sync for use in the range change callback
+  // Keep historyRef in sync for use in autoscaleInfoProvider + visibility handler
   useEffect(() => { historyRef.current = history; }, [history]);
 
-  // Initialize chart
+  // Initialize chart (runs once)
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
@@ -69,38 +70,25 @@ export default function PriceChart() {
         borderColor: '#2a2a3d',
         timeVisible: true,
         secondsVisible: false,
-        fixRightEdge: true,
+        // NOTE: fixRightEdge removed — it caused edge-case auto-scale issues
+        // when the chart was scrolled to the latest bar. Instead, applyRangeZoom
+        // positions the view correctly on load.
       },
       handleScroll: { vertTouchDrag: false },
     });
 
-    const candleSeries = chart.addCandlestickSeries({
-      upColor: '#00e676',
-      downColor: '#ff3d57',
-      borderUpColor: '#00e676',
-      borderDownColor: '#ff3d57',
-      wickUpColor: '#00e67688',
-      wickDownColor: '#ff3d5788',
-    });
-
-    const volumeSeries = chart.addHistogramSeries({
-      color: '#00d4ff15',
-      priceFormat: { type: 'volume' },
-      priceScaleId: '',
-    });
-
-    volumeSeries.priceScale().applyOptions({
-      scaleMargins: { top: 0.8, bottom: 0 },
-    });
-
     chartRef.current = chart;
-    candleSeriesRef.current = candleSeries;
-    volumeSeriesRef.current = volumeSeries;
 
-    // Dynamic price line visibility: hide GEX levels when they fall outside
-    // the visible candle range to prevent y-axis compression when zoomed in.
+    // Single subscription for both: (1) tracking visible range for autoscaleInfoProvider,
+    // and (2) hiding price line labels when they're far from visible candle data
     chart.timeScale().subscribeVisibleLogicalRangeChange((logicalRange) => {
-      if (!logicalRange || priceLinesRef.current.length === 0) return;
+      if (!logicalRange) return;
+
+      // (1) Store range for autoscaleInfoProvider
+      visibleRangeRef.current = { from: logicalRange.from, to: logicalRange.to };
+
+      // (2) Update price line visibility for visual cleanliness
+      if (priceLinesRef.current.length === 0) return;
       const data = historyRef.current;
       if (!data.length) return;
 
@@ -118,7 +106,6 @@ export default function PriceChart() {
       if (minP === Infinity) return;
 
       const priceRange = maxP - minP;
-      // Allow price lines within 60% of the visible price range as padding
       const pad = Math.max(priceRange * 0.6, (maxP + minP) * 0.005);
 
       for (const line of priceLinesRef.current) {
@@ -127,6 +114,60 @@ export default function PriceChart() {
         line.applyOptions({ lineVisible: inRange, axisLabelVisible: inRange });
       }
     });
+
+    const candleSeries = chart.addCandlestickSeries({
+      upColor: '#00e676',
+      downColor: '#ff3d57',
+      borderUpColor: '#00e676',
+      borderDownColor: '#ff3d57',
+      wickUpColor: '#00e67688',
+      wickDownColor: '#ff3d5788',
+      // CRITICAL FIX: Override auto-scale to compute y-axis range from candle
+      // data ONLY. Without this, price lines (gamma flip, call/put walls)
+      // participate in auto-scale and stretch the y-axis to include their
+      // prices, compressing the actual candle data into a tiny band.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      autoscaleInfoProvider: (original: any) => {
+        const data = historyRef.current;
+        const vr = visibleRangeRef.current;
+
+        // Before we have data + visible range, use library default
+        if (!data.length || !vr) return original();
+
+        const from = Math.max(0, Math.floor(vr.from));
+        const to = Math.min(data.length - 1, Math.ceil(vr.to));
+        if (from > to) return original();
+
+        let minP = Infinity, maxP = -Infinity;
+        for (let i = from; i <= to; i++) {
+          if (data[i]) {
+            minP = Math.min(minP, data[i].low);
+            maxP = Math.max(maxP, data[i].high);
+          }
+        }
+
+        if (minP === Infinity) return original();
+
+        return {
+          priceRange: { minValue: minP, maxValue: maxP },
+        };
+      },
+    });
+
+    // Volume on a named overlay scale — keeps volume values completely
+    // separate from the right price scale (prevents any cross-contamination)
+    const volumeSeries = chart.addHistogramSeries({
+      color: '#00d4ff15',
+      priceFormat: { type: 'volume' },
+      priceScaleId: 'volume_overlay',
+    });
+
+    volumeSeries.priceScale().applyOptions({
+      scaleMargins: { top: 0.8, bottom: 0 },
+    });
+
+    candleSeriesRef.current = candleSeries;
+    volumeSeriesRef.current = volumeSeries;
 
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
@@ -167,7 +208,7 @@ export default function PriceChart() {
     applyRangeZoom(activeRange);
   }, [history]);
 
-  // Separate effect for GEX price lines — remove old ones before adding new
+  // GEX + Max Pain price lines — clean up before re-adding
   useEffect(() => {
     const series = candleSeriesRef.current;
     if (!series) return;
@@ -182,37 +223,45 @@ export default function PriceChart() {
     const agg = multiGEX.aggregated;
 
     if (agg.gammaFlip) {
-      const line = series.createPriceLine({
+      priceLinesRef.current.push(series.createPriceLine({
         price: agg.gammaFlip,
         color: '#ffaa00',
         lineWidth: 1,
         lineStyle: 2,
         axisLabelVisible: true,
         title: 'γ Flip',
-      });
-      priceLinesRef.current.push(line);
+      }));
     }
     if (agg.callWall) {
-      const line = series.createPriceLine({
+      priceLinesRef.current.push(series.createPriceLine({
         price: agg.callWall,
         color: '#00e676',
         lineWidth: 1,
         lineStyle: 2,
         axisLabelVisible: true,
         title: 'Call Wall',
-      });
-      priceLinesRef.current.push(line);
+      }));
     }
     if (agg.putWall) {
-      const line = series.createPriceLine({
+      priceLinesRef.current.push(series.createPriceLine({
         price: agg.putWall,
         color: '#ff3d57',
         lineWidth: 1,
         lineStyle: 2,
         axisLabelVisible: true,
         title: 'Put Wall',
-      });
-      priceLinesRef.current.push(line);
+      }));
+    }
+    // Max pain — dotted cyan line for expiration gravity reference
+    if (multiGEX.maxPain?.strike) {
+      priceLinesRef.current.push(series.createPriceLine({
+        price: multiGEX.maxPain.strike,
+        color: '#00d4ff80',
+        lineWidth: 1,
+        lineStyle: 3,
+        axisLabelVisible: true,
+        title: 'Max Pain',
+      }));
     }
   }, [multiGEX, history.length]);
 
