@@ -32,9 +32,13 @@ export default function PriceChart() {
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const priceLinesRef = useRef<IPriceLine[]>([]);
+  const historyRef = useRef(useDashboardStore.getState().history);
 
   const { history, interval, setInterval, loading, symbol, multiGEX } = useDashboardStore();
   const [activeRange, setActiveRange] = useState<RangePreset>('1Y');
+
+  // Keep historyRef in sync for use in the range change callback
+  useEffect(() => { historyRef.current = history; }, [history]);
 
   // Initialize chart
   useEffect(() => {
@@ -66,8 +70,6 @@ export default function PriceChart() {
         timeVisible: true,
         secondsVisible: false,
         fixRightEdge: true,
-        fixLeftEdge: true,
-        rightOffset: 3,
       },
       handleScroll: { vertTouchDrag: false },
     });
@@ -94,6 +96,37 @@ export default function PriceChart() {
     chartRef.current = chart;
     candleSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
+
+    // Dynamic price line visibility: hide GEX levels when they fall outside
+    // the visible candle range to prevent y-axis compression when zoomed in.
+    chart.timeScale().subscribeVisibleLogicalRangeChange((logicalRange) => {
+      if (!logicalRange || priceLinesRef.current.length === 0) return;
+      const data = historyRef.current;
+      if (!data.length) return;
+
+      const from = Math.max(0, Math.floor(logicalRange.from));
+      const to = Math.min(data.length - 1, Math.ceil(logicalRange.to));
+      if (from > to) return;
+
+      let minP = Infinity, maxP = -Infinity;
+      for (let i = from; i <= to; i++) {
+        if (data[i]) {
+          minP = Math.min(minP, data[i].low);
+          maxP = Math.max(maxP, data[i].high);
+        }
+      }
+      if (minP === Infinity) return;
+
+      const priceRange = maxP - minP;
+      // Allow price lines within 60% of the visible price range as padding
+      const pad = Math.max(priceRange * 0.6, (maxP + minP) * 0.005);
+
+      for (const line of priceLinesRef.current) {
+        const price = line.options().price;
+        const inRange = price >= minP - pad && price <= maxP + pad;
+        line.applyOptions({ lineVisible: inRange, axisLabelVisible: inRange });
+      }
+    });
 
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
@@ -131,7 +164,6 @@ export default function PriceChart() {
     candleSeriesRef.current.setData(candles);
     volumeSeriesRef.current.setData(volumes);
 
-    // Apply range zoom after data load
     applyRangeZoom(activeRange);
   }, [history]);
 
@@ -140,17 +172,13 @@ export default function PriceChart() {
     const series = candleSeriesRef.current;
     if (!series) return;
 
-    // Remove ALL existing price lines first
     for (const line of priceLinesRef.current) {
       try { series.removePriceLine(line); } catch { /* already removed */ }
     }
     priceLinesRef.current = [];
 
-    // Only add price lines if we have GEX data and price data
     if (!multiGEX?.aggregated || !history.length) return;
 
-    // Determine if price lines make sense for the visible range.
-    // They're current-day levels, relevant on any timeframe as reference.
     const agg = multiGEX.aggregated;
 
     if (agg.gammaFlip) {
@@ -188,7 +216,6 @@ export default function PriceChart() {
     }
   }, [multiGEX, history.length]);
 
-  // Apply range when activeRange changes (without data reload)
   useEffect(() => {
     if (history.length > 0) {
       applyRangeZoom(activeRange);
@@ -200,23 +227,19 @@ export default function PriceChart() {
 
     const config = RANGE_CONFIG.find(r => r.value === range);
     if (!config || config.seconds === 0) {
-      // ALL — show everything
       chartRef.current.timeScale().fitContent();
       return;
     }
 
-    // Calculate the "from" timestamp for the visible range
     const lastBar = history[history.length - 1];
     const fromTimestamp = lastBar.time - config.seconds;
-
-    // Find the first bar that's within our range
     const fromIdx = history.findIndex(b => b.time >= fromTimestamp);
     if (fromIdx < 0) {
       chartRef.current.timeScale().fitContent();
       return;
     }
 
-    const fromBar = history[Math.max(0, fromIdx - 2)]; // small left padding
+    const fromBar = history[Math.max(0, fromIdx - 2)];
     chartRef.current.timeScale().setVisibleRange({
       from: fromBar.time as unknown as CandlestickData['time'],
       to: lastBar.time as unknown as CandlestickData['time'],
@@ -226,10 +249,7 @@ export default function PriceChart() {
   const handleRangeChange = useCallback((range: RangePreset) => {
     const config = RANGE_CONFIG.find(r => r.value === range);
     if (!config) return;
-
     setActiveRange(range);
-
-    // If the range needs a different interval, switch it (triggers data fetch)
     if (config.interval !== interval) {
       setInterval(config.interval);
     }
@@ -246,7 +266,6 @@ export default function PriceChart() {
           {symbol} Price Chart
         </span>
         <div className="flex items-center gap-3">
-          {/* Range Presets */}
           <div className="flex items-center gap-0.5 bg-bg-tertiary rounded-md p-0.5">
             {RANGE_CONFIG.map((r) => (
               <button
@@ -262,8 +281,6 @@ export default function PriceChart() {
               </button>
             ))}
           </div>
-
-          {/* Interval Selector */}
           <div className="flex items-center gap-0.5 border-l border-border/30 pl-3">
             <span className="text-[10px] font-mono text-text-muted/60 mr-1">INT</span>
             {INTERVALS.map((int) => (
