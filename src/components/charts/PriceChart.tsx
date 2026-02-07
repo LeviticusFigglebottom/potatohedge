@@ -63,8 +63,8 @@ export default function PriceChart() {
         borderColor: '#2a2a3d',
         timeVisible: true,
         secondsVisible: false,
-        minBarSpacing: 6,
-        rightOffset: 5,
+        fixRightEdge: true,
+        rightOffset: 3,
       },
       handleScroll: { vertTouchDrag: false },
     });

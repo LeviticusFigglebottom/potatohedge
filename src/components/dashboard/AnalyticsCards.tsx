@@ -61,12 +61,8 @@ export default function AnalyticsCards() {
   const volCtx = ctx?.volume;
   let callVolSub = vol ? `${((vol.totalCallVol / Math.max(1, vol.totalCallVol + vol.totalPutVol)) * 100).toFixed(0)}% of total` : '';
   let putVolSub = vol ? `${((vol.totalPutVol / Math.max(1, vol.totalCallVol + vol.totalPutVol)) * 100).toFixed(0)}% of total` : '';
-  if (volCtx) {
-    if (volCtx.callVolRatio > 1.5) callVolSub += ` · ${volCtx.callVolRatio.toFixed(1)}x avg`;
-    else if (volCtx.callVolRatio < 0.6) callVolSub += ` · ${(volCtx.callVolRatio * 100).toFixed(0)}% of avg`;
-    if (volCtx.putVolRatio > 1.5) putVolSub += ` · ${volCtx.putVolRatio.toFixed(1)}x avg`;
-    else if (volCtx.putVolRatio < 0.6) putVolSub += ` · ${(volCtx.putVolRatio * 100).toFixed(0)}% of avg`;
-  }
+  // Note: volume ratios vs average are not shown since we lack
+  // historical daily options volume data. PCR divergence is more meaningful.
 
   // IV context
   let ivSub = '';

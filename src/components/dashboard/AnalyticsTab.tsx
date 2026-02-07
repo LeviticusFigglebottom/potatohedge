@@ -7,6 +7,7 @@ import {
   BarChart3, Activity, TrendingUp, TrendingDown, Shield,
   Thermometer, Zap, Target, AlertTriangle, Gauge, Brain,
 } from 'lucide-react';
+import MetricExplorer from './MetricExplorer';
 
 // ─── IV / HV History Chart ──────────────────────────────────────
 
@@ -766,6 +767,9 @@ export default function AnalyticsTab() {
 
   return (
     <div className="space-y-4 animate-fade-in">
+      {/* Metric Explorer — backward-looking history for any metric */}
+      <MetricExplorer />
+
       {/* Metric Insights — anomalies and context */}
       <MetricContextCards />
 
