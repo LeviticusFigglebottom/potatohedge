@@ -137,8 +137,16 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
   }
 
+  // For fundamental mode, fetch live financial data first
+  let fundamentals: FundamentalData | null = null;
+  if (data.mode === 'fundamental') {
+    fundamentals = await fetchYahooFinancials(data.symbol);
+  }
+
   // Build the prompt based on mode
-  const prompt = data.mode === 'fundamental' ? buildFundamentalPrompt(data) : buildPrompt(data);
+  const prompt = data.mode === 'fundamental'
+    ? buildFundamentalPrompt(data, fundamentals)
+    : buildPrompt(data);
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -172,6 +180,201 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
+
+// ─── Yahoo Finance Data Fetching ──────────────────────────────
+
+interface FundamentalData {
+  // Profile
+  sector?: string;
+  industry?: string;
+  employees?: number;
+  summary?: string;
+  // Valuation
+  marketCap?: number;
+  enterpriseValue?: number;
+  trailingPE?: number;
+  forwardPE?: number;
+  pegRatio?: number;
+  priceToSales?: number;
+  priceToBook?: number;
+  evToEbitda?: number;
+  evToRevenue?: number;
+  // Financials
+  revenue?: number;
+  revenueGrowth?: number;
+  grossMargin?: number;
+  operatingMargin?: number;
+  netMargin?: number;
+  ebitda?: number;
+  trailingEps?: number;
+  forwardEps?: number;
+  earningsGrowth?: number;
+  // Balance sheet
+  totalCash?: number;
+  totalDebt?: number;
+  debtToEquity?: number;
+  // Returns & cashflow
+  roe?: number;
+  roa?: number;
+  freeCashflow?: number;
+  operatingCashflow?: number;
+  // Dividend
+  dividendYield?: number;
+  dividendRate?: number;
+  payoutRatio?: number;
+  exDividendDate?: string;
+  // Analyst
+  targetMean?: number;
+  targetHigh?: number;
+  targetLow?: number;
+  targetMedian?: number;
+  recommendationKey?: string;
+  numberOfAnalysts?: number;
+  // Recommendation trend (current month)
+  strongBuy?: number;
+  buy?: number;
+  hold?: number;
+  sell?: number;
+  strongSell?: number;
+  // Earnings history (last 4 quarters)
+  earningsHistory?: { quarter: string; actual: number; estimate: number; surprisePct: number }[];
+  nextEarningsDate?: string;
+  // 52-week
+  fiftyTwoWeekHigh?: number;
+  fiftyTwoWeekLow?: number;
+  // Other
+  sharesOutstanding?: number;
+  floatShares?: number;
+  shortPercentOfFloat?: number;
+  beta?: number;
+  bookValue?: number;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function raw(obj: any): number | undefined {
+  return obj?.raw ?? obj ?? undefined;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function fmt(obj: any): string | undefined {
+  return obj?.fmt ?? undefined;
+}
+
+async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | null> {
+  try {
+    const modules = [
+      'assetProfile',
+      'financialData',
+      'defaultKeyStatistics',
+      'earningsHistory',
+      'earningsTrend',
+      'recommendationTrend',
+      'calendarEvents',
+    ].join(',');
+
+    const url = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=${modules}`;
+
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!res.ok) return null;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const json: any = await res.json();
+    const result = json?.quoteSummary?.result?.[0];
+    if (!result) return null;
+
+    const profile = result.assetProfile || {};
+    const fin = result.financialData || {};
+    const stats = result.defaultKeyStatistics || {};
+    const earnings = result.earningsHistory?.history || [];
+    const recTrend = result.recommendationTrend?.trend?.[0] || {};
+    const calendar = result.calendarEvents || {};
+
+    const data: FundamentalData = {
+      // Profile
+      sector: profile.sector,
+      industry: profile.industry,
+      employees: raw(profile.fullTimeEmployees),
+      summary: profile.longBusinessSummary,
+      // Valuation
+      marketCap: raw(fin.marketCap ?? stats.marketCap),
+      enterpriseValue: raw(stats.enterpriseValue),
+      trailingPE: raw(stats.trailingPE ?? fin.trailingPE),
+      forwardPE: raw(stats.forwardPE ?? fin.forwardPE),
+      pegRatio: raw(stats.pegRatio),
+      priceToSales: raw(stats.priceToSalesTrailing12Months),
+      priceToBook: raw(stats.priceToBook),
+      evToEbitda: raw(stats.enterpriseToEbitda),
+      evToRevenue: raw(stats.enterpriseToRevenue),
+      // Financials
+      revenue: raw(fin.totalRevenue),
+      revenueGrowth: raw(fin.revenueGrowth),
+      grossMargin: raw(fin.grossMargins),
+      operatingMargin: raw(fin.operatingMargins),
+      netMargin: raw(fin.profitMargins),
+      ebitda: raw(fin.ebitda),
+      trailingEps: raw(stats.trailingEps),
+      forwardEps: raw(stats.forwardEps),
+      earningsGrowth: raw(fin.earningsGrowth),
+      // Balance sheet
+      totalCash: raw(fin.totalCash),
+      totalDebt: raw(fin.totalDebt),
+      debtToEquity: raw(fin.debtToEquity),
+      // Returns & cashflow
+      roe: raw(fin.returnOnEquity),
+      roa: raw(fin.returnOnAssets),
+      freeCashflow: raw(fin.freeCashflow),
+      operatingCashflow: raw(fin.operatingCashflow),
+      // Dividend
+      dividendYield: raw(stats.lastDividendValue) ? raw(fin.dividendYield) : undefined,
+      dividendRate: raw(stats.lastDividendValue),
+      payoutRatio: raw(stats.payoutRatio),
+      exDividendDate: fmt(calendar.exDividendDate),
+      // Analyst
+      targetMean: raw(fin.targetMeanPrice),
+      targetHigh: raw(fin.targetHighPrice),
+      targetLow: raw(fin.targetLowPrice),
+      targetMedian: raw(fin.targetMedianPrice),
+      recommendationKey: fin.recommendationKey,
+      numberOfAnalysts: raw(fin.numberOfAnalystOpinions),
+      // Recommendation trend
+      strongBuy: recTrend.strongBuy,
+      buy: recTrend.buy,
+      hold: recTrend.hold,
+      sell: recTrend.sell,
+      strongSell: recTrend.strongSell,
+      // Earnings history
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      earningsHistory: earnings.slice(0, 4).map((e: any) => ({
+        quarter: fmt(e.quarter) || 'N/A',
+        actual: raw(e.epsActual) ?? 0,
+        estimate: raw(e.epsEstimate) ?? 0,
+        surprisePct: raw(e.surprisePercent) ?? 0,
+      })),
+      nextEarningsDate: fmt(calendar.earnings?.earningsDate?.[0]),
+      // 52-week
+      fiftyTwoWeekHigh: raw(stats.fiftyTwoWeekHigh),
+      fiftyTwoWeekLow: raw(stats.fiftyTwoWeekLow),
+      // Other
+      sharesOutstanding: raw(stats.sharesOutstanding),
+      floatShares: raw(stats.floatShares),
+      shortPercentOfFloat: raw(stats.shortPercentOfFloat),
+      beta: raw(stats.beta),
+      bookValue: raw(stats.bookValue),
+    };
+
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Prompt Builders ──────────────────────────────────────────
 
 function buildPrompt(d: AnalysisRequest): string {
   const pctFmt = (v: number) => `${(v * 100).toFixed(1)}%`;
@@ -291,82 +494,177 @@ Be specific, quantitative, and reference the actual data. Do NOT give generic ad
 Format your response using clear headers and be concise but thorough.`;
 }
 
-function buildFundamentalPrompt(d: AnalysisRequest): string {
+function buildFundamentalPrompt(d: AnalysisRequest, fin: FundamentalData | null): string {
   const dollarFmt = (v: number) => `$${v.toFixed(2)}`;
   const pctFmt = (v: number) => `${(v * 100).toFixed(1)}%`;
+  const bigNum = (n: number) => {
+    if (n >= 1e12) return `$${(n / 1e12).toFixed(2)}T`;
+    if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
+    if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
+    return `$${n.toLocaleString()}`;
+  };
+
+  // Build the live financial data section
+  let financialSection: string;
+  if (fin && fin.marketCap) {
+    const lines: string[] = [];
+    lines.push('LIVE FINANCIAL DATA (fetched from Yahoo Finance — use these numbers, they are current)');
+    lines.push('');
+
+    // Profile
+    if (fin.sector || fin.industry) {
+      lines.push(`Sector: ${fin.sector || 'N/A'} | Industry: ${fin.industry || 'N/A'}${fin.employees ? ` | Employees: ${fin.employees.toLocaleString()}` : ''}`);
+    }
+    if (fin.summary) {
+      lines.push(`Business: ${fin.summary.slice(0, 500)}${fin.summary.length > 500 ? '...' : ''}`);
+    }
+    lines.push('');
+
+    // Valuation
+    lines.push('VALUATION');
+    lines.push(`• Market Cap: ${bigNum(fin.marketCap)}${fin.enterpriseValue ? ` | EV: ${bigNum(fin.enterpriseValue)}` : ''}`);
+    if (fin.trailingPE) lines.push(`• P/E (trailing): ${fin.trailingPE.toFixed(1)}x${fin.forwardPE ? ` | P/E (forward): ${fin.forwardPE.toFixed(1)}x` : ''}`);
+    if (fin.pegRatio) lines.push(`• PEG Ratio: ${fin.pegRatio.toFixed(2)}`);
+    if (fin.priceToSales) lines.push(`• P/S: ${fin.priceToSales.toFixed(1)}x${fin.priceToBook ? ` | P/B: ${fin.priceToBook.toFixed(1)}x` : ''}`);
+    if (fin.evToEbitda) lines.push(`• EV/EBITDA: ${fin.evToEbitda.toFixed(1)}x${fin.evToRevenue ? ` | EV/Revenue: ${fin.evToRevenue.toFixed(1)}x` : ''}`);
+    lines.push('');
+
+    // Income
+    lines.push('INCOME & GROWTH');
+    if (fin.revenue) lines.push(`• Revenue (TTM): ${bigNum(fin.revenue)}${fin.revenueGrowth !== undefined ? ` | YoY Growth: ${(fin.revenueGrowth * 100).toFixed(1)}%` : ''}`);
+    if (fin.trailingEps) lines.push(`• EPS (trailing): $${fin.trailingEps.toFixed(2)}${fin.forwardEps ? ` | EPS (forward est.): $${fin.forwardEps.toFixed(2)}` : ''}`);
+    if (fin.earningsGrowth !== undefined) lines.push(`• Earnings Growth: ${(fin.earningsGrowth * 100).toFixed(1)}%`);
+    if (fin.ebitda) lines.push(`• EBITDA: ${bigNum(fin.ebitda)}`);
+    lines.push('');
+
+    // Margins
+    lines.push('MARGINS');
+    const margins: string[] = [];
+    if (fin.grossMargin !== undefined) margins.push(`Gross: ${(fin.grossMargin * 100).toFixed(1)}%`);
+    if (fin.operatingMargin !== undefined) margins.push(`Operating: ${(fin.operatingMargin * 100).toFixed(1)}%`);
+    if (fin.netMargin !== undefined) margins.push(`Net: ${(fin.netMargin * 100).toFixed(1)}%`);
+    if (margins.length) lines.push(`• ${margins.join(' | ')}`);
+    lines.push('');
+
+    // Balance sheet & cashflow
+    lines.push('BALANCE SHEET & CASHFLOW');
+    if (fin.totalCash) lines.push(`• Cash: ${bigNum(fin.totalCash)}${fin.totalDebt ? ` | Debt: ${bigNum(fin.totalDebt)}` : ''}`);
+    if (fin.debtToEquity !== undefined) lines.push(`• Debt/Equity: ${fin.debtToEquity.toFixed(1)}%`);
+    if (fin.freeCashflow) lines.push(`• Free Cash Flow: ${bigNum(fin.freeCashflow)}${fin.operatingCashflow ? ` | Operating CF: ${bigNum(fin.operatingCashflow)}` : ''}`);
+    const fcfYield = fin.freeCashflow && fin.marketCap ? (fin.freeCashflow / fin.marketCap * 100).toFixed(2) : null;
+    if (fcfYield) lines.push(`• FCF Yield: ${fcfYield}%`);
+    lines.push('');
+
+    // Returns
+    lines.push('RETURNS');
+    const returns: string[] = [];
+    if (fin.roe !== undefined) returns.push(`ROE: ${(fin.roe * 100).toFixed(1)}%`);
+    if (fin.roa !== undefined) returns.push(`ROA: ${(fin.roa * 100).toFixed(1)}%`);
+    if (returns.length) lines.push(`• ${returns.join(' | ')}`);
+    lines.push('');
+
+    // Dividend
+    if (fin.dividendYield && fin.dividendYield > 0) {
+      lines.push('DIVIDEND');
+      lines.push(`• Yield: ${(fin.dividendYield * 100).toFixed(2)}%${fin.dividendRate ? ` ($${fin.dividendRate.toFixed(2)}/share)` : ''}`);
+      if (fin.payoutRatio !== undefined) lines.push(`• Payout Ratio: ${(fin.payoutRatio * 100).toFixed(0)}%`);
+      if (fin.exDividendDate) lines.push(`• Ex-Dividend: ${fin.exDividendDate}`);
+      lines.push('');
+    }
+
+    // 52-week & short interest
+    lines.push('MARKET DATA');
+    if (fin.fiftyTwoWeekHigh && fin.fiftyTwoWeekLow) {
+      lines.push(`• 52-week range: $${fin.fiftyTwoWeekLow.toFixed(2)} — $${fin.fiftyTwoWeekHigh.toFixed(2)} (current: ${((d.spotPrice - fin.fiftyTwoWeekLow) / (fin.fiftyTwoWeekHigh - fin.fiftyTwoWeekLow) * 100).toFixed(0)}% of range)`);
+    }
+    if (fin.beta) lines.push(`• Beta: ${fin.beta.toFixed(2)}`);
+    if (fin.sharesOutstanding) lines.push(`• Shares Outstanding: ${(fin.sharesOutstanding / 1e6).toFixed(1)}M${fin.floatShares ? ` | Float: ${(fin.floatShares / 1e6).toFixed(1)}M` : ''}`);
+    if (fin.shortPercentOfFloat) lines.push(`• Short Interest (% float): ${(fin.shortPercentOfFloat * 100).toFixed(1)}%`);
+    lines.push('');
+
+    // Analyst
+    lines.push('ANALYST CONSENSUS');
+    if (fin.recommendationKey) lines.push(`• Rating: ${fin.recommendationKey.toUpperCase()}${fin.numberOfAnalysts ? ` (${fin.numberOfAnalysts} analysts)` : ''}`);
+    if (fin.targetMean) lines.push(`• Price Target — Mean: $${fin.targetMean.toFixed(2)}${fin.targetMedian ? ` | Median: $${fin.targetMedian.toFixed(2)}` : ''} | Low: $${fin.targetLow?.toFixed(2) ?? 'N/A'} | High: $${fin.targetHigh?.toFixed(2) ?? 'N/A'}`);
+    if (fin.strongBuy !== undefined) {
+      lines.push(`• Distribution: ${fin.strongBuy} Strong Buy | ${fin.buy} Buy | ${fin.hold} Hold | ${fin.sell} Sell | ${fin.strongSell} Strong Sell`);
+    }
+    lines.push('');
+
+    // Earnings history
+    if (fin.earningsHistory && fin.earningsHistory.length > 0) {
+      lines.push('RECENT EARNINGS (last 4 quarters)');
+      for (const e of fin.earningsHistory) {
+        const beat = e.actual > e.estimate;
+        const diff = e.actual - e.estimate;
+        lines.push(`• ${e.quarter}: EPS $${e.actual.toFixed(2)} vs est. $${e.estimate.toFixed(2)} (${beat ? 'BEAT' : 'MISSED'} by $${Math.abs(diff).toFixed(2)}, ${e.surprisePct > 0 ? '+' : ''}${(e.surprisePct * 100).toFixed(1)}%)`);
+      }
+      if (fin.nextEarningsDate) lines.push(`• Next earnings: ${fin.nextEarningsDate}`);
+      lines.push('');
+    }
+
+    financialSection = lines.join('\n');
+  } else {
+    financialSection = `LIVE FINANCIAL DATA: ⚠️ Not available (Yahoo Finance fetch failed).
+Use your training knowledge for financial metrics, but clearly note all figures as estimates and flag your knowledge cutoff.
+The CURRENT stock price is ${dollarFmt(d.spotPrice)} — use this as your anchor. Do NOT cite a price from your training data.`;
+  }
 
   return `You are a senior equity research analyst. Generate a comprehensive fundamental analysis report for **${d.symbol}** trading at ${dollarFmt(d.spotPrice)} (${d.changePct > 0 ? '+' : ''}${d.changePct.toFixed(2)}% today).
 
-Use your training knowledge to provide the most current fundamental data available. Where exact numbers aren't certain, provide your best estimates and note them as approximate.
+IMPORTANT: Live financial data has been fetched and is provided below. Use THESE numbers as your primary source — they are current and accurate. Supplement with your knowledge for qualitative analysis (competitive positioning, recent news, growth narratives), but DO NOT override the quantitative data below with numbers from your training data. If your training data conflicts with the live data, trust the live data.
 
 ═══════════════════════════════════════════
-FUNDAMENTAL ANALYSIS REPORT — ${d.symbol}
+${financialSection}
 ═══════════════════════════════════════════
 
-Please cover ALL of the following sections:
-
-## 1. COMPANY OVERVIEW
-- What the company does (1-2 sentences)
-- Business segments and revenue mix
-- Competitive moat / positioning
-- TAM (total addressable market) and market share
-
-## 2. KEY FINANCIAL METRICS
-- Market Cap
-- Revenue (TTM and YoY growth)
-- EPS (TTM and forward estimates)
-- P/E Ratio (trailing and forward)
-- P/S Ratio
-- PEG Ratio
-- EV/EBITDA
-- Gross Margin, Operating Margin, Net Margin
-- Free Cash Flow and FCF Yield
-- Debt/Equity and Interest Coverage
-- ROE and ROIC
-- Dividend Yield (if applicable) and Payout Ratio
-
-## 3. RECENT EARNINGS
-- Last quarter's results vs estimates (revenue & EPS beat/miss)
-- Key takeaways from the earnings call
-- Forward guidance provided by management
-- Next earnings date (if known)
-
-## 4. GROWTH DRIVERS & CATALYSTS
-- Near-term catalysts (next 1-3 months)
-- Medium-term growth drivers (next 1-2 years)
-- Long-term secular trends supporting the thesis
-- Any upcoming product launches, partnerships, or strategic initiatives
-
-## 5. RISKS & HEADWINDS
-- Key operational risks
-- Competitive threats
-- Regulatory / legal concerns
-- Macroeconomic sensitivity
-- Valuation risk at current levels
-
-## 6. RECENT NEWS & SENTIMENT
-- Notable recent news (last 30 days)
-- Analyst consensus rating and average price target
-- Recent insider buying/selling activity (if notable)
-- Institutional ownership trends
-
-## 7. TECHNICAL CONTEXT (from live data)
+LIVE MARKET DATA
 Current price: ${dollarFmt(d.spotPrice)}
 Today's change: ${d.changePct > 0 ? '+' : ''}${d.changePct.toFixed(2)}%
 Volume: ${(d.volume / 1e6).toFixed(1)}M (${d.avgVolume > 0 ? ((d.volume / d.avgVolume) * 100).toFixed(0) : '?'}% of avg)
 IV Rank: ${d.ivRank}/100 | Current IV: ${pctFmt(d.currentIV)} | HV20: ${pctFmt(d.hv20)}
 ${d.correlations ? `Beta: ${d.correlations.beta.toFixed(2)} | 30d Alpha: ${d.correlations.alpha30d > 0 ? '+' : ''}${(d.correlations.alpha30d * 100).toFixed(1)}%` : ''}
 
-## 8. VALUATION ASSESSMENT
-- Compare current valuation to historical averages
-- Compare to peers/sector averages
-- DCF-based fair value estimate (rough range)
-- Bull case / Base case / Bear case price targets with reasoning
+═══════════════════════════════════════════
+YOUR TASK
+═══════════════════════════════════════════
 
-## 9. BOTTOM LINE
-- 2-3 sentence summary: Is this stock a Buy, Hold, or Sell at current levels?
-- What would change your mind in each direction?
+Using the live data above as your foundation, provide a complete equity research report covering:
+
+## 1. COMPANY OVERVIEW
+- What the company does, business segments, competitive moat, TAM and market share
+
+## 2. KEY FINANCIAL METRICS
+- Present all the live metrics above in a clean, organized format
+- Calculate any derived metrics (FCF yield, ROIC, etc.) from the raw data
+- Compare key ratios to sector averages where you can
+
+## 3. RECENT EARNINGS
+- Analyze the earnings history data provided above
+- Add context from your knowledge: what were the key themes from recent calls?
+- Note the next earnings date and what to watch for
+
+## 4. GROWTH DRIVERS & CATALYSTS
+- Near-term (1-3 months), medium-term (1-2 years), and long-term secular trends
+- Product launches, partnerships, strategic initiatives
+
+## 5. RISKS & HEADWINDS
+- Operational, competitive, regulatory, macro, and valuation risks
+
+## 6. RECENT NEWS & SENTIMENT
+- Notable recent developments (from your knowledge)
+- Analyst consensus is provided in the data above — analyze it
+- Insider/institutional trends if notable
+
+## 7. VALUATION ASSESSMENT
+- Compare current multiples to historical and peer averages
+- DCF-based fair value estimate (rough range)
+- Bull / Base / Bear case price targets with reasoning
+
+## 8. BOTTOM LINE
+- Buy, Hold, or Sell at current levels?
+- What would change your mind?
 - Conviction level (1-10) with justification
 
-Be specific, data-driven, and balanced. Acknowledge uncertainty where it exists. Focus on material facts that would influence an investment decision. Format with clear headers and be thorough but readable.`;
+Be specific, data-driven, and balanced. Use the LIVE numbers provided — do not substitute with older data from training. Format with clear headers.`;
 }
