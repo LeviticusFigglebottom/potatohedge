@@ -6,6 +6,12 @@ import type { Interval, OHLCV } from '@/types/market';
 /**
  * Sanitize outlier wicks that distort chart auto-scale.
  * Flash crashes (e.g. SPY briefly hitting $69 on a wick) are real data
+ * but make the chart unreadable.
+ *
+ * KEY FIX: compute local stats from NEIGHBORS ONLY (excluding current bar),
+ * so an outlier bar can't pollute its own reference frame.
+ * If a wick extends >25% from the neighbor median and no neighbor confirms,
+ * clamp the wick to the candle body (open/close).
  * but make the chart unreadable. We detect and clamp extreme wicks
  * while preserving legitimate volatile moves.
  *
@@ -16,6 +22,42 @@ import type { Interval, OHLCV } from '@/types/market';
 function sanitizeBars(bars: OHLCV[]): OHLCV[] {
   if (bars.length < 10) return bars;
 
+  const WINDOW = 5;
+  const WICK_THRESHOLD = 0.25;
+
+  return bars.map((bar, i) => {
+    // NEIGHBORS only — exclude current bar so outlier can't skew its own stats
+    const start = Math.max(0, i - WINDOW);
+    const end = Math.min(bars.length, i + WINDOW + 1);
+    const neighbors: OHLCV[] = [];
+    for (let j = start; j < end; j++) {
+      if (j !== i) neighbors.push(bars[j]);
+    }
+    if (neighbors.length < 3) return bar;
+
+    const neighborCloses = neighbors.map(b => b.close).sort((a, b) => a - b);
+    const median = neighborCloses[Math.floor(neighborCloses.length / 2)];
+    if (median <= 0) return bar;
+
+    let { low, high } = bar;
+    const bodyLow = Math.min(bar.open, bar.close);
+    const bodyHigh = Math.max(bar.open, bar.close);
+
+    // Check if the low wick is an extreme outlier
+    if ((median - low) / median > WICK_THRESHOLD) {
+      const nearestNeighborLow = Math.min(...neighbors.map(b => b.low));
+      // If no neighbor has a low anywhere near this extreme, it's an outlier
+      if (nearestNeighborLow > 0 && (nearestNeighborLow - low) / nearestNeighborLow > 0.15) {
+        // Clamp to candle body — removes the outlier wick
+        low = bodyLow;
+      }
+    }
+
+    // Check if the high wick is an extreme outlier
+    if ((high - median) / median > WICK_THRESHOLD) {
+      const nearestNeighborHigh = Math.max(...neighbors.map(b => b.high));
+      if (nearestNeighborHigh > 0 && (high - nearestNeighborHigh) / nearestNeighborHigh > 0.15) {
+        high = bodyHigh;
   const WINDOW = 5; // look at ±5 neighbors
   const WICK_THRESHOLD = 0.30; // 30% deviation from local median = suspicious
 

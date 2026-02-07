@@ -103,7 +103,7 @@ export async function GET(request: NextRequest) {
     const totalDEX = aggregatedExposures.reduce((s, e) => s + e.netDEX, 0);
     const totalVanna = aggregatedExposures.reduce((s, e) => s + e.netVanna, 0);
     const totalCharm = aggregatedExposures.reduce((s, e) => s + e.netCharm, 0);
-    const gammaFlip = findGammaFlip(aggregatedExposures);
+    const gammaFlip = findGammaFlip(aggregatedExposures, spotPrice);
     const callWall = findCallWall(aggregatedExposures);
     const putWall = findPutWall(aggregatedExposures);
 

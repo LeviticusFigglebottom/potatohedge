@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useEffect } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
-import { Sparkles, AlertTriangle, Loader2, RefreshCw, Brain } from 'lucide-react';
+import { Sparkles, AlertTriangle, Loader2, RefreshCw, Brain, FileText } from 'lucide-react';
 
 export default function AIAnalysisPanel() {
   const {
@@ -10,6 +10,7 @@ export default function AIAnalysisPanel() {
   } = useDashboardStore();
 
   const [analysis, setAnalysis] = useState<string | null>(null);
+  const [analysisMode, setAnalysisMode] = useState<'trade' | 'fundamental'>('trade');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [model, setModel] = useState<string>('');
@@ -18,17 +19,19 @@ export default function AIAnalysisPanel() {
   // Reset when ticker changes
   useEffect(() => {
     setAnalysis(null);
+    setAnalysisMode('trade');
     setError(null);
     setModel('');
     setTokens(null);
   }, [symbol]);
 
-  const runAnalysis = useCallback(async () => {
+  const runAnalysis = useCallback(async (mode: 'trade' | 'fundamental' = 'trade') => {
     if (!quote || !multiGEX) {
       setError('Wait for market data to load first.');
       return;
     }
 
+    setAnalysisMode(mode);
     setLoading(true);
     setError(null);
     setAnalysis(null);
@@ -37,6 +40,7 @@ export default function AIAnalysisPanel() {
       // Collect ALL available data into the payload
       const payload = {
         symbol,
+        mode,
         spotPrice: quote.last,
         change: quote.change,
         changePct: quote.changePct,
@@ -189,8 +193,17 @@ export default function AIAnalysisPanel() {
       });
 
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({ error: 'Unknown error' }));
-        throw new Error(errData.error || `HTTP ${res.status}`);
+        const text = await res.text().catch(() => '');
+        let errorMsg = `HTTP ${res.status}`;
+        try {
+          const errData = JSON.parse(text);
+          errorMsg = errData.error || errorMsg;
+        } catch {
+          // Non-JSON response (e.g. Vercel timeout page)
+          if (res.status === 504) errorMsg = 'Request timed out — try again';
+          else if (text.length < 200) errorMsg = text || errorMsg;
+        }
+        throw new Error(errorMsg);
       }
 
       const result = await res.json();
@@ -209,8 +222,29 @@ export default function AIAnalysisPanel() {
 
   return (
     <div className="space-y-3">
-      {/* Trigger Button */}
+      {/* Trigger Buttons */}
       {!analysis && !loading && (
+        <div className="flex gap-3">
+          <button
+            onClick={() => runAnalysis('trade')}
+            disabled={!multiGEX}
+            className={`flex-1 group relative overflow-hidden rounded-lg border transition-all duration-300 ${
+              multiGEX
+                ? 'border-purple-500/40 hover:border-purple-400/60 bg-gradient-to-r from-purple-500/10 via-bg-secondary to-purple-500/10 hover:from-purple-500/20 hover:via-purple-500/5 hover:to-purple-500/20 cursor-pointer'
+                : 'border-border/30 bg-bg-secondary opacity-50 cursor-not-allowed'
+            }`}
+          >
+            <div className="px-4 py-4 flex items-center justify-center gap-3">
+              <Brain className={`w-5 h-5 ${multiGEX ? 'text-purple-400 group-hover:text-purple-300' : 'text-text-muted'}`} />
+              <div className="text-left">
+                <span className={`text-sm font-semibold ${multiGEX ? 'text-purple-300 group-hover:text-purple-200' : 'text-text-muted'}`}>
+                  Trade Analysis
+                </span>
+                <p className="text-xs text-text-muted mt-0.5">
+                  {multiGEX ? 'Options strategies based on GEX, IV, flow & dealer data' : 'Waiting for data...'}
+                </p>
+              </div>
+              <Sparkles className={`w-4 h-4 ${multiGEX ? 'text-purple-400/60' : 'text-text-muted/40'}`} />
         <button
           onClick={runAnalysis}
           disabled={!multiGEX}
@@ -232,32 +266,73 @@ export default function AIAnalysisPanel() {
                   : 'Waiting for market data to load...'}
               </p>
             </div>
-            <Sparkles className={`w-4 h-4 ${multiGEX ? 'text-purple-400/60' : 'text-text-muted/40'}`} />
-          </div>
-          {/* Animated gradient border effect */}
-          {multiGEX && (
-            <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-500">
-              <div className="absolute inset-[-1px] rounded-lg bg-gradient-to-r from-purple-500/20 via-cyan-500/10 to-purple-500/20 blur-sm" />
+            {multiGEX && (
+              <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-500">
+                <div className="absolute inset-[-1px] rounded-lg bg-gradient-to-r from-purple-500/20 via-cyan-500/10 to-purple-500/20 blur-sm" />
+              </div>
+            )}
+          </button>
+
+          <button
+            onClick={() => runAnalysis('fundamental')}
+            disabled={!multiGEX}
+            className={`flex-1 group relative overflow-hidden rounded-lg border transition-all duration-300 ${
+              multiGEX
+                ? 'border-cyan-500/40 hover:border-cyan-400/60 bg-gradient-to-r from-cyan-500/10 via-bg-secondary to-cyan-500/10 hover:from-cyan-500/20 hover:via-cyan-500/5 hover:to-cyan-500/20 cursor-pointer'
+                : 'border-border/30 bg-bg-secondary opacity-50 cursor-not-allowed'
+            }`}
+          >
+            <div className="px-4 py-4 flex items-center justify-center gap-3">
+              <FileText className={`w-5 h-5 ${multiGEX ? 'text-cyan-400 group-hover:text-cyan-300' : 'text-text-muted'}`} />
+              <div className="text-left">
+                <span className={`text-sm font-semibold ${multiGEX ? 'text-cyan-300 group-hover:text-cyan-200' : 'text-text-muted'}`}>
+                  Fundamental Report
+                </span>
+                <p className="text-xs text-text-muted mt-0.5">
+                  {multiGEX ? 'Financials, earnings, valuation, catalysts & risks' : 'Waiting for data...'}
+                </p>
+              </div>
+              <Sparkles className={`w-4 h-4 ${multiGEX ? 'text-cyan-400/60' : 'text-text-muted/40'}`} />
             </div>
-          )}
-        </button>
+            {multiGEX && (
+              <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-500">
+                <div className="absolute inset-[-1px] rounded-lg bg-gradient-to-r from-cyan-500/20 via-purple-500/10 to-cyan-500/20 blur-sm" />
+              </div>
+            )}
+          </button>
+        </div>
       )}
 
       {/* Loading State */}
       {loading && (
-        <div className="panel border border-purple-500/30">
+        <div className={`panel border ${analysisMode === 'fundamental' ? 'border-cyan-500/30' : 'border-purple-500/30'}`}>
           <div className="px-6 py-8 flex flex-col items-center gap-4">
             <div className="relative">
-              <Loader2 className="w-8 h-8 text-purple-400 animate-spin" />
-              <Sparkles className="w-4 h-4 text-purple-300 absolute -top-1 -right-1 animate-pulse" />
+              <Loader2 className={`w-8 h-8 animate-spin ${analysisMode === 'fundamental' ? 'text-cyan-400' : 'text-purple-400'}`} />
+              <Sparkles className={`w-4 h-4 absolute -top-1 -right-1 animate-pulse ${analysisMode === 'fundamental' ? 'text-cyan-300' : 'text-purple-300'}`} />
             </div>
             <div className="text-center">
-              <p className="text-sm font-semibold text-purple-300">Claude is analyzing {symbol}...</p>
+              <p className={`text-sm font-semibold ${analysisMode === 'fundamental' ? 'text-cyan-300' : 'text-purple-300'}`}>
+                {analysisMode === 'fundamental'
+                  ? `Claude is researching ${symbol} fundamentals...`
+                  : `Claude is analyzing ${symbol}...`}
+              </p>
               <p className="text-xs text-text-muted mt-1">
-                Processing dealer positioning, volatility surface, options flow, and ATR profile
+                {analysisMode === 'fundamental'
+                  ? 'Compiling financials, earnings, valuation, catalysts, and risk factors'
+                  : 'Processing dealer positioning, volatility surface, options flow, and ATR profile'}
               </p>
             </div>
             <div className="flex gap-2 flex-wrap justify-center mt-2">
+              {(analysisMode === 'fundamental'
+                ? ['Financials', 'Earnings', 'Valuation', 'Growth', 'Risks', 'News', 'Analyst Targets']
+                : ['GEX/DEX', 'IV Rank', 'Term Structure', 'Skew', 'PCR', 'ATR', 'Key Levels', 'Correlations']
+              ).map(tag => (
+                <span key={tag} className={`text-[10px] font-mono px-2 py-0.5 rounded-full border ${
+                  analysisMode === 'fundamental'
+                    ? 'bg-cyan-500/10 text-cyan-300/60 border-cyan-500/20'
+                    : 'bg-purple-500/10 text-purple-300/60 border-purple-500/20'
+                }`}>
               {['GEX/DEX', 'IV Rank', 'Term Structure', 'Skew', 'PCR', 'ATR', 'Key Levels', 'Correlations'].map(tag => (
                 <span key={tag} className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-300/60 border border-purple-500/20">
                   {tag}
@@ -276,7 +351,7 @@ export default function AIAnalysisPanel() {
             <p className="text-sm text-accent-red font-semibold">Analysis Failed</p>
             <p className="text-xs text-text-muted mt-0.5">{error}</p>
           </div>
-          <button onClick={runAnalysis} className="text-xs text-accent-cyan hover:underline shrink-0">
+          <button onClick={() => runAnalysis(analysisMode)} className="text-xs text-accent-cyan hover:underline shrink-0">
             Retry
           </button>
         </div>
@@ -284,13 +359,16 @@ export default function AIAnalysisPanel() {
 
       {/* Analysis Result */}
       {analysis && (
-        <div className="panel border border-purple-500/30 animate-fade-in">
+        <div className={`panel border ${analysisMode === 'fundamental' ? 'border-cyan-500/30' : 'border-purple-500/30'} animate-fade-in`}>
           {/* Header */}
           <div className="px-4 py-3 border-b border-border/30 flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <Brain className="w-4 h-4 text-purple-400" />
-              <span className="text-xs font-mono font-semibold text-purple-300 uppercase tracking-wider">
-                Claude Analysis — {symbol}
+              {analysisMode === 'fundamental'
+                ? <FileText className="w-4 h-4 text-cyan-400" />
+                : <Brain className="w-4 h-4 text-purple-400" />
+              }
+              <span className={`text-xs font-mono font-semibold uppercase tracking-wider ${analysisMode === 'fundamental' ? 'text-cyan-300' : 'text-purple-300'}`}>
+                {analysisMode === 'fundamental' ? 'Fundamental Report' : 'Trade Analysis'} — {symbol}
               </span>
               {model && (
                 <span className="text-[10px] font-mono text-text-muted bg-bg-tertiary px-1.5 py-0.5 rounded">
@@ -305,11 +383,24 @@ export default function AIAnalysisPanel() {
                 </span>
               )}
               <button
-                onClick={runAnalysis}
-                className="flex items-center gap-1.5 text-xs font-mono text-purple-400 hover:text-purple-300 transition-colors"
+                onClick={() => runAnalysis(analysisMode)}
+                className={`flex items-center gap-1.5 text-xs font-mono transition-colors ${
+                  analysisMode === 'fundamental' ? 'text-cyan-400 hover:text-cyan-300' : 'text-purple-400 hover:text-purple-300'
+                }`}
               >
                 <RefreshCw className="w-3 h-3" />
                 Re-analyze
+              </button>
+              <button
+                onClick={() => {
+                  setAnalysis(null);
+                  setError(null);
+                  setModel('');
+                  setTokens(null);
+                }}
+                className="text-xs font-mono text-text-muted hover:text-text-secondary transition-colors"
+              >
+                Back
               </button>
             </div>
           </div>

@@ -42,7 +42,7 @@ export async function GET(request: NextRequest) {
     );
 
     const totalGEX = exposures.reduce((sum, e) => sum + e.netGEX, 0);
-    const gammaFlip = findGammaFlip(exposures);
+    const gammaFlip = findGammaFlip(exposures, chain.underlyingPrice);
     const callWall = findCallWall(exposures);
     const putWall = findPutWall(exposures);
 
