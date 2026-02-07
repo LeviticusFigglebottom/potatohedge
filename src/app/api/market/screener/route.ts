@@ -17,7 +17,7 @@ import { generateRecommendations, type RecommendationInput } from '@/lib/math/re
 import { getUniverseSymbols } from '@/lib/stockUniverse';
 import type { EquityBar } from '@/lib/providers/equityBars';
 
-export const maxDuration = 600; // 10 minutes — self-hosted, no timeout issues
+export const maxDuration = 300;
 
 export interface ScreenerResult {
   symbol: string;
