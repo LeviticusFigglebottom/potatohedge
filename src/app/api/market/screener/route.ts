@@ -19,8 +19,6 @@ import type { EquityBar } from '@/lib/providers/equityBars';
 
 export const maxDuration = 300;
 
-export const maxDuration = 300; // 5 minutes — self-hosted, no timeout issues
-
 export interface ScreenerResult {
   symbol: string;
   spotPrice: number;
@@ -42,7 +40,6 @@ export interface ScreenerResult {
 }
 
 const CONCURRENCY = 8; // parallel stock processing limit
-const CONCURRENCY = 4; // parallel stock processing limit
 
 async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -171,7 +168,6 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
     const totalGEX = aggExposures.reduce((s, e) => s + e.netGEX, 0);
     const totalDEX = aggExposures.reduce((s, e) => s + e.netDEX, 0);
     const gammaFlip = findGammaFlip(aggExposures, spotPrice);
-    const gammaFlip = findGammaFlip(aggExposures);
     const callWall = findCallWall(aggExposures);
     const putWall = findPutWall(aggExposures);
 
@@ -189,12 +185,6 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
       .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < atmTolerance && o.impliedVolatility > 0.01)
       .sort((a, b) => Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice));
     let currentIV = atmOpts.length > 0
-    // ATM IV
-    const nearChain = chains[0];
-    const atmOpts = [...nearChain.calls, ...nearChain.puts]
-      .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < 0.02 && o.impliedVolatility > 0.01)
-      .sort((a, b) => Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice));
-    const currentIV = atmOpts.length > 0
       ? atmOpts.slice(0, 4).reduce((s, o) => s + o.impliedVolatility, 0) / Math.min(4, atmOpts.length)
       : 0;
 
