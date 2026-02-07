@@ -20,7 +20,7 @@ export default function PriceChart() {
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
 
-  const { history, interval, setInterval, loading, symbol, analytics } = useDashboardStore();
+  const { history, interval, setInterval, loading, symbol, multiGEX } = useDashboardStore();
 
   // Initialize chart
   useEffect(() => {
@@ -114,13 +114,12 @@ export default function PriceChart() {
     volumeSeriesRef.current.setData(volumes);
 
     // Add GEX levels as price lines
-    if (analytics?.gex && candleSeriesRef.current) {
-      // Clear previous lines would require tracking them; for now just add
+    if (multiGEX?.aggregated && candleSeriesRef.current) {
       const series = candleSeriesRef.current;
       
-      if (analytics.gex.gammaFlip) {
+      if (multiGEX.aggregated.gammaFlip) {
         series.createPriceLine({
-          price: analytics.gex.gammaFlip,
+          price: multiGEX.aggregated.gammaFlip,
           color: '#ffaa00',
           lineWidth: 1,
           lineStyle: 2,
@@ -128,9 +127,9 @@ export default function PriceChart() {
           title: 'γ Flip',
         });
       }
-      if (analytics.gex.callWall) {
+      if (multiGEX.aggregated.callWall) {
         series.createPriceLine({
-          price: analytics.gex.callWall,
+          price: multiGEX.aggregated.callWall,
           color: '#00e676',
           lineWidth: 1,
           lineStyle: 2,
@@ -138,9 +137,9 @@ export default function PriceChart() {
           title: 'Call Wall',
         });
       }
-      if (analytics.gex.putWall) {
+      if (multiGEX.aggregated.putWall) {
         series.createPriceLine({
-          price: analytics.gex.putWall,
+          price: multiGEX.aggregated.putWall,
           color: '#ff3d57',
           lineWidth: 1,
           lineStyle: 2,
@@ -151,7 +150,7 @@ export default function PriceChart() {
     }
 
     chartRef.current?.timeScale().fitContent();
-  }, [history, analytics]);
+  }, [history, multiGEX]);
 
   const handleIntervalChange = useCallback((newInterval: Interval) => {
     setInterval(newInterval);

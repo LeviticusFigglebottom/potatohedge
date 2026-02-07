@@ -2,23 +2,51 @@ import { create } from 'zustand';
 import type { Quote, OHLCV, OptionsChain, OptionExpiration, Interval } from '@/types/market';
 import type { StrikeExposure } from '@/lib/math/blackScholes';
 
-interface Analytics {
-  gex: {
-    totalGEX: number;
-    gammaFlip: number | null;
-    callWall: number | null;
-    putWall: number | null;
-    maxGammaStrike: number;
-    exposures: StrikeExposure[];
-    spotPrice: number;
-  };
-  maxPain: { strike: number; totalPain: number; distribution: { strike: number; callPain: number; putPain: number; totalPain: number }[] };
-  pcr: { volumePCR: number; oiPCR: number; totalCallVol: number; totalPutVol: number; totalCallOI: number; totalPutOI: number };
-  interpretations: string[];
+// ─── Phase 2 Types ─────────────────────────────────────────
+
+interface PerExpData {
+  expiration: string; dte: number;
+  totalGEX: number; totalDEX: number; totalVanna: number; totalCharm: number;
+  callVolume: number; putVolume: number; callOI: number; putOI: number;
+  volumePCR: number; oiPCR: number;
+  exposures: StrikeExposure[];
 }
 
+interface ContextBlock {
+  dealer: { gexRegime: string; dexBias: string; spotVsGammaFlip: string; keyLevels: { level: string; price: number; distance: number; interpretation: string }[]; interpretation: string };
+  volume: { callVolRatio: number; putVolRatio: number; totalVolRatio: number; pcrToday: number; pcrAvg: number; interpretation: string };
+  skew: { skew25d: number; skewRatio: number; skewBias: string; interpretation: string };
+  oi: { topCallStrikes: { strike: number; oi: number; pctOfTotal: number }[]; topPutStrikes: { strike: number; oi: number; pctOfTotal: number }[]; interpretation: string };
+}
+
+export interface MultiGEXData {
+  spotPrice: number;
+  expirationsCovered: string[];
+  aggregated: {
+    totalGEX: number; totalDEX: number; totalVanna: number; totalCharm: number;
+    gammaFlip: number | null; callWall: number | null; putWall: number | null;
+    exposures: StrikeExposure[];
+  };
+  perExpiration: PerExpData[];
+  volume: { totalCallVol: number; totalPutVol: number; totalCallOI: number; totalPutOI: number; volumePCR: number; oiPCR: number };
+  maxPain: { strike: number; totalPain: number; distribution: { strike: number; callPain: number; putPain: number; totalPain: number }[] };
+  context: ContextBlock;
+}
+
+export interface SnapshotData {
+  spotPrice: number;
+  iv: { currentIV: number; ivRank: number; ivPercentile: number; iv30dMA: number; iv52wHigh: number; iv52wLow: number; hvCurrent: number; ivHvRatio: number; interpretation: string };
+  termStructure: { expiration: string; dte: number; atmIV: number }[];
+  skewSurface: { expiration: string; dte: number; points: { strike: number; iv: number; type: string; delta: number }[] }[];
+  historicalVol: { hv20: number; hv60: number };
+  snapshotCount: number;
+}
+
+export type TabId = 'overview' | 'chain' | 'dealer' | 'volatility';
+
 interface DashboardStore {
-  // State
+  activeTab: TabId;
+  setActiveTab: (tab: TabId) => void;
   symbol: string;
   quote: Quote | null;
   history: OHLCV[];
@@ -26,173 +54,101 @@ interface DashboardStore {
   expirations: OptionExpiration[];
   selectedExpiration: string | null;
   interval: Interval;
-  analytics: Analytics | null;
-
-  loading: {
-    quote: boolean;
-    history: boolean;
-    chain: boolean;
-    expirations: boolean;
-    analytics: boolean;
-  };
+  multiGEX: MultiGEXData | null;
+  snapshot: SnapshotData | null;
+  loading: Record<string, boolean>;
   error: string | null;
   lastUpdate: number;
 
-  // Actions
-  setSymbol: (symbol: string) => void;
-  setInterval: (interval: Interval) => void;
-  setSelectedExpiration: (exp: string) => void;
+  setSymbol: (s: string) => void;
+  setInterval: (i: Interval) => void;
+  setSelectedExpiration: (e: string) => void;
   fetchQuote: () => Promise<void>;
   fetchHistory: () => Promise<void>;
   fetchExpirations: () => Promise<void>;
   fetchChain: () => Promise<void>;
-  fetchAnalytics: () => Promise<void>;
-  loadSymbol: (symbol: string) => Promise<void>;
+  fetchMultiGEX: () => Promise<void>;
+  fetchSnapshot: () => Promise<void>;
+  loadSymbol: (s: string) => Promise<void>;
 }
 
-export const useDashboardStore = create<DashboardStore>((set, get) => ({
-  symbol: 'SPY',
-  quote: null,
-  history: [],
-  chain: null,
-  expirations: [],
-  selectedExpiration: null,
-  interval: '1D',
-  analytics: null,
+const api = async (path: string) => {
+  const res = await fetch(path);
+  if (!res.ok) throw new Error(`${res.status}: ${await res.text().catch(() => 'Error')}`);
+  return res.json();
+};
 
-  loading: {
-    quote: false,
-    history: false,
-    chain: false,
-    expirations: false,
-    analytics: false,
-  },
-  error: null,
-  lastUpdate: 0,
+export const useDashboardStore = create<DashboardStore>((set, get) => ({
+  activeTab: 'overview',
+  setActiveTab: (tab) => set({ activeTab: tab }),
+
+  symbol: 'SPY', quote: null, history: [], chain: null,
+  expirations: [], selectedExpiration: null, interval: '1D',
+  multiGEX: null, snapshot: null,
+  loading: {}, error: null, lastUpdate: 0,
 
   setSymbol: (symbol) => set({ symbol: symbol.toUpperCase() }),
-
-  setInterval: (interval) => {
-    set({ interval });
-    get().fetchHistory();
-  },
-
-  setSelectedExpiration: (exp) => {
-    set({ selectedExpiration: exp });
-    get().fetchChain();
-    get().fetchAnalytics();
-  },
+  setInterval: (interval) => { set({ interval }); get().fetchHistory(); },
+  setSelectedExpiration: (exp) => { set({ selectedExpiration: exp }); get().fetchChain(); },
 
   fetchQuote: async () => {
-    const { symbol } = get();
-    set((s) => ({ loading: { ...s.loading, quote: true }, error: null }));
+    set(s => ({ loading: { ...s.loading, quote: true }, error: null }));
     try {
-      const res = await fetch(`/api/market/quote?symbol=${symbol}`);
-      if (!res.ok) throw new Error(await res.text());
-      const quote = await res.json();
-      set((s) => ({ quote, loading: { ...s.loading, quote: false }, lastUpdate: Date.now() }));
-    } catch (err) {
-      set((s) => ({
-        loading: { ...s.loading, quote: false },
-        error: err instanceof Error ? err.message : 'Failed to fetch quote',
-      }));
-    }
+      const quote = await api(`/api/market/quote?symbol=${get().symbol}`);
+      set(s => ({ quote, loading: { ...s.loading, quote: false }, lastUpdate: Date.now() }));
+    } catch (e) { set(s => ({ loading: { ...s.loading, quote: false }, error: (e as Error).message })); }
   },
 
   fetchHistory: async () => {
-    const { symbol, interval } = get();
-    set((s) => ({ loading: { ...s.loading, history: true } }));
+    set(s => ({ loading: { ...s.loading, history: true } }));
     try {
-      const res = await fetch(`/api/market/history?symbol=${symbol}&interval=${interval}`);
-      if (!res.ok) throw new Error(await res.text());
-      const history = await res.json();
-      set((s) => ({ history, loading: { ...s.loading, history: false } }));
-    } catch (err) {
-      set((s) => ({
-        loading: { ...s.loading, history: false },
-        error: err instanceof Error ? err.message : 'Failed to fetch history',
-      }));
-    }
+      const history = await api(`/api/market/history?symbol=${get().symbol}&interval=${get().interval}`);
+      set(s => ({ history, loading: { ...s.loading, history: false } }));
+    } catch (e) { set(s => ({ loading: { ...s.loading, history: false }, error: (e as Error).message })); }
   },
 
   fetchExpirations: async () => {
-    const { symbol } = get();
-    set((s) => ({ loading: { ...s.loading, expirations: true } }));
+    set(s => ({ loading: { ...s.loading, expirations: true } }));
     try {
-      const res = await fetch(`/api/market/expirations?symbol=${symbol}`);
-      if (!res.ok) throw new Error(await res.text());
-      const expirations = await res.json();
-      // Auto-select nearest expiration
+      const expirations = await api(`/api/market/expirations?symbol=${get().symbol}`);
       const nearest = expirations[0]?.date || null;
-      set((s) => ({
-        expirations,
-        selectedExpiration: nearest,
-        loading: { ...s.loading, expirations: false },
-      }));
-      // Fetch chain for nearest expiration
-      if (nearest) {
-        get().fetchChain();
-        get().fetchAnalytics();
-      }
-    } catch (err) {
-      set((s) => ({
-        loading: { ...s.loading, expirations: false },
-        error: err instanceof Error ? err.message : 'Failed to fetch expirations',
-      }));
-    }
+      set(s => ({ expirations, selectedExpiration: nearest, loading: { ...s.loading, expirations: false } }));
+      if (nearest) get().fetchChain();
+    } catch (e) { set(s => ({ loading: { ...s.loading, expirations: false }, error: (e as Error).message })); }
   },
 
   fetchChain: async () => {
     const { symbol, selectedExpiration } = get();
     if (!selectedExpiration) return;
-    set((s) => ({ loading: { ...s.loading, chain: true } }));
+    set(s => ({ loading: { ...s.loading, chain: true } }));
     try {
-      const res = await fetch(`/api/market/chain?symbol=${symbol}&expiration=${selectedExpiration}`);
-      if (!res.ok) throw new Error(await res.text());
-      const chain = await res.json();
-      set((s) => ({ chain, loading: { ...s.loading, chain: false } }));
-    } catch (err) {
-      set((s) => ({
-        loading: { ...s.loading, chain: false },
-        error: err instanceof Error ? err.message : 'Failed to fetch chain',
-      }));
-    }
+      const chain = await api(`/api/market/chain?symbol=${symbol}&expiration=${selectedExpiration}`);
+      set(s => ({ chain, loading: { ...s.loading, chain: false } }));
+    } catch (e) { set(s => ({ loading: { ...s.loading, chain: false }, error: (e as Error).message })); }
   },
 
-  fetchAnalytics: async () => {
-    const { symbol, selectedExpiration } = get();
-    if (!selectedExpiration) return;
-    set((s) => ({ loading: { ...s.loading, analytics: true } }));
+  fetchMultiGEX: async () => {
+    set(s => ({ loading: { ...s.loading, multiGEX: true } }));
     try {
-      const res = await fetch(`/api/market/greeks?symbol=${symbol}&expiration=${selectedExpiration}`);
-      if (!res.ok) throw new Error(await res.text());
-      const analytics = await res.json();
-      set((s) => ({ analytics, loading: { ...s.loading, analytics: false } }));
-    } catch (err) {
-      set((s) => ({
-        loading: { ...s.loading, analytics: false },
-        error: err instanceof Error ? err.message : 'Failed to fetch analytics',
-      }));
-    }
+      const multiGEX = await api(`/api/market/multi-gex?symbol=${get().symbol}&max=4`);
+      set(s => ({ multiGEX, loading: { ...s.loading, multiGEX: false } }));
+    } catch (e) { set(s => ({ loading: { ...s.loading, multiGEX: false }, error: (e as Error).message })); }
+  },
+
+  fetchSnapshot: async () => {
+    set(s => ({ loading: { ...s.loading, snapshot: true } }));
+    try {
+      const snapshot = await api(`/api/market/snapshot?symbol=${get().symbol}`);
+      set(s => ({ snapshot, loading: { ...s.loading, snapshot: false } }));
+    } catch (e) { set(s => ({ loading: { ...s.loading, snapshot: false }, error: (e as Error).message })); }
   },
 
   loadSymbol: async (symbol: string) => {
     set({
-      symbol: symbol.toUpperCase(),
-      quote: null,
-      history: [],
-      chain: null,
-      expirations: [],
-      selectedExpiration: null,
-      analytics: null,
-      error: null,
+      symbol: symbol.toUpperCase(), quote: null, history: [], chain: null,
+      expirations: [], selectedExpiration: null, multiGEX: null, snapshot: null, error: null,
     });
-
-    // Parallel fetch
-    await Promise.allSettled([
-      get().fetchQuote(),
-      get().fetchHistory(),
-      get().fetchExpirations(),
-    ]);
+    await Promise.allSettled([get().fetchQuote(), get().fetchHistory(), get().fetchExpirations()]);
+    Promise.allSettled([get().fetchMultiGEX(), get().fetchSnapshot()]);
   },
 }));
