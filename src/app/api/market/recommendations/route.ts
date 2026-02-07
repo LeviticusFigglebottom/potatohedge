@@ -18,8 +18,83 @@ import {
   generateRecommendations,
   type RecommendationInput,
 } from '@/lib/math/recommendations';
+import type { EquityBar } from '@/lib/providers/equityBars';
 
 export const maxDuration = 30;
+
+/**
+ * Lightweight correlation context from equity bars — no extra API calls needed.
+ * Computes mean reversion stats and vol regime performance from daily bars.
+ */
+function computeQuickCorrelationCtx(
+  bars: EquityBar[],
+  hvCurrent: number,
+): RecommendationInput['correlationCtx'] {
+  if (bars.length < 60) return undefined;
+
+  const returns: number[] = [];
+  for (let i = 1; i < bars.length; i++) {
+    if (bars[i - 1].c > 0) returns.push((bars[i].c - bars[i - 1].c) / bars[i - 1].c);
+  }
+  if (returns.length < 40) return undefined;
+
+  // Rolling 20-day HV for vol regime classification
+  const hvValues: number[] = [];
+  for (let i = 20; i < returns.length; i++) {
+    const window = returns.slice(i - 20, i);
+    const mean = window.reduce((s, r) => s + r, 0) / window.length;
+    const variance = window.reduce((s, r) => s + (r - mean) ** 2, 0) / (window.length - 1);
+    hvValues.push(Math.sqrt(variance * 252));
+  }
+
+  const sortedHV = [...hvValues].sort((a, b) => a - b);
+  const p33 = sortedHV[Math.floor(sortedHV.length * 0.33)] || 0;
+  const p66 = sortedHV[Math.floor(sortedHV.length * 0.66)] || 999;
+
+  // Vol regime forward returns
+  const lowVolRets: number[] = [];
+  const highVolRets: number[] = [];
+  const lowVolWins5d: boolean[] = [];
+  for (let i = 0; i < hvValues.length - 20; i++) {
+    const idx = i + 20;
+    const fwd5 = returns.slice(idx, idx + 5).reduce((s, r) => s + r, 0);
+    const fwd20 = returns.slice(idx, idx + 20).reduce((s, r) => s + r, 0);
+    if (hvValues[i] <= p33) {
+      lowVolRets.push(fwd20);
+      lowVolWins5d.push(fwd5 > 0);
+    } else if (hvValues[i] >= p66) {
+      highVolRets.push(fwd20);
+    }
+  }
+
+  // Mean reversion: after 2σ+ moves
+  const dailySigma = hvCurrent > 0 ? hvCurrent / Math.sqrt(252) : 0.015;
+  const bigUps: { next1d: number }[] = [];
+  const bigDowns: { next1d: number; next5d: number }[] = [];
+  for (let i = 0; i < returns.length - 5; i++) {
+    if (Math.abs(returns[i]) < dailySigma * 2) continue;
+    if (returns[i] > 0) {
+      bigUps.push({ next1d: returns[i + 1] || 0 });
+    } else {
+      const fwd5 = returns.slice(i + 1, i + 6).reduce((s, r) => s + r, 0);
+      bigDowns.push({ next1d: returns[i + 1] || 0, next5d: fwd5 });
+    }
+  }
+
+  const avg = (arr: number[]) => arr.length > 0 ? arr.reduce((s, v) => s + v, 0) / arr.length : 0;
+
+  return {
+    meanReversionBounceRate: bigDowns.length > 3 ? bigDowns.filter(d => d.next1d > 0).length / bigDowns.length : 0.5,
+    meanReversionPullbackRate: bigUps.length > 3 ? bigUps.filter(u => u.next1d < 0).length / bigUps.length : 0.5,
+    avgRecovery5d: avg(bigDowns.map(d => d.next5d)),
+    lowVolWinRate: lowVolWins5d.length > 5 ? lowVolWins5d.filter(Boolean).length / lowVolWins5d.length : 0.5,
+    highVolAvg20d: avg(highVolRets),
+    lowVolAvg20d: avg(lowVolRets),
+    volOverpricingRate: 0.5,
+    drawdownRatio: 1,
+    alpha30d: 0,
+  };
+}
 
 export async function GET(request: NextRequest) {
   const symbol = request.nextUrl.searchParams.get('symbol');
@@ -118,6 +193,9 @@ export async function GET(request: NextRequest) {
       hvCurrent
     );
 
+    // Lightweight correlation context from existing bars
+    const correlationCtx = computeQuickCorrelationCtx(historyBars, hvCurrent);
+
     const input: RecommendationInput = {
       symbol: ticker,
       spotPrice,
@@ -147,6 +225,7 @@ export async function GET(request: NextRequest) {
       nearestDTE: nearExps[0]?.dte || 0,
       weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
       monthlyExp: nearExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
+      correlationCtx,
     };
 
     const recommendations = generateRecommendations(input);

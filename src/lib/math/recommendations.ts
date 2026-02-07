@@ -85,6 +85,18 @@ export interface RecommendationInput {
   nearestDTE: number;
   weeklyExp?: string;
   monthlyExp?: string;
+  // Optional correlation context (available when correlation data is loaded)
+  correlationCtx?: {
+    meanReversionBounceRate: number;   // 0-1, bounce rate after 2σ+ drops
+    meanReversionPullbackRate: number; // 0-1, pullback rate after 2σ+ rallies
+    avgRecovery5d: number;             // avg 5d return after big drops
+    lowVolWinRate: number;             // win rate in low-vol regime
+    highVolAvg20d: number;             // avg 20d return in high-vol regime
+    lowVolAvg20d: number;              // avg 20d return in low-vol regime
+    volOverpricingRate: number;        // 0-1, how often IV > realized
+    drawdownRatio: number;             // vs SPY during drawdowns
+    alpha30d: number;                  // 30d alpha vs SPY
+  };
 }
 
 // ─── Signal Scoring ────────────────────────────────────────
@@ -297,7 +309,78 @@ function scoreSignals(input: RecommendationInput): Signal[] {
     });
   }
 
-  // 10. Momentum — ATR-RELATIVE, not hardcoded
+  // 10. Correlation-based signals (when available)
+  if (input.correlationCtx) {
+    const ctx = input.correlationCtx;
+    const absChange = Math.abs(input.changePercent);
+    const sigma = dailySigma > 0 ? absChange / dailySigma : 0;
+
+    // Mean reversion after big drops: if stock dropped >2σ today and has strong bounce tendency
+    if (input.changePercent < 0 && sigma > 2 && ctx.meanReversionBounceRate > 0.6) {
+      const strength = Math.min(0.2, (ctx.meanReversionBounceRate - 0.5) * 0.6);
+      signals.push({
+        name: 'Mean Reversion (Hist)',
+        direction: 'bullish',
+        weight: strength,
+        description: `After 2σ+ drops, this stock bounces ${(ctx.meanReversionBounceRate * 100).toFixed(0)}% of the time (avg 5d recovery: ${ctx.avgRecovery5d > 0 ? '+' : ''}${(ctx.avgRecovery5d * 100).toFixed(1)}%)`,
+      });
+    }
+
+    // Momentum continuation after big ups
+    if (input.changePercent > 0 && sigma > 2 && ctx.meanReversionPullbackRate < 0.4) {
+      const strength = Math.min(0.15, (0.5 - ctx.meanReversionPullbackRate) * 0.4);
+      signals.push({
+        name: 'Momentum (Hist)',
+        direction: 'bullish',
+        weight: strength,
+        description: `Momentum stock — continues higher ${((1 - ctx.meanReversionPullbackRate) * 100).toFixed(0)}% after big up days`,
+      });
+    } else if (input.changePercent > 0 && sigma > 2 && ctx.meanReversionPullbackRate > 0.6) {
+      const strength = Math.min(0.15, (ctx.meanReversionPullbackRate - 0.5) * 0.4);
+      signals.push({
+        name: 'Mean Reversion (Hist)',
+        direction: 'bearish',
+        weight: -strength,
+        description: `Tends to pull back ${(ctx.meanReversionPullbackRate * 100).toFixed(0)}% of the time after big rallies`,
+      });
+    }
+
+    // IV regime edge: if current vol is low and low-vol periods historically favor going up
+    if (input.ivRank < 30 && ctx.lowVolWinRate > 0.58 && ctx.lowVolAvg20d > 0.005) {
+      signals.push({
+        name: 'Low-Vol Edge (Hist)',
+        direction: 'bullish',
+        weight: Math.min(0.12, (ctx.lowVolWinRate - 0.5) * 0.5),
+        description: `Low-vol regimes historically bullish: ${(ctx.lowVolWinRate * 100).toFixed(0)}% win rate, +${(ctx.lowVolAvg20d * 100).toFixed(1)}% avg 20d return`,
+      });
+    } else if (input.ivRank > 70 && ctx.highVolAvg20d < -0.01) {
+      signals.push({
+        name: 'High-Vol Drag (Hist)',
+        direction: 'bearish',
+        weight: Math.max(-0.1, ctx.highVolAvg20d * 5),
+        description: `High-vol regimes historically weak: ${(ctx.highVolAvg20d * 100).toFixed(1)}% avg 20d return`,
+      });
+    }
+
+    // Recent alpha momentum
+    if (ctx.alpha30d > 0.04) {
+      signals.push({
+        name: 'Alpha Momentum',
+        direction: 'bullish',
+        weight: Math.min(0.1, ctx.alpha30d),
+        description: `+${(ctx.alpha30d * 100).toFixed(1)}% alpha vs SPY over 30 days — outperformance momentum`,
+      });
+    } else if (ctx.alpha30d < -0.04) {
+      signals.push({
+        name: 'Alpha Drag',
+        direction: 'bearish',
+        weight: Math.max(-0.1, ctx.alpha30d),
+        description: `${(ctx.alpha30d * 100).toFixed(1)}% alpha vs SPY over 30 days — underperforming`,
+      });
+    }
+  }
+
+  // 11. Momentum — ATR-RELATIVE, not hardcoded
   // A "big move" is >2σ or >1.5 ATR, NOT a fixed percentage
   const absChange = Math.abs(input.changePercent);
   const moveSigma = dailySigma > 0 ? absChange / dailySigma : 0;

@@ -6,65 +6,52 @@ import type { Interval, OHLCV } from '@/types/market';
 /**
  * Sanitize outlier wicks that distort chart auto-scale.
  * Flash crashes (e.g. SPY briefly hitting $69 on a wick) are real data
- * but make the chart unreadable. We detect and clamp extreme wicks
- * while preserving legitimate volatile moves.
+ * but make the chart unreadable.
  *
- * Logic: for each bar, compare its high/low to a local median of closes.
- * If a wick extends more than 40% from the local median and is far outside
- * the local price range, clamp it to a reasonable multiple of local ATR.
+ * KEY FIX: compute local stats from NEIGHBORS ONLY (excluding current bar),
+ * so an outlier bar can't pollute its own reference frame.
+ * If a wick extends >25% from the neighbor median and no neighbor confirms,
+ * clamp the wick to the candle body (open/close).
  */
 function sanitizeBars(bars: OHLCV[]): OHLCV[] {
   if (bars.length < 10) return bars;
 
-  const WINDOW = 5; // look at ±5 neighbors
-  const WICK_THRESHOLD = 0.30; // 30% deviation from local median = suspicious
+  const WINDOW = 5;
+  const WICK_THRESHOLD = 0.25;
 
   return bars.map((bar, i) => {
-    // Get local window of closes
+    // NEIGHBORS only — exclude current bar so outlier can't skew its own stats
     const start = Math.max(0, i - WINDOW);
     const end = Math.min(bars.length, i + WINDOW + 1);
-    const localCloses = bars.slice(start, end).map(b => b.close).sort((a, b) => a - b);
-    const median = localCloses[Math.floor(localCloses.length / 2)];
+    const neighbors: OHLCV[] = [];
+    for (let j = start; j < end; j++) {
+      if (j !== i) neighbors.push(bars[j]);
+    }
+    if (neighbors.length < 3) return bar;
 
+    const neighborCloses = neighbors.map(b => b.close).sort((a, b) => a - b);
+    const median = neighborCloses[Math.floor(neighborCloses.length / 2)];
     if (median <= 0) return bar;
 
-    // Local high/low range for "normal" wicks
-    const localHighs = bars.slice(start, end).map(b => b.high);
-    const localLows = bars.slice(start, end).map(b => b.low);
-    const localMax = Math.max(...localHighs);
-    const localMin = Math.min(...localLows);
-    const localRange = localMax - localMin;
-    // Allow wicks up to 3x the local range beyond the local extremes
-    const clampBuffer = Math.max(localRange * 3, median * 0.05);
-
     let { low, high } = bar;
+    const bodyLow = Math.min(bar.open, bar.close);
+    const bodyHigh = Math.max(bar.open, bar.close);
 
     // Check if the low wick is an extreme outlier
     if ((median - low) / median > WICK_THRESHOLD) {
-      // Wick is >30% below median — check if any neighbor is also this low
-      const neighborLows = bars.slice(start, end)
-        .filter((_, j) => j + start !== i)
-        .map(b => b.low);
-      const nearestNeighborLow = Math.min(...neighborLows);
-
-      // If no neighbor is anywhere near this low, it's an outlier wick
-      if ((nearestNeighborLow - low) / nearestNeighborLow > 0.15) {
-        low = Math.max(low, localMin - clampBuffer);
-        // Ensure low doesn't go below body
-        low = Math.min(low, Math.min(bar.open, bar.close));
+      const nearestNeighborLow = Math.min(...neighbors.map(b => b.low));
+      // If no neighbor has a low anywhere near this extreme, it's an outlier
+      if (nearestNeighborLow > 0 && (nearestNeighborLow - low) / nearestNeighborLow > 0.15) {
+        // Clamp to candle body — removes the outlier wick
+        low = bodyLow;
       }
     }
 
-    // Check if the high wick is an extreme outlier (same logic, inverted)
+    // Check if the high wick is an extreme outlier
     if ((high - median) / median > WICK_THRESHOLD) {
-      const neighborHighs = bars.slice(start, end)
-        .filter((_, j) => j + start !== i)
-        .map(b => b.high);
-      const nearestNeighborHigh = Math.max(...neighborHighs);
-
-      if ((high - nearestNeighborHigh) / nearestNeighborHigh > 0.15) {
-        high = Math.min(high, localMax + clampBuffer);
-        high = Math.max(high, Math.max(bar.open, bar.close));
+      const nearestNeighborHigh = Math.max(...neighbors.map(b => b.high));
+      if (nearestNeighborHigh > 0 && (high - nearestNeighborHigh) / nearestNeighborHigh > 0.15) {
+        high = bodyHigh;
       }
     }
 
