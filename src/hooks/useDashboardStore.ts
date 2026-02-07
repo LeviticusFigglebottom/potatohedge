@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { Quote, OHLCV, OptionsChain, OptionExpiration, Interval } from '@/types/market';
 import type { StrikeExposure } from '@/lib/math/blackScholes';
+import type { CorrelationResult } from '@/lib/math/correlations';
 import { saveMetricSnapshot, loadMetricHistory, type DailyMetricRecord } from '@/lib/metricHistory';
 
 // ─── Phase 2 Types ─────────────────────────────────────────
@@ -77,6 +78,7 @@ interface DashboardStore {
   multiGEX: MultiGEXData | null;
   snapshot: SnapshotData | null;
   recommendations: RecommendationData | null;
+  correlations: CorrelationResult | null;
   metricHistory: DailyMetricRecord[];
   loading: Record<string, boolean>;
   error: string | null;
@@ -92,6 +94,7 @@ interface DashboardStore {
   fetchMultiGEX: () => Promise<void>;
   fetchSnapshot: () => Promise<void>;
   fetchRecommendations: () => Promise<void>;
+  fetchCorrelations: () => Promise<void>;
   loadSymbol: (s: string) => Promise<void>;
   saveAndLoadMetricHistory: () => void;
 }
@@ -108,7 +111,7 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
 
   symbol: 'SPY', quote: null, history: [], chain: null,
   expirations: [], selectedExpiration: null, interval: '1D',
-  multiGEX: null, snapshot: null, recommendations: null,
+  multiGEX: null, snapshot: null, recommendations: null, correlations: null,
   metricHistory: [],
   loading: {}, error: null, lastUpdate: 0,
 
@@ -176,6 +179,14 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     } catch (e) { set(s => ({ loading: { ...s.loading, recommendations: false }, error: (e as Error).message })); }
   },
 
+  fetchCorrelations: async () => {
+    set(s => ({ loading: { ...s.loading, correlations: true } }));
+    try {
+      const correlations = await api(`/api/market/correlations?symbol=${get().symbol}`);
+      set(s => ({ correlations, loading: { ...s.loading, correlations: false } }));
+    } catch (e) { set(s => ({ loading: { ...s.loading, correlations: false }, error: (e as Error).message })); }
+  },
+
   saveAndLoadMetricHistory: () => {
     const { symbol, multiGEX, snapshot } = get();
     if (!multiGEX || !snapshot) {
@@ -214,14 +225,14 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     set({
       symbol: symbol.toUpperCase(), quote: null, history: [], chain: null,
       expirations: [], selectedExpiration: null, multiGEX: null, snapshot: null,
-      recommendations: null, metricHistory: [], error: null,
+      recommendations: null, correlations: null, metricHistory: [], error: null,
     });
     // Load existing metric history from localStorage immediately
     const existing = loadMetricHistory(symbol.toUpperCase());
     if (existing.length > 0) set({ metricHistory: existing });
 
     await Promise.allSettled([get().fetchQuote(), get().fetchHistory(), get().fetchExpirations()]);
-    await Promise.allSettled([get().fetchMultiGEX(), get().fetchSnapshot(), get().fetchRecommendations()]);
+    await Promise.allSettled([get().fetchMultiGEX(), get().fetchSnapshot(), get().fetchRecommendations(), get().fetchCorrelations()]);
     // Save today's metrics after all data is loaded
     get().saveAndLoadMetricHistory();
   },

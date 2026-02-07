@@ -16,6 +16,7 @@ import DealerTab from '@/components/dashboard/DealerTab';
 import VolatilityTab from '@/components/dashboard/VolatilityTab';
 import AnalyticsTab from '@/components/dashboard/AnalyticsTab';
 import ScreenerTab from '@/components/dashboard/ScreenerTab';
+import CorrelationPanel from '@/components/dashboard/CorrelationPanel';
 import { Activity, Zap } from 'lucide-react';
 
 function OverviewTab() {
@@ -32,6 +33,7 @@ function OverviewTab() {
       </div>
       <InterpretationsPanel />
       <RecommendationsPanel />
+      <CorrelationPanel />
       <AIAnalysisPanel />
     </div>
   );
