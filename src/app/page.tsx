@@ -14,6 +14,7 @@ import RecommendationsPanel from '@/components/dashboard/RecommendationsPanel';
 import AIAnalysisPanel from '@/components/dashboard/AIAnalysisPanel';
 import DealerTab from '@/components/dashboard/DealerTab';
 import VolatilityTab from '@/components/dashboard/VolatilityTab';
+import AnalyticsTab from '@/components/dashboard/AnalyticsTab';
 import { Activity, Zap } from 'lucide-react';
 
 function OverviewTab() {
@@ -86,6 +87,7 @@ export default function DashboardPage() {
           {activeTab === 'overview' && <OverviewTab />}
           {activeTab === 'dealer' && <DealerTab />}
           {activeTab === 'volatility' && <VolatilityTab />}
+          {activeTab === 'analytics' && <AnalyticsTab />}
           {activeTab === 'chain' && <ChainTab />}
         </div>
       </main>

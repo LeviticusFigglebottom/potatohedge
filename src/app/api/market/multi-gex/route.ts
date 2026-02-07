@@ -128,8 +128,10 @@ export async function GET(request: NextRequest) {
     // OI concentration
     const oiAnalysis = analyzeOIConcentration(nearestChain.calls, nearestChain.puts);
 
-    // Volume context (using first chain vs rough averages)
-    const volumeCtx = interpretVolume(totalCallVol, totalPutVol, totalCallVol, totalPutVol, aggPCR);
+    // Volume context — we don't have historical daily options volume averages,
+    // so we pass today=avg (ratio=1, honest). The meaningful signal is PCR
+    // divergence (today's volume PCR vs accumulated OI PCR).
+    const volumeCtx = interpretVolume(totalCallVol, totalPutVol, totalCallVol, totalPutVol, aggOIPCR);
 
     // Dealer positioning interpretation
     const dealerCtx = interpretDealerPositioning(

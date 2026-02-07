@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { createChart, type IChartApi, type ISeriesApi, type CandlestickData, type HistogramData, ColorType, CrosshairMode } from 'lightweight-charts';
+import { createChart, type IChartApi, type ISeriesApi, type IPriceLine, type CandlestickData, type HistogramData, ColorType, CrosshairMode } from 'lightweight-charts';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import type { Interval } from '@/types/market';
 
@@ -31,6 +31,7 @@ export default function PriceChart() {
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
+  const priceLinesRef = useRef<IPriceLine[]>([]);
 
   const { history, interval, setInterval, loading, symbol, multiGEX } = useDashboardStore();
   const [activeRange, setActiveRange] = useState<RangePreset>('1Y');
@@ -57,12 +58,16 @@ export default function PriceChart() {
       },
       rightPriceScale: {
         borderColor: '#2a2a3d',
-        scaleMargins: { top: 0.1, bottom: 0.25 },
+        scaleMargins: { top: 0.08, bottom: 0.22 },
+        autoScale: true,
       },
       timeScale: {
         borderColor: '#2a2a3d',
         timeVisible: true,
         secondsVisible: false,
+        fixRightEdge: true,
+        fixLeftEdge: true,
+        rightOffset: 3,
       },
       handleScroll: { vertTouchDrag: false },
     });
@@ -101,10 +106,11 @@ export default function PriceChart() {
     return () => {
       resizeObserver.disconnect();
       chart.remove();
+      priceLinesRef.current = [];
     };
   }, []);
 
-  // Update data + apply time range zoom
+  // Update candle/volume data when history changes
   useEffect(() => {
     if (!candleSeriesRef.current || !volumeSeriesRef.current || !history.length) return;
 
@@ -125,45 +131,62 @@ export default function PriceChart() {
     candleSeriesRef.current.setData(candles);
     volumeSeriesRef.current.setData(volumes);
 
-    // Add GEX levels as price lines
-    if (multiGEX?.aggregated && candleSeriesRef.current) {
-      const series = candleSeriesRef.current;
-
-      if (multiGEX.aggregated.gammaFlip) {
-        series.createPriceLine({
-          price: multiGEX.aggregated.gammaFlip,
-          color: '#ffaa00',
-          lineWidth: 1,
-          lineStyle: 2,
-          axisLabelVisible: true,
-          title: 'γ Flip',
-        });
-      }
-      if (multiGEX.aggregated.callWall) {
-        series.createPriceLine({
-          price: multiGEX.aggregated.callWall,
-          color: '#00e676',
-          lineWidth: 1,
-          lineStyle: 2,
-          axisLabelVisible: true,
-          title: 'Call Wall',
-        });
-      }
-      if (multiGEX.aggregated.putWall) {
-        series.createPriceLine({
-          price: multiGEX.aggregated.putWall,
-          color: '#ff3d57',
-          lineWidth: 1,
-          lineStyle: 2,
-          axisLabelVisible: true,
-          title: 'Put Wall',
-        });
-      }
-    }
-
-    // Apply range zoom
+    // Apply range zoom after data load
     applyRangeZoom(activeRange);
-  }, [history, multiGEX]);
+  }, [history]);
+
+  // Separate effect for GEX price lines — remove old ones before adding new
+  useEffect(() => {
+    const series = candleSeriesRef.current;
+    if (!series) return;
+
+    // Remove ALL existing price lines first
+    for (const line of priceLinesRef.current) {
+      try { series.removePriceLine(line); } catch { /* already removed */ }
+    }
+    priceLinesRef.current = [];
+
+    // Only add price lines if we have GEX data and price data
+    if (!multiGEX?.aggregated || !history.length) return;
+
+    // Determine if price lines make sense for the visible range.
+    // They're current-day levels, relevant on any timeframe as reference.
+    const agg = multiGEX.aggregated;
+
+    if (agg.gammaFlip) {
+      const line = series.createPriceLine({
+        price: agg.gammaFlip,
+        color: '#ffaa00',
+        lineWidth: 1,
+        lineStyle: 2,
+        axisLabelVisible: true,
+        title: 'γ Flip',
+      });
+      priceLinesRef.current.push(line);
+    }
+    if (agg.callWall) {
+      const line = series.createPriceLine({
+        price: agg.callWall,
+        color: '#00e676',
+        lineWidth: 1,
+        lineStyle: 2,
+        axisLabelVisible: true,
+        title: 'Call Wall',
+      });
+      priceLinesRef.current.push(line);
+    }
+    if (agg.putWall) {
+      const line = series.createPriceLine({
+        price: agg.putWall,
+        color: '#ff3d57',
+        lineWidth: 1,
+        lineStyle: 2,
+        axisLabelVisible: true,
+        title: 'Put Wall',
+      });
+      priceLinesRef.current.push(line);
+    }
+  }, [multiGEX, history.length]);
 
   // Apply range when activeRange changes (without data reload)
   useEffect(() => {
@@ -213,12 +236,6 @@ export default function PriceChart() {
   }, [interval, setInterval]);
 
   const handleIntervalChange = useCallback((newInterval: Interval) => {
-    // When manually changing interval, clear the active range highlight
-    // unless the interval matches one of our presets
-    const matchingRange = RANGE_CONFIG.find(r => r.interval === newInterval);
-    if (matchingRange && ['1D', '1W', '1M'].includes(newInterval)) {
-      // Don't change range for daily+ intervals — user is just switching candle size
-    }
     setInterval(newInterval);
   }, [setInterval]);
 

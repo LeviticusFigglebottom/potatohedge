@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { Quote, OHLCV, OptionsChain, OptionExpiration, Interval } from '@/types/market';
 import type { StrikeExposure } from '@/lib/math/blackScholes';
+import { saveMetricSnapshot, loadMetricHistory, type DailyMetricRecord } from '@/lib/metricHistory';
 
 // ─── Phase 2 Types ─────────────────────────────────────────
 
@@ -39,10 +40,11 @@ export interface SnapshotData {
   termStructure: { expiration: string; dte: number; atmIV: number }[];
   skewSurface: { expiration: string; dte: number; points: { strike: number; iv: number; type: string; delta: number }[] }[];
   historicalVol: { hv20: number; hv60: number };
+  ivTimeSeries?: { time: number; hv20: number; ivProxy: number; ivRank: number }[];
   snapshotCount: number;
 }
 
-export type TabId = 'overview' | 'chain' | 'dealer' | 'volatility';
+export type TabId = 'overview' | 'chain' | 'dealer' | 'volatility' | 'analytics';
 
 export interface RecommendationData {
   symbol: string;
@@ -75,6 +77,7 @@ interface DashboardStore {
   multiGEX: MultiGEXData | null;
   snapshot: SnapshotData | null;
   recommendations: RecommendationData | null;
+  metricHistory: DailyMetricRecord[];
   loading: Record<string, boolean>;
   error: string | null;
   lastUpdate: number;
@@ -90,6 +93,7 @@ interface DashboardStore {
   fetchSnapshot: () => Promise<void>;
   fetchRecommendations: () => Promise<void>;
   loadSymbol: (s: string) => Promise<void>;
+  saveAndLoadMetricHistory: () => void;
 }
 
 const api = async (path: string) => {
@@ -105,6 +109,7 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
   symbol: 'SPY', quote: null, history: [], chain: null,
   expirations: [], selectedExpiration: null, interval: '1D',
   multiGEX: null, snapshot: null, recommendations: null,
+  metricHistory: [],
   loading: {}, error: null, lastUpdate: 0,
 
   setSymbol: (symbol) => set({ symbol: symbol.toUpperCase() }),
@@ -171,13 +176,53 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     } catch (e) { set(s => ({ loading: { ...s.loading, recommendations: false }, error: (e as Error).message })); }
   },
 
+  saveAndLoadMetricHistory: () => {
+    const { symbol, multiGEX, snapshot } = get();
+    if (!multiGEX || !snapshot) {
+      // Load existing history even if we can't save yet
+      const existing = loadMetricHistory(symbol);
+      if (existing.length > 0) set({ metricHistory: existing });
+      return;
+    }
+    const today = new Date();
+    const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    const record: DailyMetricRecord = {
+      date,
+      timestamp: Date.now(),
+      spotPrice: multiGEX.spotPrice,
+      volumePCR: multiGEX.volume?.volumePCR ?? 0,
+      oiPCR: multiGEX.volume?.oiPCR ?? 0,
+      totalCallVol: multiGEX.volume?.totalCallVol ?? 0,
+      totalPutVol: multiGEX.volume?.totalPutVol ?? 0,
+      totalGEX: multiGEX.aggregated?.totalGEX ?? 0,
+      totalDEX: multiGEX.aggregated?.totalDEX ?? 0,
+      totalVanna: multiGEX.aggregated?.totalVanna ?? 0,
+      totalCharm: multiGEX.aggregated?.totalCharm ?? 0,
+      ivRank: snapshot.iv?.ivRank ?? 0,
+      currentIV: snapshot.iv?.currentIV ?? 0,
+      hvCurrent: snapshot.iv?.hvCurrent ?? 0,
+      gammaFlip: multiGEX.aggregated?.gammaFlip ?? null,
+      callWall: multiGEX.aggregated?.callWall ?? null,
+      putWall: multiGEX.aggregated?.putWall ?? null,
+      maxPain: multiGEX.maxPain?.strike ?? 0,
+    };
+    saveMetricSnapshot(symbol, record);
+    set({ metricHistory: loadMetricHistory(symbol) });
+  },
+
   loadSymbol: async (symbol: string) => {
     set({
       symbol: symbol.toUpperCase(), quote: null, history: [], chain: null,
       expirations: [], selectedExpiration: null, multiGEX: null, snapshot: null,
-      recommendations: null, error: null,
+      recommendations: null, metricHistory: [], error: null,
     });
+    // Load existing metric history from localStorage immediately
+    const existing = loadMetricHistory(symbol.toUpperCase());
+    if (existing.length > 0) set({ metricHistory: existing });
+
     await Promise.allSettled([get().fetchQuote(), get().fetchHistory(), get().fetchExpirations()]);
-    Promise.allSettled([get().fetchMultiGEX(), get().fetchSnapshot(), get().fetchRecommendations()]);
+    await Promise.allSettled([get().fetchMultiGEX(), get().fetchSnapshot(), get().fetchRecommendations()]);
+    // Save today's metrics after all data is loaded
+    get().saveAndLoadMetricHistory();
   },
 }));
