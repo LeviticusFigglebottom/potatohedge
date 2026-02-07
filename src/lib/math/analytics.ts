@@ -36,7 +36,7 @@ export function computeIVRankPercentile(
   const iv52wHigh = Math.max(...historicalIVs);
   const iv52wLow = Math.min(...historicalIVs);
   const range = iv52wHigh - iv52wLow;
-  const ivRank = range > 0 ? ((currentIV - iv52wLow) / range) * 100 : 50;
+  const ivRank = range > 0 ? Math.max(0, Math.min(100, ((currentIV - iv52wLow) / range) * 100)) : 50;
 
   const below = historicalIVs.filter(iv => iv < currentIV).length;
   const ivPercentile = (below / historicalIVs.length) * 100;

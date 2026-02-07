@@ -39,7 +39,7 @@ export interface ScreenerResult {
   timestamp: number;
 }
 
-const CONCURRENCY = 6; // parallel stock processing limit
+const CONCURRENCY = 8; // parallel stock processing limit
 
 async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));

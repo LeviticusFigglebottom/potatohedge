@@ -123,71 +123,90 @@ function scoreSignals(input: RecommendationInput): Signal[] {
   }
 
   // 2. Gamma Flip Position — distance measured in ATR multiples
+  //    Fade signal to zero when flip is >30% from price (stale/irrelevant)
   if (input.gammaFlip !== null) {
     const distPct = (spotPrice - input.gammaFlip) / spotPrice * 100;
-    const distATR = atrPercent > 0 ? Math.abs(distPct) / atrPercent : 0;
-    if (distPct > 0.3) {
-      signals.push({
-        name: 'Gamma Flip',
-        direction: 'bullish',
-        weight: Math.min(0.3, distATR * 0.15),
-        description: `Spot ${distPct.toFixed(1)}% above γ flip ($${input.gammaFlip.toFixed(0)}) — ${distATR.toFixed(1)} ATR into positive gamma, dips get bought`,
-      });
-    } else if (distPct < -0.3) {
-      signals.push({
-        name: 'Gamma Flip',
-        direction: 'bearish',
-        weight: Math.max(-0.3, -distATR * 0.15),
-        description: `Spot ${Math.abs(distPct).toFixed(1)}% below γ flip ($${input.gammaFlip.toFixed(0)}) — ${distATR.toFixed(1)} ATR into negative gamma, sells accelerate`,
-      });
+    const absDistPct = Math.abs(distPct);
+    const distATR = atrPercent > 0 ? absDistPct / atrPercent : 0;
+
+    if (absDistPct > 30) {
+      // Too far away — gamma flip is stale/irrelevant, skip entirely
     } else {
-      signals.push({
-        name: 'Gamma Flip',
-        direction: 'neutral',
-        weight: 0,
-        description: `Spot at γ flip ($${input.gammaFlip.toFixed(0)}) — regime transition, high uncertainty`,
-      });
+      // Fade weight linearly from full at <10% to zero at 30%
+      const distanceFade = absDistPct > 10 ? Math.max(0, 1 - (absDistPct - 10) / 20) : 1;
+      // Weight peaks at ~3 ATR then fades, capped at 0.3
+      const rawWeight = Math.min(0.3, Math.min(distATR, 3) * 0.1);
+
+      if (distPct > 0.3) {
+        signals.push({
+          name: 'Gamma Flip',
+          direction: 'bullish',
+          weight: rawWeight * distanceFade,
+          description: `Spot ${distPct.toFixed(1)}% above γ flip ($${input.gammaFlip.toFixed(0)}) — ${distATR.toFixed(1)} ATR into positive gamma, dips get bought`,
+        });
+      } else if (distPct < -0.3) {
+        signals.push({
+          name: 'Gamma Flip',
+          direction: 'bearish',
+          weight: -(rawWeight * distanceFade),
+          description: `Spot ${Math.abs(distPct).toFixed(1)}% below γ flip ($${input.gammaFlip.toFixed(0)}) — ${distATR.toFixed(1)} ATR into negative gamma, sells accelerate`,
+        });
+      } else {
+        signals.push({
+          name: 'Gamma Flip',
+          direction: 'neutral',
+          weight: 0,
+          description: `Spot at γ flip ($${input.gammaFlip.toFixed(0)}) — regime transition, high uncertainty`,
+        });
+      }
     }
   }
 
   // 3. Call/Put Wall Proximity — measured in ATR
+  //    Skip walls >20% from price — just far-OTM OI clusters, not real levels
   if (input.callWall !== null) {
     const distPct = (input.callWall - spotPrice) / spotPrice * 100;
+    const absDistPct = Math.abs(distPct);
     const distATR = atrPercent > 0 ? distPct / atrPercent : 99;
-    if (distPct > 0 && distATR < 1.5) {
-      signals.push({
-        name: 'Call Wall Proximity',
-        direction: 'bearish',
-        weight: -0.2,
-        description: `Call Wall at $${input.callWall} is ${distATR.toFixed(1)} ATR overhead (${distPct.toFixed(1)}%) — strong resistance within ~${Math.ceil(distATR)} day range`,
-      });
-    } else if (distPct < 0) {
-      signals.push({
-        name: 'Call Wall Breach',
-        direction: 'bullish',
-        weight: 0.3,
-        description: `Above Call Wall ($${input.callWall}) — dealers chasing, squeeze potential`,
-      });
+    if (absDistPct <= 20) {
+      if (distPct > 0 && distATR < 1.5) {
+        signals.push({
+          name: 'Call Wall Proximity',
+          direction: 'bearish',
+          weight: -0.2,
+          description: `Call Wall at $${input.callWall} is ${distATR.toFixed(1)} ATR overhead (${distPct.toFixed(1)}%) — strong resistance within ~${Math.ceil(distATR)} day range`,
+        });
+      } else if (distPct < 0) {
+        signals.push({
+          name: 'Call Wall Breach',
+          direction: 'bullish',
+          weight: 0.3,
+          description: `Above Call Wall ($${input.callWall}) — dealers chasing, squeeze potential`,
+        });
+      }
     }
   }
 
   if (input.putWall !== null) {
     const distPct = (spotPrice - input.putWall) / spotPrice * 100;
+    const absDistPct = Math.abs(distPct);
     const distATR = atrPercent > 0 ? distPct / atrPercent : 99;
-    if (distPct > 0 && distATR < 1.5) {
-      signals.push({
-        name: 'Put Wall Proximity',
-        direction: 'bullish',
-        weight: 0.2,
-        description: `Put Wall at $${input.putWall} is ${distATR.toFixed(1)} ATR below (${distPct.toFixed(1)}%) — strong support within ~${Math.ceil(distATR)} day range`,
-      });
-    } else if (distPct < 0) {
-      signals.push({
-        name: 'Put Wall Breach',
-        direction: 'bearish',
-        weight: -0.3,
-        description: `Below Put Wall ($${input.putWall}) — support broken, downside accelerates`,
-      });
+    if (absDistPct <= 20) {
+      if (distPct > 0 && distATR < 1.5) {
+        signals.push({
+          name: 'Put Wall Proximity',
+          direction: 'bullish',
+          weight: 0.2,
+          description: `Put Wall at $${input.putWall} is ${distATR.toFixed(1)} ATR below (${distPct.toFixed(1)}%) — strong support within ~${Math.ceil(distATR)} day range`,
+        });
+      } else if (distPct < 0) {
+        signals.push({
+          name: 'Put Wall Breach',
+          direction: 'bearish',
+          weight: -0.3,
+          description: `Below Put Wall ($${input.putWall}) — support broken, downside accelerates`,
+        });
+      }
     }
   }
 
@@ -204,33 +223,37 @@ function scoreSignals(input: RecommendationInput): Signal[] {
   }
 
   // 5. PCR Signal (ratio-based, already ticker-neutral)
+  //    Attenuate when total options volume is thin (<2k contracts)
+  const totalOptVol = input.totalCallVol + input.totalPutVol;
+  const pcrConfidence = totalOptVol < 500 ? 0 : totalOptVol < 2000 ? (totalOptVol - 500) / 1500 : 1;
+
   if (input.volumePCR > 1.3) {
     signals.push({
       name: 'Volume P/C Ratio',
       direction: 'bearish',
-      weight: input.volumePCR > 2 ? -0.35 : -0.25,
-      description: `PCR ${input.volumePCR.toFixed(2)}${input.volumePCR > 2 ? ' — extreme' : ''} — heavy put buying, bearish sentiment or hedging demand`,
+      weight: (input.volumePCR > 2 ? -0.35 : -0.25) * pcrConfidence,
+      description: `PCR ${input.volumePCR.toFixed(2)}${input.volumePCR > 2 ? ' — extreme' : ''}${pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — heavy put buying, bearish sentiment or hedging demand`,
     });
   } else if (input.volumePCR > 1.0) {
     signals.push({
       name: 'Volume P/C Ratio',
       direction: 'bearish',
-      weight: -0.1,
-      description: `PCR ${input.volumePCR.toFixed(2)} — slightly put-heavy, mild bearish lean`,
+      weight: -0.1 * pcrConfidence,
+      description: `PCR ${input.volumePCR.toFixed(2)}${pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — slightly put-heavy, mild bearish lean`,
     });
   } else if (input.volumePCR < 0.6) {
     signals.push({
       name: 'Volume P/C Ratio',
       direction: 'bullish',
-      weight: 0.25,
-      description: `PCR ${input.volumePCR.toFixed(2)} — strong call dominance, bullish flow`,
+      weight: 0.25 * pcrConfidence,
+      description: `PCR ${input.volumePCR.toFixed(2)}${pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — strong call dominance, bullish flow`,
     });
   } else if (input.volumePCR < 0.8) {
     signals.push({
       name: 'Volume P/C Ratio',
       direction: 'bullish',
-      weight: 0.1,
-      description: `PCR ${input.volumePCR.toFixed(2)} — call-heavy, mild bullish lean`,
+      weight: 0.1 * pcrConfidence,
+      description: `PCR ${input.volumePCR.toFixed(2)}${pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — call-heavy, mild bullish lean`,
     });
   }
 
@@ -702,7 +725,12 @@ export function generateRecommendations(input: RecommendationInput): Recommendat
     warnings.push(`IV near 52-week highs (Rank ${input.ivRank}) — avoid buying naked long options; they need a ${(input.currentIV / Math.sqrt(252) * 200).toFixed(0)}%+ move to profit.`);
   }
   if (input.volumePCR > 2) {
-    warnings.push(`Extremely elevated P/C ratio (${input.volumePCR.toFixed(2)}) — could indicate panic hedging or imminent catalyst.`);
+    const optVol = input.totalCallVol + input.totalPutVol;
+    if (optVol < 1000) {
+      warnings.push(`P/C ratio ${input.volumePCR.toFixed(2)} on only ${optVol} total contracts — likely thin-market artifact, not reliable sentiment signal.`);
+    } else {
+      warnings.push(`Extremely elevated P/C ratio (${input.volumePCR.toFixed(2)}) — could indicate panic hedging or imminent catalyst.`);
+    }
   }
   if (input.totalGEX < 0 && input.ivRank > 60) {
     warnings.push('Short gamma + elevated IV = volatile environment. Use defined-risk strategies only.');
