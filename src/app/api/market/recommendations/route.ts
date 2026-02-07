@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getQuote, getExpirations, getOptionsChain } from '@/lib/providers/tradier';
-import { getEquityHistory } from '@/lib/providers/polygon';
+import { fetchEquityBars } from '@/lib/providers/equityBars';
 import {
   computeDealerExposureFromChain,
   findGammaFlip,
@@ -33,11 +33,7 @@ export async function GET(request: NextRequest) {
     const [quote, expirations, historyBars] = await Promise.all([
       getQuote(ticker),
       getExpirations(ticker),
-      getEquityHistory(
-        ticker, 1, 'day',
-        new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-        new Date().toISOString().split('T')[0]
-      ).catch(() => []),
+      fetchEquityBars(ticker, 400),
     ]);
 
     const spotPrice = quote.last;

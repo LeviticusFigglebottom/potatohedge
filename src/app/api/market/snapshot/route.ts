@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getOptionsSnapshot } from '@/lib/providers/polygon';
-import { getEquityHistory } from '@/lib/providers/polygon';
+import { fetchEquityBars } from '@/lib/providers/equityBars';
 import { getOptionsChain, getExpirations } from '@/lib/providers/tradier';
 import {
   computeIVRankPercentile,
@@ -26,11 +26,7 @@ export async function GET(request: NextRequest) {
     // 3. Polygon options snapshot (for term structure + skew surface)
     const [expirations, historyBars, polygonSnapshot] = await Promise.all([
       getExpirations(ticker).catch(() => []),
-      getEquityHistory(
-        ticker, 1, 'day',
-        new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-        new Date().toISOString().split('T')[0]
-      ).catch(() => []),
+      fetchEquityBars(ticker, 400),
       getOptionsSnapshot(ticker).catch(() => []),
     ]);
 
@@ -144,10 +140,18 @@ export async function GET(request: NextRequest) {
     ivContext.interpretation = interpretIV(ivContext);
 
     // ── Skew Surface from Tradier chains (reliable) + Polygon supplement ──
-    // Key: filter out deep OTM garbage IVs that create 287% spikes
-    // Use ATM IV as anchor — cap skew IVs at 3x ATM IV
-    const maxSkewIV = currentIV > 0 ? Math.max(currentIV * 3, 1.0) : 3;
-    const minDeltaFilter = 0.03; // skip contracts with |delta| < 3% (deep OTM garbage)
+    // Key: filter out garbage IVs that create spikes
+    // - Cap at 2.5x ATM IV (was 3x) with lower floor
+    // - Delta filter scales with DTE (near-term options need stricter filter)
+    // - Skip 0-1 DTE (too noisy for meaningful skew)
+    const maxSkewIV = currentIV > 0 ? Math.max(currentIV * 2.5, 0.40) : 1.5;
+
+    function minDeltaForDTE(dte: number): number {
+      if (dte <= 3) return 0.10;  // Very near-term: only keep 10%+ delta
+      if (dte <= 7) return 0.07;  // Weekly: 7%+
+      if (dte <= 21) return 0.05; // Monthly: 5%+
+      return 0.04;                // Longer: 4%+
+    }
 
     const skewSurface: {
       expiration: string; dte: number;
@@ -156,17 +160,21 @@ export async function GET(request: NextRequest) {
 
     // Primary: Tradier chains
     for (const chain of tradierChains) {
+      const dte = chain.calls[0]?.dte ?? chain.puts[0]?.dte ?? 0;
+      if (dte < 2) continue; // skip 0-1 DTE (too noisy for skew)
+
+      const minDelta = minDeltaForDTE(dte);
       const points: { strike: number; iv: number; type: string; delta: number }[] = [];
       for (const c of chain.calls) {
         if (c.impliedVolatility > 0.01 && c.impliedVolatility < maxSkewIV &&
-            Math.abs(c.delta) > minDeltaFilter &&
+            Math.abs(c.delta) > minDelta &&
             c.strike >= spotPrice * 0.88 && c.strike <= spotPrice * 1.12) {
           points.push({ strike: c.strike, iv: c.impliedVolatility, type: 'call', delta: c.delta });
         }
       }
       for (const p of chain.puts) {
         if (p.impliedVolatility > 0.01 && p.impliedVolatility < maxSkewIV &&
-            Math.abs(p.delta) > minDeltaFilter &&
+            Math.abs(p.delta) > minDelta &&
             p.strike >= spotPrice * 0.88 && p.strike <= spotPrice * 1.12) {
           points.push({ strike: p.strike, iv: p.impliedVolatility, type: 'put', delta: p.delta });
         }
@@ -175,7 +183,7 @@ export async function GET(request: NextRequest) {
         points.sort((a, b) => a.strike - b.strike);
         skewSurface.push({
           expiration: chain.expiration,
-          dte: chain.calls[0]?.dte ?? chain.puts[0]?.dte ?? 0,
+          dte,
           points,
         });
       }
@@ -192,11 +200,12 @@ export async function GET(request: NextRequest) {
         if (coveredExps.has(exp)) continue;
         if (opt.implied_volatility <= 0.01 || opt.implied_volatility >= maxSkewIV) continue;
         if (opt.details.strike_price < spotPrice * 0.88 || opt.details.strike_price > spotPrice * 1.12) continue;
-        // Filter deep OTM via delta
-        if (opt.greeks?.delta !== undefined && Math.abs(opt.greeks.delta) < minDeltaFilter) continue;
 
         const dte = Math.ceil((new Date(exp).getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
-        if (dte <= 0 || dte > 90) continue;
+        if (dte < 2 || dte > 90) continue; // skip 0-1 DTE
+
+        const minDelta = minDeltaForDTE(dte);
+        if (opt.greeks?.delta !== undefined && Math.abs(opt.greeks.delta) < minDelta) continue;
 
         if (!byExp.has(exp)) byExp.set(exp, { points: [], dte });
         byExp.get(exp)!.points.push({
