@@ -223,37 +223,42 @@ function scoreSignals(input: RecommendationInput): Signal[] {
   }
 
   // 5. PCR Signal (ratio-based, already ticker-neutral)
-  //    Attenuate when total options volume is thin (<2k contracts)
+  //    Zero-weight when either side has <50 contracts (PCR is meaningless)
+  //    Attenuate when total volume is thin (<2k contracts)
+  //    Cap effective PCR to [0.05, 20] — values outside are data artifacts
   const totalOptVol = input.totalCallVol + input.totalPutVol;
-  const pcrConfidence = totalOptVol < 500 ? 0 : totalOptVol < 2000 ? (totalOptVol - 500) / 1500 : 1;
+  const minSideVol = Math.min(input.totalCallVol, input.totalPutVol);
+  const pcrReliable = minSideVol >= 50 && totalOptVol >= 500;
+  const pcrConfidence = !pcrReliable ? 0 : totalOptVol < 2000 ? (totalOptVol - 500) / 1500 : 1;
+  const effectivePCR = Math.max(0.05, Math.min(20, input.volumePCR));
 
-  if (input.volumePCR > 1.3) {
+  if (effectivePCR > 1.3) {
     signals.push({
       name: 'Volume P/C Ratio',
       direction: 'bearish',
-      weight: (input.volumePCR > 2 ? -0.35 : -0.25) * pcrConfidence,
-      description: `PCR ${input.volumePCR.toFixed(2)}${input.volumePCR > 2 ? ' — extreme' : ''}${pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — heavy put buying, bearish sentiment or hedging demand`,
+      weight: (effectivePCR > 2 ? -0.35 : -0.25) * pcrConfidence,
+      description: `PCR ${input.volumePCR > 20 ? '>20' : input.volumePCR.toFixed(2)}${effectivePCR > 2 ? ' — extreme' : ''}${!pcrReliable ? ` (UNRELIABLE: ${minSideVol < 50 ? `only ${minSideVol} contracts on ${input.totalCallVol < input.totalPutVol ? 'call' : 'put'} side` : `low volume: ${totalOptVol}`})` : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — heavy put buying, bearish sentiment or hedging demand`,
     });
-  } else if (input.volumePCR > 1.0) {
+  } else if (effectivePCR > 1.0) {
     signals.push({
       name: 'Volume P/C Ratio',
       direction: 'bearish',
       weight: -0.1 * pcrConfidence,
-      description: `PCR ${input.volumePCR.toFixed(2)}${pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — slightly put-heavy, mild bearish lean`,
+      description: `PCR ${input.volumePCR.toFixed(2)}${!pcrReliable ? ' (unreliable — thin volume)' : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — slightly put-heavy, mild bearish lean`,
     });
-  } else if (input.volumePCR < 0.6) {
+  } else if (effectivePCR < 0.6) {
     signals.push({
       name: 'Volume P/C Ratio',
       direction: 'bullish',
       weight: 0.25 * pcrConfidence,
-      description: `PCR ${input.volumePCR.toFixed(2)}${pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — strong call dominance, bullish flow`,
+      description: `PCR ${input.volumePCR < 0.05 ? '<0.05' : input.volumePCR.toFixed(2)}${!pcrReliable ? ` (UNRELIABLE: ${minSideVol < 50 ? `only ${minSideVol} contracts on ${input.totalCallVol < input.totalPutVol ? 'call' : 'put'} side` : `low volume: ${totalOptVol}`})` : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — strong call dominance, bullish flow`,
     });
-  } else if (input.volumePCR < 0.8) {
+  } else if (effectivePCR < 0.8) {
     signals.push({
       name: 'Volume P/C Ratio',
       direction: 'bullish',
       weight: 0.1 * pcrConfidence,
-      description: `PCR ${input.volumePCR.toFixed(2)}${pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — call-heavy, mild bullish lean`,
+      description: `PCR ${input.volumePCR.toFixed(2)}${!pcrReliable ? ' (unreliable — thin volume)' : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — call-heavy, mild bullish lean`,
     });
   }
 

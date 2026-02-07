@@ -4,6 +4,7 @@ export const maxDuration = 60; // Claude can take a moment
 
 interface AnalysisRequest {
   symbol: string;
+  mode?: 'trade' | 'fundamental';
   spotPrice: number;
   change: number;
   changePct: number;
@@ -136,8 +137,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
   }
 
-  // Build the comprehensive prompt
-  const prompt = buildPrompt(data);
+  // Build the prompt based on mode
+  const prompt = data.mode === 'fundamental' ? buildFundamentalPrompt(data) : buildPrompt(data);
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -288,4 +289,84 @@ Also provide:
 Be specific, quantitative, and reference the actual data. Do NOT give generic advice. Every recommendation should be traceable back to specific data points above. Think like a professional options desk analyst writing a trade memo.
 
 Format your response using clear headers and be concise but thorough.`;
+}
+
+function buildFundamentalPrompt(d: AnalysisRequest): string {
+  const dollarFmt = (v: number) => `$${v.toFixed(2)}`;
+  const pctFmt = (v: number) => `${(v * 100).toFixed(1)}%`;
+
+  return `You are a senior equity research analyst. Generate a comprehensive fundamental analysis report for **${d.symbol}** trading at ${dollarFmt(d.spotPrice)} (${d.changePct > 0 ? '+' : ''}${d.changePct.toFixed(2)}% today).
+
+Use your training knowledge to provide the most current fundamental data available. Where exact numbers aren't certain, provide your best estimates and note them as approximate.
+
+═══════════════════════════════════════════
+FUNDAMENTAL ANALYSIS REPORT — ${d.symbol}
+═══════════════════════════════════════════
+
+Please cover ALL of the following sections:
+
+## 1. COMPANY OVERVIEW
+- What the company does (1-2 sentences)
+- Business segments and revenue mix
+- Competitive moat / positioning
+- TAM (total addressable market) and market share
+
+## 2. KEY FINANCIAL METRICS
+- Market Cap
+- Revenue (TTM and YoY growth)
+- EPS (TTM and forward estimates)
+- P/E Ratio (trailing and forward)
+- P/S Ratio
+- PEG Ratio
+- EV/EBITDA
+- Gross Margin, Operating Margin, Net Margin
+- Free Cash Flow and FCF Yield
+- Debt/Equity and Interest Coverage
+- ROE and ROIC
+- Dividend Yield (if applicable) and Payout Ratio
+
+## 3. RECENT EARNINGS
+- Last quarter's results vs estimates (revenue & EPS beat/miss)
+- Key takeaways from the earnings call
+- Forward guidance provided by management
+- Next earnings date (if known)
+
+## 4. GROWTH DRIVERS & CATALYSTS
+- Near-term catalysts (next 1-3 months)
+- Medium-term growth drivers (next 1-2 years)
+- Long-term secular trends supporting the thesis
+- Any upcoming product launches, partnerships, or strategic initiatives
+
+## 5. RISKS & HEADWINDS
+- Key operational risks
+- Competitive threats
+- Regulatory / legal concerns
+- Macroeconomic sensitivity
+- Valuation risk at current levels
+
+## 6. RECENT NEWS & SENTIMENT
+- Notable recent news (last 30 days)
+- Analyst consensus rating and average price target
+- Recent insider buying/selling activity (if notable)
+- Institutional ownership trends
+
+## 7. TECHNICAL CONTEXT (from live data)
+Current price: ${dollarFmt(d.spotPrice)}
+Today's change: ${d.changePct > 0 ? '+' : ''}${d.changePct.toFixed(2)}%
+Volume: ${(d.volume / 1e6).toFixed(1)}M (${d.avgVolume > 0 ? ((d.volume / d.avgVolume) * 100).toFixed(0) : '?'}% of avg)
+IV Rank: ${d.ivRank}/100 | Current IV: ${pctFmt(d.currentIV)} | HV20: ${pctFmt(d.hv20)}
+${d.correlations ? `Beta: ${d.correlations.beta.toFixed(2)} | 30d Alpha: ${d.correlations.alpha30d > 0 ? '+' : ''}${(d.correlations.alpha30d * 100).toFixed(1)}%` : ''}
+
+## 8. VALUATION ASSESSMENT
+- Compare current valuation to historical averages
+- Compare to peers/sector averages
+- DCF-based fair value estimate (rough range)
+- Bull case / Base case / Bear case price targets with reasoning
+
+## 9. BOTTOM LINE
+- 2-3 sentence summary: Is this stock a Buy, Hold, or Sell at current levels?
+- What would change your mind in each direction?
+- Conviction level (1-10) with justification
+
+Be specific, data-driven, and balanced. Acknowledge uncertainty where it exists. Focus on material facts that would influence an investment decision. Format with clear headers and be thorough but readable.`;
 }
