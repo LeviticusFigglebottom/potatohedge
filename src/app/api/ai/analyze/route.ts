@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-export const maxDuration = 60; // Claude can take a moment
+export const maxDuration = 120; // Web search fundamental analysis can take longer
 
 interface AnalysisRequest {
   symbol: string;
@@ -189,6 +189,7 @@ export async function POST(request: NextRequest) {
             'anthropic-version': '2023-06-01',
           },
           body: JSON.stringify(body),
+          signal: AbortSignal.timeout(enableSearch ? 100000 : 60000), // generous timeout
         });
 
         if (!response.ok) {
@@ -226,13 +227,9 @@ export async function POST(request: NextRequest) {
         // Try with web search first
         result = await callClaude(true);
       } catch (err) {
-        // If web search not available (403/400 from API), fall back to without
-        const msg = err instanceof Error ? err.message : '';
-        if (msg.includes('400') || msg.includes('403') || msg.includes('tool')) {
-          result = await callClaude(false);
-        } else {
-          throw err;
-        }
+        // If web search fails for any reason, fall back to Claude without web search
+        console.error('[ai/analyze] Web search call failed, falling back:', err instanceof Error ? err.message : String(err));
+        result = await callClaude(false);
       }
     } else {
       result = await callClaude(false);
@@ -240,7 +237,8 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ analysis: result.text, model: result.model, usage: result.usage });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
+    const message = error instanceof Error ? error.message : String(error ?? 'Unknown error');
+    console.error('[ai/analyze] Error:', message);
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
@@ -332,10 +330,13 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
     const cookieRes = await fetch('https://fc.yahoo.com/', {
       redirect: 'manual',
       headers: { 'User-Agent': UA },
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(3000),
     });
     const setCookie = cookieRes.headers.get('set-cookie');
-    if (!setCookie) return null;
+    if (!setCookie) {
+      console.log('[Yahoo] No cookie returned from fc.yahoo.com');
+      return null;
+    }
     // Extract cookie key=value pairs (may have multiple cookies separated by commas)
     const cookieParts = setCookie.split(/,(?=\s*\w+=)/).map(c => c.split(';')[0].trim());
     const cookie = cookieParts.join('; ');
@@ -343,11 +344,17 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
     // Step 2: Get crumb using the cookie
     const crumbRes = await fetch('https://query2.finance.yahoo.com/v1/test/getcrumb', {
       headers: { 'Cookie': cookie, 'User-Agent': UA },
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(3000),
     });
-    if (!crumbRes.ok) return null;
+    if (!crumbRes.ok) {
+      console.log(`[Yahoo] Crumb fetch failed: ${crumbRes.status}`);
+      return null;
+    }
     const crumb = await crumbRes.text();
-    if (!crumb || crumb.length > 50) return null; // sanity check
+    if (!crumb || crumb.length > 50) {
+      console.log('[Yahoo] Invalid crumb:', crumb?.slice(0, 20));
+      return null;
+    }
 
     // Step 3: Fetch financial data with cookie + crumb
     const modules = [
@@ -364,10 +371,13 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
 
     const res = await fetch(url, {
       headers: { 'Cookie': cookie, 'User-Agent': UA },
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(5000),
     });
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.log(`[Yahoo] quoteSummary failed: ${res.status}`);
+      return null;
+    }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const json: any = await res.json();
@@ -455,7 +465,8 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
     };
 
     return data;
-  } catch {
+  } catch (err) {
+    console.log('[Yahoo] Fetch error:', err instanceof Error ? err.message : String(err));
     return null;
   }
 }

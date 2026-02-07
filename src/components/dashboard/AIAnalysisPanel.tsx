@@ -193,8 +193,17 @@ export default function AIAnalysisPanel() {
       });
 
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({ error: 'Unknown error' }));
-        throw new Error(errData.error || `HTTP ${res.status}`);
+        const text = await res.text().catch(() => '');
+        let errorMsg = `HTTP ${res.status}`;
+        try {
+          const errData = JSON.parse(text);
+          errorMsg = errData.error || errorMsg;
+        } catch {
+          // Non-JSON response (e.g. Vercel timeout page)
+          if (res.status === 504) errorMsg = 'Request timed out — try again';
+          else if (text.length < 200) errorMsg = text || errorMsg;
+        }
+        throw new Error(errorMsg);
       }
 
       const result = await res.json();
