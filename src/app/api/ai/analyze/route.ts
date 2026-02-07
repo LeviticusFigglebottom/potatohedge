@@ -144,37 +144,101 @@ export async function POST(request: NextRequest) {
   }
 
   // Build the prompt based on mode
+  const hasYahooData = !!(fundamentals && fundamentals.marketCap);
   const prompt = data.mode === 'fundamental'
     ? buildFundamentalPrompt(data, fundamentals)
     : buildPrompt(data);
 
-  try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 4096,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
+  // Enable Claude web search when doing fundamental analysis without Yahoo data
+  // This lets Claude search the web for current financial metrics itself
+  const useWebSearch = data.mode === 'fundamental' && !hasYahooData;
 
-    if (!response.ok) {
-      const err = await response.text().catch(() => 'Unknown error');
-      return NextResponse.json({ error: `Claude API error: ${response.status} — ${err}` }, { status: 500 });
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const callClaude = async (enableSearch: boolean): Promise<{ text: string; model: string; usage: any }> => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const body: Record<string, any> = {
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: data.mode === 'fundamental' ? 8192 : 4096,
+        messages: [{ role: 'user', content: prompt }],
+      };
+
+      if (enableSearch) {
+        body.tools = [
+          {
+            type: 'web_search_20250305',
+            name: 'web_search',
+            max_uses: 5,
+          },
+        ];
+      }
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let allContent: any[] = [];
+      let lastModel = '';
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let lastUsage: any = {};
+
+      // Handle pause_turn continuation (web search may pause long turns)
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify(body),
+        });
+
+        if (!response.ok) {
+          const err = await response.text().catch(() => 'Unknown error');
+          throw new Error(`Claude API error: ${response.status} — ${err}`);
+        }
+
+        const result = await response.json();
+        allContent = [...allContent, ...(result.content || [])];
+        lastModel = result.model;
+        lastUsage = result.usage;
+
+        // If turn completed normally, we're done
+        if (result.stop_reason !== 'pause_turn') break;
+
+        // Turn was paused — continue it by passing accumulated content as assistant message
+        body.messages = [
+          { role: 'user', content: prompt },
+          { role: 'assistant', content: allContent },
+        ];
+      }
+
+      // Extract text from all text blocks
+      const text = allContent
+        .filter((block: { type: string }) => block.type === 'text')
+        .map((block: { text: string }) => block.text)
+        .join('\n') || 'No response generated.';
+
+      return { text, model: lastModel, usage: lastUsage };
+    };
+
+    let result;
+    if (useWebSearch) {
+      try {
+        // Try with web search first
+        result = await callClaude(true);
+      } catch (err) {
+        // If web search not available (403/400 from API), fall back to without
+        const msg = err instanceof Error ? err.message : '';
+        if (msg.includes('400') || msg.includes('403') || msg.includes('tool')) {
+          result = await callClaude(false);
+        } else {
+          throw err;
+        }
+      }
+    } else {
+      result = await callClaude(false);
     }
 
-    const result = await response.json();
-    const text = result.content
-      ?.filter((block: { type: string }) => block.type === 'text')
-      .map((block: { text: string }) => block.text)
-      .join('\n') || 'No response generated.';
-
-    return NextResponse.json({ analysis: text, model: result.model, usage: result.usage });
+    return NextResponse.json({ analysis: result.text, model: result.model, usage: result.usage });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     return NextResponse.json({ error: message }, { status: 500 });
@@ -262,6 +326,30 @@ function fmt(obj: any): string | undefined {
 
 async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | null> {
   try {
+    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+    // Step 1: Get session cookie from fc.yahoo.com (returns 404 but sets cookie)
+    const cookieRes = await fetch('https://fc.yahoo.com/', {
+      redirect: 'manual',
+      headers: { 'User-Agent': UA },
+      signal: AbortSignal.timeout(5000),
+    });
+    const setCookie = cookieRes.headers.get('set-cookie');
+    if (!setCookie) return null;
+    // Extract cookie key=value pairs (may have multiple cookies separated by commas)
+    const cookieParts = setCookie.split(/,(?=\s*\w+=)/).map(c => c.split(';')[0].trim());
+    const cookie = cookieParts.join('; ');
+
+    // Step 2: Get crumb using the cookie
+    const crumbRes = await fetch('https://query2.finance.yahoo.com/v1/test/getcrumb', {
+      headers: { 'Cookie': cookie, 'User-Agent': UA },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!crumbRes.ok) return null;
+    const crumb = await crumbRes.text();
+    if (!crumb || crumb.length > 50) return null; // sanity check
+
+    // Step 3: Fetch financial data with cookie + crumb
     const modules = [
       'assetProfile',
       'financialData',
@@ -272,12 +360,10 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
       'calendarEvents',
     ].join(',');
 
-    const url = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=${modules}`;
+    const url = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=${modules}&crumb=${encodeURIComponent(crumb)}`;
 
     const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
+      headers: { 'Cookie': cookie, 'User-Agent': UA },
       signal: AbortSignal.timeout(8000),
     });
 
@@ -605,14 +691,23 @@ function buildFundamentalPrompt(d: AnalysisRequest, fin: FundamentalData | null)
 
     financialSection = lines.join('\n');
   } else {
-    financialSection = `LIVE FINANCIAL DATA: ⚠️ Not available (Yahoo Finance fetch failed).
-Use your training knowledge for financial metrics, but clearly note all figures as estimates and flag your knowledge cutoff.
-The CURRENT stock price is ${dollarFmt(d.spotPrice)} — use this as your anchor. Do NOT cite a price from your training data.`;
+    financialSection = `LIVE FINANCIAL DATA: ⚠️ Not available from our data feed.
+You have web search capability — USE IT. Search for current financial data for ${d.symbol} including:
+1. Current market cap, P/E ratio, P/S ratio, and other valuation metrics
+2. Most recent quarterly earnings results (EPS actual vs estimate, revenue)
+3. Revenue growth, profit margins, and balance sheet highlights
+4. Analyst price targets and consensus rating
+5. Any significant recent news, catalysts, or material developments
+
+The CURRENT stock price is ${dollarFmt(d.spotPrice)} — use this as your price anchor. Do NOT cite a price from your training data.
+Search for the most recent data available and cite your sources.`;
   }
 
   return `You are a senior equity research analyst. Generate a comprehensive fundamental analysis report for **${d.symbol}** trading at ${dollarFmt(d.spotPrice)} (${d.changePct > 0 ? '+' : ''}${d.changePct.toFixed(2)}% today).
 
-IMPORTANT: Live financial data has been fetched and is provided below. Use THESE numbers as your primary source — they are current and accurate. Supplement with your knowledge for qualitative analysis (competitive positioning, recent news, growth narratives), but DO NOT override the quantitative data below with numbers from your training data. If your training data conflicts with the live data, trust the live data.
+IMPORTANT: ${fin && fin.marketCap
+    ? 'Live financial data has been fetched and is provided below. Use THESE numbers as your primary source — they are current and accurate. Supplement with your knowledge for qualitative analysis (competitive positioning, recent news, growth narratives), but DO NOT override the quantitative data below with numbers from your training data. If your training data conflicts with the live data, trust the live data.'
+    : 'Live financial data could not be fetched from our data feed. You have web search access — you MUST use it to search for current financial metrics before writing your analysis. Do NOT rely on training data for any financial figures. Search first, then write.'}
 
 ═══════════════════════════════════════════
 ${financialSection}
