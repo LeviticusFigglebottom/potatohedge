@@ -6,7 +6,7 @@ import { Sparkles, AlertTriangle, Loader2, RefreshCw, Brain } from 'lucide-react
 
 export default function AIAnalysisPanel() {
   const {
-    symbol, quote, multiGEX, snapshot, recommendations,
+    symbol, quote, multiGEX, snapshot, recommendations, correlations,
   } = useDashboardStore();
 
   const [analysis, setAnalysis] = useState<string | null>(null);
@@ -124,6 +124,43 @@ export default function AIAnalysisPanel() {
         warnings: recommendations?.warnings ?? [],
         moveContext: recommendations?.moveContext ?? '',
         stockContext: recommendations?.stockContext ?? '',
+
+        // Correlations
+        correlations: correlations ? {
+          beta: correlations.marketRelative.beta,
+          marketCorrelation: correlations.marketRelative.correlation,
+          alpha30d: correlations.marketRelative.alpha30d,
+          alpha90d: correlations.marketRelative.alpha90d,
+          drawdownRatio: correlations.marketRelative.drawdownBehavior.ratio,
+          rallyRatio: correlations.marketRelative.rallyBehavior.ratio,
+          ivRegime: {
+            lowVolAvg20d: correlations.ivRegime.lowIV.avgReturn20d,
+            highVolAvg20d: correlations.ivRegime.highIV.avgReturn20d,
+            lowVolWinRate: correlations.ivRegime.lowIV.winRate5d,
+            insight: correlations.ivRegime.insight,
+          },
+          volPricing: {
+            overPricingRate: correlations.volPricing.overPricingRate,
+            avgImpliedMove: correlations.volPricing.avgImpliedMove,
+            avgRealizedMove: correlations.volPricing.avgRealizedMove,
+            insight: correlations.volPricing.insight,
+          },
+          meanReversion: {
+            bounceRateAfterDrops: correlations.meanReversion.afterBigDown.reversalRate,
+            pullbackRateAfterRallies: correlations.meanReversion.afterBigUp.reversalRate,
+            avgRecovery5d: correlations.meanReversion.afterBigDown.avgNext5dReturn,
+            insight: correlations.meanReversion.insight,
+          },
+          sectorRelative: correlations.sectorRelative ? {
+            sectorETF: correlations.sectorRelative.sectorETF,
+            sectorCorrelation: correlations.sectorRelative.correlation,
+            relativeStrength30d: correlations.sectorRelative.relativeStrength30d,
+            divergenceDays: correlations.sectorRelative.divergenceDays,
+            insight: correlations.sectorRelative.insight,
+          } : null,
+          anomalies: correlations.anomalies.map(a => a.description),
+          strongestInsights: correlations.strongestInsights.slice(0, 6).map(i => `${i.label}: ${i.value}`),
+        } : null,
       };
 
       // Parse stockContext to extract ATR values if available
@@ -165,7 +202,7 @@ export default function AIAnalysisPanel() {
     } finally {
       setLoading(false);
     }
-  }, [symbol, quote, multiGEX, snapshot, recommendations]);
+  }, [symbol, quote, multiGEX, snapshot, recommendations, correlations]);
 
   // Don't show if no data
   if (!quote) return null;
@@ -191,7 +228,7 @@ export default function AIAnalysisPanel() {
               </span>
               <p className="text-xs text-text-muted mt-0.5">
                 {multiGEX
-                  ? 'Sends all GEX, IV, flow, dealer, and volatility data to Claude for deep analysis'
+                  ? 'Sends all GEX, IV, flow, dealer, volatility, and correlation data to Claude for deep analysis'
                   : 'Waiting for market data to load...'}
               </p>
             </div>
@@ -221,7 +258,7 @@ export default function AIAnalysisPanel() {
               </p>
             </div>
             <div className="flex gap-2 flex-wrap justify-center mt-2">
-              {['GEX/DEX', 'IV Rank', 'Term Structure', 'Skew', 'PCR', 'ATR', 'Key Levels'].map(tag => (
+              {['GEX/DEX', 'IV Rank', 'Term Structure', 'Skew', 'PCR', 'ATR', 'Key Levels', 'Correlations'].map(tag => (
                 <span key={tag} className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-300/60 border border-purple-500/20">
                   {tag}
                 </span>
