@@ -119,7 +119,7 @@ export default function ScreenerTab() {
   const exportCSV = useCallback(() => {
     if (filteredResults.length === 0) return;
 
-    const headers = ['Symbol', 'Price', 'Change%', 'Bias', 'Score', 'Vol Regime', 'Gamma Regime', 'IV', 'IV Rank', 'PCR', 'Top Signal', 'Gamma Flip', 'Call Wall', 'Put Wall', 'Warnings'];
+    const headers = ['Symbol', 'Price', 'Change%', 'Bias', 'Score', 'Vol Regime', 'Gamma Regime', 'IV', 'IV Rank', 'PCR', 'Top Signal', 'Gamma Flip', 'Call Wall', 'Put Wall', 'Swap Maturities Today', 'Swap Notional ($M)', 'Days to Cover', 'Reg SHO', 'Warnings'];
     const rows = filteredResults.map(r => [
       r.symbol,
       r.spotPrice.toFixed(2),
@@ -135,6 +135,10 @@ export default function ScreenerTab() {
       r.gammaFlip?.toFixed(2) || 'N/A',
       r.callWall?.toFixed(2) || 'N/A',
       r.putWall?.toFixed(2) || 'N/A',
+      r.swapMaturitiesToday.toString(),
+      (r.swapNotionalToday / 1e6).toFixed(1),
+      r.daysToCover > 0 ? r.daysToCover.toFixed(1) : 'N/A',
+      r.regSHO ? 'YES' : '',
       r.warnings.join('; '),
     ]);
 
@@ -315,6 +319,8 @@ export default function ScreenerTab() {
                   <SortHeader label="PCR" sortKeyVal="volumePCR" />
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Top Signal</th>
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Key Levels</th>
+                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Swaps</th>
+                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">SI/DTC</th>
                 </tr>
               </thead>
               <tbody>
@@ -398,6 +404,38 @@ export default function ScreenerTab() {
                         {r.gammaFlip && <span>γF: ${r.gammaFlip.toFixed(0)}</span>}
                         {r.callWall && <span className="text-green-500/70">CW: ${r.callWall.toFixed(0)}</span>}
                         {r.putWall && <span className="text-red-500/70">PW: ${r.putWall.toFixed(0)}</span>}
+                      </div>
+                    </td>
+                    <td className="px-3 py-2 text-xs font-mono text-text-muted">
+                      {r.swapMaturitiesToday > 0 ? (
+                        <div className="flex flex-col gap-0.5">
+                          <span className={r.swapMaturitiesToday > 100 ? 'text-orange-400' : ''}>
+                            {r.swapMaturitiesToday} today
+                          </span>
+                          {r.swapNotionalToday > 0 && (
+                            <span className="text-text-muted/60">
+                              ${(r.swapNotionalToday / 1e6).toFixed(0)}M
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-text-muted/30">—</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 text-xs font-mono">
+                      <div className="flex flex-col gap-0.5">
+                        {r.daysToCover > 0 ? (
+                          <span className={r.daysToCover > 5 ? 'text-orange-400' : r.daysToCover > 2 ? 'text-yellow-400' : 'text-text-muted'}>
+                            {r.daysToCover.toFixed(1)}d
+                          </span>
+                        ) : (
+                          <span className="text-text-muted/30">—</span>
+                        )}
+                        {r.regSHO && (
+                          <span className="text-red-400 font-semibold" title="On Reg SHO Threshold List — persistent FTDs">
+                            RegSHO
+                          </span>
+                        )}
                       </div>
                     </td>
                   </tr>
