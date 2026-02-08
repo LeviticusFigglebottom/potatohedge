@@ -170,6 +170,15 @@ export async function fetchSwapData(): Promise<Map<string, SwapData>> {
     }
 
     const contentType = res.headers.get('content-type') || '';
+
+    // Reject HTML error pages
+    if (contentType.includes('html') || contentType.includes('text/plain')) {
+      const preview = await res.text().catch(() => '');
+      if (preview.includes('<html') || preview.includes('host_not_allowed') || preview.length < 50) {
+        console.log(`[DTCC] Got non-data response (${contentType}): ${preview.slice(0, 100)}`);
+        return new Map();
+      }
+    }
     let csvText: string;
 
     if (contentType.includes('json')) {

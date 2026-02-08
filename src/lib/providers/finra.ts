@@ -61,18 +61,18 @@ export async function fetchRegSHOThreshold(): Promise<Set<string>> {
       signal: AbortSignal.timeout(10000),
     });
 
-    if (res.ok) {
+    const contentType = res.headers.get('content-type') || '';
+    if (res.ok && contentType.includes('json')) {
       const data = await res.json();
       if (Array.isArray(data)) {
         for (const record of data) {
           const sym = (record.symbolCode || record.symbol || '').toUpperCase().trim();
-          if (sym && sym.length <= 6) tickers.add(sym);
+          if (sym && sym.length <= 6 && /^[A-Z]+$/.test(sym)) tickers.add(sym);
         }
       }
       console.log(`[FINRA] Reg SHO threshold list: ${tickers.size} securities`);
     } else {
-      console.log(`[FINRA] Reg SHO API returned ${res.status}, trying archive...`);
-      // Fallback: try the text archive
+      console.log(`[FINRA] Reg SHO API returned ${res.status} (${contentType}), trying archive...`);
       await fetchRegSHOFromArchive(tickers);
     }
   } catch (err) {
@@ -97,11 +97,16 @@ async function fetchRegSHOFromArchive(tickers: Set<string>): Promise<void> {
 
   if (!res.ok) return;
 
+  const contentType = res.headers.get('content-type') || '';
+  if (contentType.includes('html')) {
+    console.log('[FINRA] Archive returned HTML — skipping');
+    return;
+  }
   const text = await res.text();
   for (const line of text.split('\n')) {
     const parts = line.split('|');
     const sym = (parts[1] || parts[0] || '').trim().toUpperCase();
-    if (sym && sym.length <= 6 && sym !== 'SYMBOL' && !sym.includes(' ')) {
+    if (sym && sym.length <= 6 && sym !== 'SYMBOL' && /^[A-Z]+$/.test(sym)) {
       tickers.add(sym);
     }
   }
@@ -141,8 +146,9 @@ export async function fetchShortInterest(): Promise<Map<string, ShortInterestDat
       signal: AbortSignal.timeout(15000),
     });
 
-    if (!res.ok) {
-      console.log(`[FINRA] Short interest API returned ${res.status}`);
+    const siContentType = res.headers.get('content-type') || '';
+    if (!res.ok || !siContentType.includes('json')) {
+      console.log(`[FINRA] Short interest API returned ${res.status} (${siContentType})`);
       shortInterestCache = { data: map, timestamp: Date.now() };
       return map;
     }

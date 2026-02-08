@@ -4,9 +4,9 @@ import { useState, useCallback } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import {
   Newspaper, RefreshCw, Loader2, TrendingUp, TrendingDown, Minus,
-  AlertTriangle, ArrowRightLeft, ShieldAlert, BarChart3,
+  AlertTriangle, ArrowRightLeft, ShieldAlert, Shield, Activity, Target,
 } from 'lucide-react';
-import type { BriefingData } from '@/app/api/market/briefing/route';
+import type { BriefingData, IndexAnalysis } from '@/app/api/market/briefing/route';
 
 function formatNotional(n: number): string {
   if (n >= 1e9) return `$${(n / 1e9).toFixed(1)}B`;
@@ -26,6 +26,103 @@ function ChangeChip({ pct }: { pct: number }) {
   );
 }
 
+function BiasChip({ bias, score }: { bias: string; score: number }) {
+  const color = bias === 'bullish' ? 'bg-green-500/15 text-green-400 border-green-500/30'
+    : bias === 'bearish' ? 'bg-red-500/15 text-red-400 border-red-500/30'
+    : 'bg-bg-tertiary text-text-muted border-border/30';
+  return (
+    <span className={`inline-block px-2 py-0.5 rounded text-xs font-mono font-semibold border ${color}`}>
+      {score > 0 ? '+' : ''}{score} {bias}
+    </span>
+  );
+}
+
+function RegimeChip({ label, value, type }: { label: string; value: string; type: 'gamma' | 'vol' }) {
+  let color = 'bg-bg-tertiary text-text-muted';
+  if (type === 'gamma') {
+    if (value === 'long') color = 'bg-green-500/15 text-green-400';
+    else if (value === 'short') color = 'bg-red-500/15 text-red-400';
+  } else {
+    if (value === 'high') color = 'bg-orange-500/15 text-orange-400';
+    else if (value === 'low') color = 'bg-blue-500/15 text-blue-400';
+  }
+  return (
+    <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${color}`}>
+      {label}: {value}
+    </span>
+  );
+}
+
+function IndexCard({ idx, onClick }: { idx: IndexAnalysis; onClick: () => void }) {
+  return (
+    <div className="panel cursor-pointer hover:border-accent-cyan/30 transition-colors" onClick={onClick}>
+      <div className="px-4 py-3">
+        {/* Header */}
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-2">
+            <span className="font-mono font-bold text-text-primary text-sm">{idx.symbol}</span>
+            <span className="font-mono text-text-secondary text-sm">${idx.price.toFixed(2)}</span>
+            <ChangeChip pct={idx.changePct} />
+          </div>
+          <BiasChip bias={idx.bias} score={idx.biasScore} />
+        </div>
+
+        {/* Regime badges */}
+        <div className="flex flex-wrap gap-1.5 mb-3">
+          <RegimeChip label="Gamma" value={idx.gammaRegime} type="gamma" />
+          <RegimeChip label="IV" value={idx.volRegime} type="vol" />
+          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-bg-tertiary text-text-muted">
+            IV Rank: {idx.ivRank}
+          </span>
+          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-bg-tertiary text-text-muted">
+            PCR: {idx.volumePCR.toFixed(2)}
+          </span>
+        </div>
+
+        {/* Key levels */}
+        <div className="grid grid-cols-4 gap-2 mb-3">
+          <div>
+            <div className="text-[10px] text-text-muted font-mono">Gamma Flip</div>
+            <div className="text-xs font-mono text-text-secondary">
+              {idx.gammaFlip ? `$${idx.gammaFlip.toFixed(0)}` : '—'}
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] text-text-muted font-mono">Call Wall</div>
+            <div className="text-xs font-mono text-green-500/70">
+              {idx.callWall ? `$${idx.callWall.toFixed(0)}` : '—'}
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] text-text-muted font-mono">Put Wall</div>
+            <div className="text-xs font-mono text-red-500/70">
+              {idx.putWall ? `$${idx.putWall.toFixed(0)}` : '—'}
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] text-text-muted font-mono">Max Pain</div>
+            <div className="text-xs font-mono text-text-secondary">${idx.maxPain.toFixed(0)}</div>
+          </div>
+        </div>
+
+        {/* Top signals */}
+        {idx.topSignals.length > 0 && (
+          <div className="space-y-1 pt-2 border-t border-border/20">
+            {idx.topSignals.slice(0, 3).map((sig, i) => (
+              <div key={i} className="flex items-start gap-2 text-[11px]">
+                <span className={`shrink-0 mt-0.5 ${sig.direction === 'bullish' ? 'text-green-400' : sig.direction === 'bearish' ? 'text-red-400' : 'text-text-muted'}`}>
+                  {sig.direction === 'bullish' ? '▲' : sig.direction === 'bearish' ? '▼' : '●'}
+                </span>
+                <span className="text-text-muted font-mono leading-relaxed">{sig.description}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function BriefingTab() {
   const { loadSymbol, setActiveTab } = useDashboardStore();
   const [data, setData] = useState<BriefingData | null>(null);
@@ -40,7 +137,9 @@ export default function BriefingTab() {
       const res = await fetch('/api/market/briefing');
       if (!res.ok) {
         const text = await res.text().catch(() => '');
-        throw new Error(text || `HTTP ${res.status}`);
+        let msg = `HTTP ${res.status}`;
+        try { const j = JSON.parse(text); msg = j.error || msg; } catch { if (text.length < 200) msg = text || msg; }
+        throw new Error(msg);
       }
       const json = await res.json();
       setData(json);
@@ -65,19 +164,23 @@ export default function BriefingTab() {
           <Newspaper className="w-12 h-12 text-text-muted/30 mb-4" />
           <h3 className="text-lg font-semibold text-text-secondary mb-2">Daily Market Briefing</h3>
           <p className="text-sm text-text-muted max-w-md mb-1">
-            Aggregates DTCC swap maturity data, FINRA short interest, Reg SHO threshold flags,
-            and key index/Mag7 snapshots into a single morning overview.
+            Full GEX/IV/flow analysis of SPY, QQQ, IWM plus Mag7 snapshot,
+            DTCC swap maturities, and FINRA short interest data — synthesized
+            into an actionable morning overview.
           </p>
           <p className="text-xs text-text-muted/60 mb-6 max-w-md">
-            Data sourced from SEC-mandated DTCC swap disclosures and FINRA short interest reports.
+            Runs the same analysis pipeline as the individual stock view across all key indices.
           </p>
           <button
             onClick={fetchBriefing}
             className="px-6 py-2.5 rounded-lg bg-accent-cyan/20 text-accent-cyan border border-accent-cyan/30 hover:bg-accent-cyan/30 transition-all font-medium flex items-center gap-2"
           >
             <Newspaper className="w-5 h-5" />
-            Load Briefing
+            Generate Briefing
           </button>
+          <p className="text-xs text-text-muted/40 mt-3 font-mono">
+            Takes ~15-30 seconds (analyzes 3 indices + 7 stocks)
+          </p>
         </div>
       </div>
     );
@@ -92,9 +195,7 @@ export default function BriefingTab() {
             <Newspaper className="w-4 h-4 text-accent-cyan" />
             <span className="panel-title">Daily Market Briefing</span>
             {loadedAt && (
-              <span className="text-xs text-text-muted font-mono">
-                Updated {loadedAt}
-              </span>
+              <span className="text-xs text-text-muted font-mono">Updated {loadedAt}</span>
             )}
           </div>
           <button
@@ -103,7 +204,7 @@ export default function BriefingTab() {
             className="px-3 py-1.5 rounded-md text-xs font-mono bg-bg-tertiary border border-border/30 text-text-secondary hover:border-accent-cyan/30 hover:text-accent-cyan transition-all flex items-center gap-1.5 disabled:opacity-50"
           >
             {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
-            Refresh
+            {loading ? 'Analyzing...' : 'Refresh'}
           </button>
         </div>
       </div>
@@ -119,34 +220,89 @@ export default function BriefingTab() {
         <div className="panel p-6 flex items-center justify-center">
           <div className="flex items-center gap-3 text-text-muted font-mono text-sm">
             <Loader2 className="w-5 h-5 animate-spin text-accent-cyan" />
-            Loading market briefing data...
+            Analyzing SPY, QQQ, IWM + fetching Mag7, DTCC, FINRA data...
           </div>
         </div>
       )}
 
       {data && (
         <>
-          {/* Market Snapshot */}
+          {/* Alerts */}
+          {data.alerts.length > 0 && (
+            <div className="panel border border-accent-amber/30">
+              <div className="px-4 py-2 border-b border-border/30 flex items-center gap-2">
+                <AlertTriangle className="w-3.5 h-3.5 text-accent-amber" />
+                <span className="text-xs font-mono font-semibold text-accent-amber uppercase tracking-wider">Alerts</span>
+              </div>
+              <div className="px-4 py-2 space-y-1">
+                {data.alerts.map((a, i) => (
+                  <p key={i} className="text-sm text-text-secondary flex items-start gap-2">
+                    <span className="text-accent-amber shrink-0">!</span>
+                    {a}
+                  </p>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Narrative Summary */}
           <div className="panel">
             <div className="panel-header">
               <span className="panel-title flex items-center gap-2">
-                <BarChart3 className="w-3.5 h-3.5 text-accent-cyan" />
-                Market Indices
+                <Target className="w-3.5 h-3.5 text-accent-cyan" />
+                Market Analysis
               </span>
             </div>
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-px bg-border/20">
-              {data.marketSnapshot.map(s => (
-                <div
-                  key={s.symbol}
-                  className="bg-bg-secondary px-4 py-3 cursor-pointer hover:bg-bg-hover/50 transition-colors"
-                  onClick={() => s.symbol !== 'VIX' && navigateToStock(s.symbol)}
-                >
-                  <div className="text-xs font-mono text-text-muted mb-1">{s.symbol}</div>
-                  <div className="text-sm font-mono font-semibold text-text-primary">${s.price.toFixed(2)}</div>
-                  <ChangeChip pct={s.changePct} />
-                </div>
+            <div className="px-4 py-3 space-y-2">
+              {data.narrative.map((line, i) => (
+                <p key={i} className="text-sm text-text-secondary leading-relaxed font-mono">
+                  {line}
+                </p>
               ))}
             </div>
+          </div>
+
+          {/* Market Snapshot Bar — compact indices + VIX + DIA */}
+          <div className="panel overflow-hidden">
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-px bg-border/20">
+              {data.indices.map(idx => (
+                <div
+                  key={idx.symbol}
+                  className="bg-bg-secondary px-4 py-3 cursor-pointer hover:bg-bg-hover/50 transition-colors"
+                  onClick={() => navigateToStock(idx.symbol)}
+                >
+                  <div className="text-xs font-mono text-text-muted mb-1">{idx.symbol}</div>
+                  <div className="text-sm font-mono font-semibold text-text-primary">${idx.price.toFixed(2)}</div>
+                  <ChangeChip pct={idx.changePct} />
+                </div>
+              ))}
+              {data.dia && (
+                <div
+                  className="bg-bg-secondary px-4 py-3 cursor-pointer hover:bg-bg-hover/50 transition-colors"
+                  onClick={() => navigateToStock('DIA')}
+                >
+                  <div className="text-xs font-mono text-text-muted mb-1">DIA</div>
+                  <div className="text-sm font-mono font-semibold text-text-primary">${data.dia.price.toFixed(2)}</div>
+                  <ChangeChip pct={data.dia.changePct} />
+                </div>
+              )}
+              {data.vix && (
+                <div className="bg-bg-secondary px-4 py-3">
+                  <div className="text-xs font-mono text-text-muted mb-1">VIX</div>
+                  <div className={`text-sm font-mono font-semibold ${data.vix.price > 25 ? 'text-red-400' : data.vix.price < 15 ? 'text-green-400' : 'text-text-primary'}`}>
+                    {data.vix.price.toFixed(2)}
+                  </div>
+                  <ChangeChip pct={data.vix.changePct} />
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Index Analysis Cards */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            {data.indices.map(idx => (
+              <IndexCard key={idx.symbol} idx={idx} onClick={() => navigateToStock(idx.symbol)} />
+            ))}
           </div>
 
           {/* Mag7 Breakdown */}
@@ -161,10 +317,6 @@ export default function BriefingTab() {
                     <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Symbol</th>
                     <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Price</th>
                     <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Chg%</th>
-                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Swaps Today</th>
-                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Notional</th>
-                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">DTC</th>
-                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Flags</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -179,18 +331,6 @@ export default function BriefingTab() {
                         {s.price > 0 ? `$${s.price.toFixed(2)}` : '—'}
                       </td>
                       <td className="px-3 py-2"><ChangeChip pct={s.changePct} /></td>
-                      <td className={`px-3 py-2 font-mono text-xs ${s.swapMaturitiesToday > 100 ? 'text-orange-400' : 'text-text-muted'}`}>
-                        {s.swapMaturitiesToday > 0 ? s.swapMaturitiesToday : '—'}
-                      </td>
-                      <td className="px-3 py-2 font-mono text-xs text-text-muted">
-                        {s.swapNotionalToday > 0 ? formatNotional(s.swapNotionalToday) : '—'}
-                      </td>
-                      <td className={`px-3 py-2 font-mono text-xs ${s.daysToCover > 5 ? 'text-orange-400' : s.daysToCover > 2 ? 'text-yellow-400' : 'text-text-muted'}`}>
-                        {s.daysToCover > 0 ? `${s.daysToCover.toFixed(1)}d` : '—'}
-                      </td>
-                      <td className="px-3 py-2">
-                        {s.regSHO && <span className="text-xs font-mono text-red-400 font-semibold">RegSHO</span>}
-                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -198,143 +338,133 @@ export default function BriefingTab() {
             </div>
           </div>
 
-          {/* Swap Maturity Summary + Reg SHO side by side */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            {/* Swap Maturity */}
-            <div className="panel">
-              <div className="panel-header">
-                <span className="panel-title flex items-center gap-2">
-                  <ArrowRightLeft className="w-3.5 h-3.5 text-accent-purple" />
-                  DTCC Swap Maturities
-                </span>
-              </div>
-              <div className="px-4 py-3 space-y-3">
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <div className="text-xs text-text-muted font-mono mb-1">Today</div>
-                    <div className="text-xl font-bold text-text-primary font-mono">
-                      {data.swapSummary.totalMaturitiesToday.toLocaleString()}
-                    </div>
-                    <div className="text-xs text-text-muted font-mono">
-                      {formatNotional(data.swapSummary.totalNotionalToday)} notional
-                    </div>
+          {/* DTCC + FINRA data (only show if available) */}
+          {(data.swapSummary.available || data.finraAvailable) && (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              {/* Swap Maturity */}
+              {data.swapSummary.available && (
+                <div className="panel">
+                  <div className="panel-header">
+                    <span className="panel-title flex items-center gap-2">
+                      <ArrowRightLeft className="w-3.5 h-3.5 text-accent-purple" />
+                      DTCC Swap Maturities
+                    </span>
                   </div>
-                  <div>
-                    <div className="text-xs text-text-muted font-mono mb-1">This Week</div>
-                    <div className="text-xl font-bold text-text-primary font-mono">
-                      {data.swapSummary.totalMaturitiesWeek.toLocaleString()}
-                    </div>
-                    <div className="text-xs text-text-muted font-mono">
-                      {formatNotional(data.swapSummary.totalNotionalWeek)} notional
-                    </div>
-                  </div>
-                </div>
-
-                {data.swapSummary.topMaturities.length > 0 && (
-                  <div>
-                    <div className="text-xs text-text-muted font-mono mb-2 uppercase tracking-wider">Top Maturities Today</div>
-                    <div className="space-y-1">
-                      {data.swapSummary.topMaturities.slice(0, 10).map(m => (
-                        <div
-                          key={m.symbol}
-                          className="flex items-center justify-between text-xs font-mono py-1 px-2 rounded hover:bg-bg-hover/50 cursor-pointer"
-                          onClick={() => navigateToStock(m.symbol)}
-                        >
-                          <span className="text-text-primary font-semibold">{m.symbol}</span>
-                          <div className="flex items-center gap-3">
-                            <span className="text-text-muted">{m.count} swaps</span>
-                            <span className="text-accent-purple">{formatNotional(m.notional)}</span>
-                          </div>
+                  <div className="px-4 py-3 space-y-3">
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <div className="text-xs text-text-muted font-mono mb-1">Today</div>
+                        <div className="text-xl font-bold text-text-primary font-mono">
+                          {data.swapSummary.totalMaturitiesToday.toLocaleString()}
                         </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {data.swapSummary.totalMaturitiesToday === 0 && (
-                  <p className="text-xs text-text-muted/60 font-mono text-center py-4">
-                    No swap maturity data available — DTCC data may not have updated yet today.
-                  </p>
-                )}
-              </div>
-            </div>
-
-            {/* Reg SHO + Short Interest */}
-            <div className="panel">
-              <div className="panel-header">
-                <span className="panel-title flex items-center gap-2">
-                  <ShieldAlert className="w-3.5 h-3.5 text-red-400" />
-                  Reg SHO Threshold &amp; Short Interest
-                </span>
-              </div>
-              <div className="px-4 py-3 space-y-3">
-                {/* Reg SHO */}
-                <div>
-                  <div className="text-xs text-text-muted font-mono mb-1">
-                    Reg SHO Threshold List ({data.regSHOList.length} securities)
-                  </div>
-                  {data.regSHOList.length > 0 ? (
-                    <div className="flex flex-wrap gap-1.5 mt-1">
-                      {data.regSHOList.slice(0, 30).map(sym => (
-                        <span
-                          key={sym}
-                          className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-red-500/10 text-red-400 border border-red-500/20 cursor-pointer hover:bg-red-500/20 transition-colors"
-                          onClick={() => navigateToStock(sym)}
-                        >
-                          {sym}
-                        </span>
-                      ))}
-                      {data.regSHOList.length > 30 && (
-                        <span className="text-[10px] font-mono px-2 py-0.5 text-text-muted">
-                          +{data.regSHOList.length - 30} more
-                        </span>
-                      )}
-                    </div>
-                  ) : (
-                    <p className="text-xs text-text-muted/60 font-mono">
-                      No securities on threshold list — or FINRA data not yet available.
-                    </p>
-                  )}
-                </div>
-
-                {/* High Short Interest */}
-                <div className="pt-2 border-t border-border/20">
-                  <div className="text-xs text-text-muted font-mono mb-2 uppercase tracking-wider">
-                    High Short Interest ({'>'}3 days to cover)
-                  </div>
-                  {data.shortInterestHighlights.length > 0 ? (
-                    <div className="space-y-1">
-                      {data.shortInterestHighlights.slice(0, 10).map(s => (
-                        <div
-                          key={s.symbol}
-                          className="flex items-center justify-between text-xs font-mono py-1 px-2 rounded hover:bg-bg-hover/50 cursor-pointer"
-                          onClick={() => navigateToStock(s.symbol)}
-                        >
-                          <span className="text-text-primary font-semibold">{s.symbol}</span>
-                          <div className="flex items-center gap-3">
-                            <span className={s.daysToCover > 5 ? 'text-orange-400' : 'text-yellow-400'}>
-                              {s.daysToCover.toFixed(1)}d DTC
-                            </span>
-                            <span className="text-text-muted">
-                              {(s.shortInterest / 1e6).toFixed(1)}M shares
-                            </span>
-                          </div>
+                        <div className="text-xs text-text-muted font-mono">
+                          {formatNotional(data.swapSummary.totalNotionalToday)} notional
                         </div>
-                      ))}
+                      </div>
+                      <div>
+                        <div className="text-xs text-text-muted font-mono mb-1">This Week</div>
+                        <div className="text-xl font-bold text-text-primary font-mono">
+                          {data.swapSummary.totalMaturitiesWeek.toLocaleString()}
+                        </div>
+                        <div className="text-xs text-text-muted font-mono">
+                          {formatNotional(data.swapSummary.totalNotionalWeek)} notional
+                        </div>
+                      </div>
                     </div>
-                  ) : (
-                    <p className="text-xs text-text-muted/60 font-mono">
-                      No high-SI securities found — or FINRA data not yet available.
-                    </p>
-                  )}
+                    {data.swapSummary.topMaturities.length > 0 && (
+                      <div>
+                        <div className="text-xs text-text-muted font-mono mb-2 uppercase tracking-wider">Top Maturities</div>
+                        <div className="space-y-1">
+                          {data.swapSummary.topMaturities.slice(0, 8).map(m => (
+                            <div
+                              key={m.symbol}
+                              className="flex items-center justify-between text-xs font-mono py-1 px-2 rounded hover:bg-bg-hover/50 cursor-pointer"
+                              onClick={() => navigateToStock(m.symbol)}
+                            >
+                              <span className="text-text-primary font-semibold">{m.symbol}</span>
+                              <div className="flex items-center gap-3">
+                                <span className="text-text-muted">{m.count} swaps</span>
+                                <span className="text-accent-purple">{formatNotional(m.notional)}</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
-            </div>
-          </div>
+              )}
 
-          {/* Data sourcing note */}
+              {/* Reg SHO + Short Interest */}
+              {data.finraAvailable && (
+                <div className="panel">
+                  <div className="panel-header">
+                    <span className="panel-title flex items-center gap-2">
+                      <ShieldAlert className="w-3.5 h-3.5 text-red-400" />
+                      Reg SHO &amp; Short Interest
+                    </span>
+                  </div>
+                  <div className="px-4 py-3 space-y-3">
+                    {data.regSHOList.length > 0 && (
+                      <div>
+                        <div className="text-xs text-text-muted font-mono mb-1">
+                          Reg SHO Threshold ({data.regSHOList.length})
+                        </div>
+                        <div className="flex flex-wrap gap-1.5 mt-1">
+                          {data.regSHOList.slice(0, 30).map(sym => (
+                            <span
+                              key={sym}
+                              className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-red-500/10 text-red-400 border border-red-500/20 cursor-pointer hover:bg-red-500/20 transition-colors"
+                              onClick={() => navigateToStock(sym)}
+                            >
+                              {sym}
+                            </span>
+                          ))}
+                          {data.regSHOList.length > 30 && (
+                            <span className="text-[10px] font-mono px-2 py-0.5 text-text-muted">
+                              +{data.regSHOList.length - 30} more
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    {data.shortInterestHighlights.length > 0 && (
+                      <div className={data.regSHOList.length > 0 ? 'pt-2 border-t border-border/20' : ''}>
+                        <div className="text-xs text-text-muted font-mono mb-2 uppercase tracking-wider">
+                          High Short Interest ({'>'}3d DTC)
+                        </div>
+                        <div className="space-y-1">
+                          {data.shortInterestHighlights.slice(0, 8).map(s => (
+                            <div
+                              key={s.symbol}
+                              className="flex items-center justify-between text-xs font-mono py-1 px-2 rounded hover:bg-bg-hover/50 cursor-pointer"
+                              onClick={() => navigateToStock(s.symbol)}
+                            >
+                              <span className="text-text-primary font-semibold">{s.symbol}</span>
+                              <div className="flex items-center gap-3">
+                                <span className={s.daysToCover > 5 ? 'text-orange-400' : 'text-yellow-400'}>
+                                  {s.daysToCover.toFixed(1)}d DTC
+                                </span>
+                                <span className="text-text-muted">
+                                  {(s.shortInterest / 1e6).toFixed(1)}M sh
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Source note */}
           <div className="text-center text-[10px] text-text-muted/40 font-mono py-2">
-            Sources: DTCC Public Price Dissemination (pddata.dtcc.com) &bull; FINRA Short Interest &amp; Reg SHO Threshold (api.finra.org) &bull; Tradier (quotes)
+            Analysis: Tradier (options) &bull; Polygon (equity bars) &bull; GEX/IV/Flow computed locally
+            {data.swapSummary.available && ' \u2022 DTCC (swap maturities)'}
+            {data.finraAvailable && ' \u2022 FINRA (short interest, Reg SHO)'}
           </div>
         </>
       )}
