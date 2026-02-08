@@ -19,6 +19,8 @@ import {
   type RecommendationInput,
 } from '@/lib/math/recommendations';
 import type { EquityBar } from '@/lib/providers/equityBars';
+import { getSwapDataForTicker } from '@/lib/providers/dtcc';
+import { fetchRegSHOThreshold, getShortInterestForTicker } from '@/lib/providers/finra';
 
 export const maxDuration = 30;
 
@@ -202,6 +204,13 @@ export async function GET(request: NextRequest) {
     // Lightweight correlation context from existing bars
     const correlationCtx = computeQuickCorrelationCtx(historyBars, hvCurrent);
 
+    // Fetch DTCC + FINRA data in parallel (non-blocking — graceful if unavailable)
+    const [swapData, regSHOSet, siData] = await Promise.all([
+      getSwapDataForTicker(ticker).catch(() => null),
+      fetchRegSHOThreshold().catch(() => new Set<string>()),
+      getShortInterestForTicker(ticker).catch(() => null),
+    ]);
+
     const input: RecommendationInput = {
       symbol: ticker,
       spotPrice,
@@ -234,6 +243,15 @@ export async function GET(request: NextRequest) {
       weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
       monthlyExp: nearExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
       correlationCtx,
+      // DTCC swap data
+      swapMaturitiesToday: swapData?.maturitiesToday,
+      swapNotionalToday: swapData?.notionalToday,
+      swapMaturitiesWeek: swapData?.maturitiesWeek,
+      swapNotionalWeek: swapData?.notionalWeek,
+      // FINRA data
+      shortInterest: siData?.shortInterest,
+      daysToCover: siData?.daysToCover,
+      regSHOThreshold: regSHOSet.has(ticker),
     };
 
     const recommendations = generateRecommendations(input);

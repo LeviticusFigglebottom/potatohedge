@@ -99,6 +99,15 @@ export interface RecommendationInput {
     drawdownRatio: number;             // vs SPY during drawdowns
     alpha30d: number;                  // 30d alpha vs SPY
   };
+  // Optional: DTCC swap maturity data
+  swapMaturitiesToday?: number;
+  swapNotionalToday?: number;
+  swapMaturitiesWeek?: number;
+  swapNotionalWeek?: number;
+  // Optional: FINRA short interest + Reg SHO
+  shortInterest?: number;         // total shares short
+  daysToCover?: number;           // SI / avg daily volume
+  regSHOThreshold?: boolean;      // on Reg SHO threshold list (persistent FTDs)
 }
 
 // ─── Signal Scoring ────────────────────────────────────────
@@ -445,6 +454,59 @@ function scoreSignals(input: RecommendationInput): Signal[] {
       weight: 0,
       description: `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ — within normal range for this stock (${atrPercent.toFixed(1)}% ATR, ${avgDailyRangePctStr(input.avgDailyRangePct)} avg daily range)`,
     });
+  }
+
+  // 12. DTCC Swap Maturity Pressure
+  if (input.swapMaturitiesToday && input.swapMaturitiesToday > 0) {
+    const notionalM = (input.swapNotionalToday || 0) / 1e6;
+    const isHeavy = input.swapMaturitiesToday > 100 || notionalM > 50;
+    const weight = isHeavy ? -0.10 : -0.05; // headwind — dealer rebalancing creates friction
+    signals.push({
+      name: 'Swap Maturity',
+      direction: isHeavy ? 'bearish' : 'neutral',
+      weight: isHeavy ? weight : 0,
+      description: `${input.swapMaturitiesToday} swap${input.swapMaturitiesToday > 1 ? 's' : ''} ($${notionalM.toFixed(0)}M notional) maturing today — ${isHeavy ? 'heavy dealer rebalancing pressure' : 'minor dealer flow'}`,
+    });
+  }
+  if (input.swapMaturitiesWeek && input.swapMaturitiesWeek > (input.swapMaturitiesToday || 0)) {
+    const weekNotionalM = (input.swapNotionalWeek || 0) / 1e6;
+    if (input.swapMaturitiesWeek > 200 || weekNotionalM > 100) {
+      signals.push({
+        name: 'Swap Maturity (Week)',
+        direction: 'bearish',
+        weight: -0.05,
+        description: `${input.swapMaturitiesWeek} swaps ($${weekNotionalM.toFixed(0)}M) maturing this week — persistent rebalancing headwind`,
+      });
+    }
+  }
+
+  // 13. Reg SHO Threshold (persistent FTDs)
+  if (input.regSHOThreshold) {
+    signals.push({
+      name: 'Reg SHO Threshold',
+      direction: 'neutral',
+      weight: 0,
+      description: 'On Reg SHO threshold list — persistent failures-to-deliver, potential forced buy-in / squeeze catalyst',
+    });
+  }
+
+  // 14. Short Interest / Days to Cover
+  if (input.daysToCover !== undefined && input.daysToCover > 0) {
+    if (input.daysToCover > 5) {
+      signals.push({
+        name: 'High Short Interest',
+        direction: 'neutral', // could squeeze either way
+        weight: 0,
+        description: `${input.daysToCover.toFixed(1)} days to cover — crowded short, squeeze risk on positive catalysts`,
+      });
+    } else if (input.daysToCover > 2) {
+      signals.push({
+        name: 'Elevated Short Interest',
+        direction: 'neutral',
+        weight: 0,
+        description: `${input.daysToCover.toFixed(1)} days to cover — moderate short positioning`,
+      });
+    }
   }
 
   return signals;

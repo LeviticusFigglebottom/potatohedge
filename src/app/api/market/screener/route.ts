@@ -17,6 +17,8 @@ import {
 import { generateRecommendations, type RecommendationInput } from '@/lib/math/recommendations';
 import { getUniverseSymbols } from '@/lib/stockUniverse';
 import type { EquityBar } from '@/lib/providers/equityBars';
+import { fetchSwapData, type SwapData } from '@/lib/providers/dtcc';
+import { fetchRegSHOThreshold, fetchShortInterest, type ShortInterestData } from '@/lib/providers/finra';
 
 export const maxDuration = 300;
 
@@ -38,6 +40,11 @@ export interface ScreenerResult {
   putWall: number | null;
   warnings: string[];
   timestamp: number;
+  // DTCC + FINRA data
+  swapMaturitiesToday: number;
+  swapNotionalToday: number;
+  daysToCover: number;
+  regSHO: boolean;
 }
 
 const CONCURRENCY = 4; // match recommendations route throughput
@@ -121,7 +128,12 @@ function computeQuickCorrelationCtx(
   };
 }
 
-async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
+async function analyzeStock(
+  ticker: string,
+  swapMap: Map<string, SwapData>,
+  regSHOSet: Set<string>,
+  siMap: Map<string, ShortInterestData>,
+): Promise<ScreenerResult | null> {
   try {
     // Fetch core data: quote + expirations + equity bars in parallel
     const [quote, expirations, historyBars] = await Promise.all([
@@ -255,6 +267,15 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
       weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
       monthlyExp: nearExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
       correlationCtx,
+      // DTCC swap data
+      swapMaturitiesToday: swapMap.get(ticker)?.maturitiesToday,
+      swapNotionalToday: swapMap.get(ticker)?.notionalToday,
+      swapMaturitiesWeek: swapMap.get(ticker)?.maturitiesWeek,
+      swapNotionalWeek: swapMap.get(ticker)?.notionalWeek,
+      // FINRA data
+      shortInterest: siMap.get(ticker)?.shortInterest,
+      daysToCover: siMap.get(ticker)?.daysToCover,
+      regSHOThreshold: regSHOSet.has(ticker),
     };
 
     const rec = generateRecommendations(input);
@@ -282,6 +303,11 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
       putWall,
       warnings: rec.warnings,
       timestamp: Date.now(),
+      // DTCC + FINRA data
+      swapMaturitiesToday: swapMap.get(ticker)?.maturitiesToday || 0,
+      swapNotionalToday: swapMap.get(ticker)?.notionalToday || 0,
+      daysToCover: siMap.get(ticker)?.daysToCover || 0,
+      regSHO: regSHOSet.has(ticker),
     };
   } catch (err) {
     console.error(`[screener] Failed to analyze ${ticker}:`, err instanceof Error ? err.message : err);
@@ -306,6 +332,20 @@ export async function GET(request: NextRequest) {
 
       send({ type: 'start', total: symbols.length });
 
+      // Pre-fetch DTCC + FINRA data once (shared across all stocks)
+      const [swapMap, regSHOSet, siMap] = await Promise.all([
+        fetchSwapData().catch(() => new Map<string, SwapData>()),
+        fetchRegSHOThreshold().catch(() => new Set<string>()),
+        fetchShortInterest().catch(() => new Map<string, ShortInterestData>()),
+      ]);
+
+      send({
+        type: 'meta',
+        swapData: swapMap.size > 0,
+        regSHOCount: regSHOSet.size,
+        shortInterestCount: siMap.size,
+      });
+
       const results: ScreenerResult[] = [];
       let completed = 0;
 
@@ -315,7 +355,7 @@ export async function GET(request: NextRequest) {
 
         const batchResults = await Promise.all(
           batch.map(async (sym) => {
-            const result = await analyzeStock(sym);
+            const result = await analyzeStock(sym, swapMap, regSHOSet, siMap);
             completed++;
             send({
               type: 'progress',
