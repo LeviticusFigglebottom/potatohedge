@@ -6,6 +6,7 @@ import {
   findGammaFlip,
   findCallWall,
   findPutWall,
+  computeMaxPain,
 } from '@/lib/math/blackScholes';
 import {
   computeHistoricalVolatility,
@@ -39,7 +40,7 @@ export interface ScreenerResult {
   timestamp: number;
 }
 
-const CONCURRENCY = 8; // parallel stock processing limit
+const CONCURRENCY = 4; // match recommendations route throughput
 
 async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -126,14 +127,14 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
     const [quote, expirations, historyBars] = await Promise.all([
       getQuote(ticker),
       getExpirations(ticker).catch(() => []),
-      fetchEquityBars(ticker, 100), // lighter — 100 days is enough for HV20 + ATR14
+      fetchEquityBars(ticker, 400), // match recommendations: full 252-day IV rank window
     ]);
 
     const spotPrice = quote.last;
     if (!spotPrice || spotPrice <= 0) return null;
 
-    // Only fetch the nearest 2 expirations for speed
-    const nearExps = expirations.slice(0, 2);
+    // Match recommendations route: 4 nearest expirations
+    const nearExps = expirations.slice(0, 4);
     if (nearExps.length === 0) return null;
 
     const chains = await Promise.all(
@@ -213,24 +214,11 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
       hvCurrent
     );
 
-    // Max pain from nearest chain
-    const maxPainCalc = (() => {
-      const callStrikes = nearChain.calls.map(c => ({ strike: c.strike, openInterest: c.openInterest }));
-      const putStrikes = nearChain.puts.map(p => ({ strike: p.strike, openInterest: p.openInterest }));
-      if (callStrikes.length === 0 && putStrikes.length === 0) return spotPrice;
-      const strikes = [...new Set([...callStrikes.map(s => s.strike), ...putStrikes.map(s => s.strike)])].sort((a, b) => a - b);
-      let minPain = Infinity;
-      let mpStrike = spotPrice;
-      for (const s of strikes) {
-        const callPain = callStrikes.reduce((sum, c) => sum + c.openInterest * Math.max(0, s - c.strike) * 100, 0);
-        const putPain = putStrikes.reduce((sum, p) => sum + p.openInterest * Math.max(0, p.strike - s) * 100, 0);
-        if (callPain + putPain < minPain) {
-          minPain = callPain + putPain;
-          mpStrike = s;
-        }
-      }
-      return mpStrike;
-    })();
+    // Max pain from nearest chain (same helper as recommendations route)
+    const maxPainResult = computeMaxPain(
+      nearChain.calls.map(c => ({ strike: c.strike, openInterest: c.openInterest })),
+      nearChain.puts.map(p => ({ strike: p.strike, openInterest: p.openInterest }))
+    );
 
     // Lightweight correlation context from existing bars
     const correlationCtx = computeQuickCorrelationCtx(historyBars, hvCurrent);
@@ -243,7 +231,7 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
       gammaFlip,
       callWall,
       putWall,
-      maxPain: maxPainCalc,
+      maxPain: maxPainResult.strike,
       volumePCR,
       oiPCR,
       totalCallVol,
