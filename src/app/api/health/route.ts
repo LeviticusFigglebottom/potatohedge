@@ -62,15 +62,7 @@ export async function GET() {
     checks.recommendations = { ok: false, error: err instanceof Error ? `${err.message}\n${err.stack?.split('\n').slice(0, 3).join('\n')}` : String(err) };
   }
 
-  // Test zlib availability
-  try {
-    const zlib = await import('zlib');
-    checks.zlib = { ok: typeof zlib.inflateRawSync === 'function' };
-  } catch {
-    checks.zlib = { ok: false, error: 'zlib not available (expected in edge runtime)' };
-  }
-
-  // Check DecompressionStream availability
+  // Check DecompressionStream availability (used by dtcc.ts for ZIP extraction)
   checks.decompressionStream = {
     ok: typeof DecompressionStream !== 'undefined',
     error: typeof DecompressionStream === 'undefined' ? 'DecompressionStream not available' : undefined,

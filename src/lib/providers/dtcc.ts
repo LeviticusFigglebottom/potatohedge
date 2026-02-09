@@ -30,43 +30,33 @@ let swapCache: { result: SwapResult; timestamp: number } | null = null;
 const CACHE_TTL = 3600_000; // 1 hour
 
 /**
- * Inflate raw deflate data. Tries Node zlib first, falls back to Web API DecompressionStream.
+ * Inflate raw deflate data using the Web API DecompressionStream.
+ * Available in Node 18+ and all modern runtimes (Edge, Workers, browsers).
+ * We avoid importing Node's zlib entirely because the bundler traces
+ * even dynamic import('zlib') and fails on Vercel.
  */
 async function inflateRaw(data: Uint8Array): Promise<Uint8Array> {
-  // Try Node.js zlib (available in standard serverless, not edge)
-  try {
-    const zlib = await import('zlib');
-    return zlib.inflateRawSync(data);
-  } catch {
-    // zlib not available — use Web Streams DecompressionStream
+  const ds = new DecompressionStream('deflate-raw');
+  const writer = ds.writable.getWriter();
+  const reader = ds.readable.getReader();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  writer.write(data as any);
+  writer.close();
+
+  const chunks: Uint8Array[] = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
   }
-
-  // Web API fallback (works in Edge Runtime, Cloudflare Workers, modern Node)
-  if (typeof DecompressionStream !== 'undefined') {
-    const ds = new DecompressionStream('deflate-raw');
-    const writer = ds.writable.getWriter();
-    const reader = ds.readable.getReader();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    writer.write(data as any);
-    writer.close();
-
-    const chunks: Uint8Array[] = [];
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-    }
-    const totalLen = chunks.reduce((s, c) => s + c.length, 0);
-    const result = new Uint8Array(totalLen);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return result;
+  const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+  const result = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
   }
-
-  throw new Error('No decompression available (neither zlib nor DecompressionStream)');
+  return result;
 }
 
 /**
