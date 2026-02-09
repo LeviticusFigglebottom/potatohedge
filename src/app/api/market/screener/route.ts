@@ -47,7 +47,7 @@ export interface ScreenerResult {
   regSHO: boolean;
 }
 
-const CONCURRENCY = 4; // match recommendations route throughput
+const CONCURRENCY = 6; // higher concurrency to scan more stocks within timeout
 
 async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -362,11 +362,9 @@ export async function GET(request: NextRequest) {
               completed,
               total: symbols.length,
               current: sym,
-              result: result ? {
-                symbol: result.symbol,
-                biasScore: result.biasScore,
-                overallBias: result.overallBias,
-              } : null,
+              // Include full result so client can accumulate incrementally
+              // (critical for Hobby plan where function may timeout before 'done')
+              result: result || null,
             });
             return result;
           })

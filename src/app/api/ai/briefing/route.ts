@@ -460,7 +460,33 @@ export async function POST() {
   }
 
   try {
-    // Phase 1: Scan all stocks in parallel batches
+    // Helper: race a promise against a hard deadline
+    const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
+      Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
+
+    const emptySwap = {
+      totalMaturitiesToday: 0, totalNotionalToday: 0,
+      totalMaturitiesWeek: 0, totalNotionalWeek: 0,
+      topMaturities: [] as { symbol: string; count: number; notional: number }[],
+      asOf: '',
+    };
+    const emptyFlow: FlowResult = {
+      flow: { netCallPremium: 0, netPutPremium: 0, netPremium: 0, totalCallVolume: 0, totalPutVolume: 0, putCallRatio: 0, sentiment: 'neutral', tickersScanned: 0, contractsAnalyzed: 0 },
+      alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
+    };
+
+    // Start institutional data fetches IMMEDIATELY — they run in parallel
+    // with stock scanning (saves 5-10s vs running them sequentially after)
+    const institutionalPromise = Promise.all([
+      getQuote('VIX').catch(() => null),
+      raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 4000, emptySwap),
+      raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
+      raceTimeout(fetchShortInterest().catch(() => new Map<string, ShortInterestData>()), 5000, new Map<string, ShortInterestData>()),
+      raceTimeout(fetchShortSaleVolume().catch(() => new Map<string, ShortVolumeData>()), 5000, new Map<string, ShortVolumeData>()),
+      raceTimeout(scanMarketFlow().catch(() => emptyFlow), 8000, emptyFlow),
+    ]);
+
+    // Phase 1: Scan all stocks in parallel batches (runs concurrently with institutional data)
     const results: StockScan[] = [];
     for (let i = 0; i < ALL_TICKERS.length; i += CONCURRENCY) {
       const batch = ALL_TICKERS.slice(i, i + CONCURRENCY);
@@ -470,29 +496,8 @@ export async function POST() {
       }
     }
 
-    // Phase 1b: VIX + DTCC/FINRA — independent per-provider timeouts
-    const emptySwap = {
-      totalMaturitiesToday: 0, totalNotionalToday: 0,
-      totalMaturitiesWeek: 0, totalNotionalWeek: 0,
-      topMaturities: [] as { symbol: string; count: number; notional: number }[],
-      asOf: '',
-    };
-    const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
-      Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
-
-    const emptyFlow: FlowResult = {
-      flow: { netCallPremium: 0, netPutPremium: 0, netPremium: 0, totalCallVolume: 0, totalPutVolume: 0, putCallRatio: 0, sentiment: 'neutral', tickersScanned: 0, contractsAnalyzed: 0 },
-      alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
-    };
-
-    const [vixQuote, swapSummary, regSHOSet, shortInterestMap, shortVolumeMap, flowResult] = await Promise.all([
-      getQuote('VIX').catch(() => null),
-      raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 4000, emptySwap),
-      raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
-      raceTimeout(fetchShortInterest().catch(() => new Map<string, ShortInterestData>()), 5000, new Map<string, ShortInterestData>()),
-      raceTimeout(fetchShortSaleVolume().catch(() => new Map<string, ShortVolumeData>()), 5000, new Map<string, ShortVolumeData>()),
-      raceTimeout(scanMarketFlow().catch(() => emptyFlow), 10000, emptyFlow),
-    ]);
+    // Wait for institutional data (likely already done since stock scanning takes longer)
+    const [vixQuote, swapSummary, regSHOSet, shortInterestMap, shortVolumeMap, flowResult] = await institutionalPromise;
     const vixPrice = vixQuote?.last ?? 0;
     const vixChangePct = vixQuote?.changePct ?? 0;
     const regSHOList = Array.from(regSHOSet).filter(s => /^[A-Z]+$/.test(s)).sort();

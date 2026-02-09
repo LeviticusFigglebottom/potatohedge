@@ -110,6 +110,31 @@ export interface RecommendationInput {
   regSHOThreshold?: boolean;      // on Reg SHO threshold list (persistent FTDs)
 }
 
+// ─── Helpers ──────────────────────────────────────────────
+
+/** Clamp value to [min, max] */
+function clamp(v: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, v));
+}
+
+/**
+ * Piecewise linear interpolation.
+ * Given sorted breakpoints xs and corresponding weights ys,
+ * returns the interpolated weight for value x.
+ * Clamps to first/last ys if x is outside the range.
+ */
+function plerp(x: number, xs: number[], ys: number[]): number {
+  if (x <= xs[0]) return ys[0];
+  if (x >= xs[xs.length - 1]) return ys[ys.length - 1];
+  for (let i = 1; i < xs.length; i++) {
+    if (x <= xs[i]) {
+      const t = (x - xs[i - 1]) / (xs[i] - xs[i - 1]);
+      return ys[i - 1] + t * (ys[i] - ys[i - 1]);
+    }
+  }
+  return ys[ys.length - 1];
+}
+
 // ─── Signal Scoring ────────────────────────────────────────
 
 function scoreSignals(input: RecommendationInput): Signal[] {
@@ -249,51 +274,46 @@ function scoreSignals(input: RecommendationInput): Signal[] {
   const pcrConfidence = !pcrReliable ? 0 : totalOptVol < 2000 ? (totalOptVol - 500) / 1500 : 1;
   const effectivePCR = Math.max(0.05, Math.min(20, input.volumePCR));
 
-  if (effectivePCR > 1.3) {
+  // Continuous PCR weight: smoothly interpolates across the full range
+  // PCR 0.3→+0.25, 0.6→+0.10, 0.8→+0.03, 0.95→0, 1.05→0, 1.2→-0.08, 1.5→-0.20, 2.5→-0.30
+  const pcrWeight = plerp(effectivePCR,
+    [0.3, 0.6, 0.8, 0.95, 1.05, 1.2, 1.5, 2.5],
+    [0.25, 0.10, 0.03, 0.0, 0.0, -0.08, -0.20, -0.30]
+  ) * pcrConfidence;
+  if (Math.abs(pcrWeight) > 0.01) {
+    const reliabilityNote = !pcrReliable
+      ? ` (UNRELIABLE: ${minSideVol < 50 ? `only ${minSideVol} contracts on ${input.totalCallVol < input.totalPutVol ? 'call' : 'put'} side` : `low volume: ${totalOptVol}`})`
+      : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : '';
+    const pcrLabel = input.volumePCR > 20 ? '>20' : input.volumePCR < 0.05 ? '<0.05' : input.volumePCR.toFixed(2);
     signals.push({
       name: 'Volume P/C Ratio',
-      direction: 'bearish',
-      weight: (effectivePCR > 2 ? -0.35 : -0.25) * pcrConfidence,
-      description: `PCR ${input.volumePCR > 20 ? '>20' : input.volumePCR.toFixed(2)}${effectivePCR > 2 ? ' — extreme' : ''}${!pcrReliable ? ` (UNRELIABLE: ${minSideVol < 50 ? `only ${minSideVol} contracts on ${input.totalCallVol < input.totalPutVol ? 'call' : 'put'} side` : `low volume: ${totalOptVol}`})` : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — heavy put buying, bearish sentiment or hedging demand`,
-    });
-  } else if (effectivePCR > 1.0) {
-    signals.push({
-      name: 'Volume P/C Ratio',
-      direction: 'bearish',
-      weight: -0.1 * pcrConfidence,
-      description: `PCR ${input.volumePCR.toFixed(2)}${!pcrReliable ? ' (unreliable — thin volume)' : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — slightly put-heavy, mild bearish lean`,
-    });
-  } else if (effectivePCR < 0.6) {
-    signals.push({
-      name: 'Volume P/C Ratio',
-      direction: 'bullish',
-      weight: 0.25 * pcrConfidence,
-      description: `PCR ${input.volumePCR < 0.05 ? '<0.05' : input.volumePCR.toFixed(2)}${!pcrReliable ? ` (UNRELIABLE: ${minSideVol < 50 ? `only ${minSideVol} contracts on ${input.totalCallVol < input.totalPutVol ? 'call' : 'put'} side` : `low volume: ${totalOptVol}`})` : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — strong call dominance, bullish flow`,
-    });
-  } else if (effectivePCR < 0.8) {
-    signals.push({
-      name: 'Volume P/C Ratio',
-      direction: 'bullish',
-      weight: 0.1 * pcrConfidence,
-      description: `PCR ${input.volumePCR.toFixed(2)}${!pcrReliable ? ' (unreliable — thin volume)' : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — call-heavy, mild bullish lean`,
+      direction: pcrWeight > 0 ? 'bullish' : 'bearish',
+      weight: pcrWeight,
+      description: `PCR ${pcrLabel}${reliabilityNote} — ${effectivePCR < 0.7 ? 'call-dominant, bullish flow' : effectivePCR > 1.5 ? 'heavy put buying, bearish/hedging' : effectivePCR > 1.0 ? 'slightly put-heavy' : 'slightly call-heavy'}`,
     });
   }
 
-  // 6. DEX Bias
-  if (input.totalDEX < 0) {
-    signals.push({
-      name: 'Dealer Delta',
-      direction: 'bullish',
-      weight: 0.1,
-      description: `Dealers short delta ($${abbr(input.totalDEX)}) — must buy underlying to hedge, supportive flow`,
-    });
-  } else if (input.totalDEX > 0) {
-    signals.push({
-      name: 'Dealer Delta',
-      direction: 'bearish',
-      weight: -0.05,
-      description: `Dealers long delta ($${abbr(input.totalDEX)}) — may sell into rallies`,
-    });
+  // 6. DEX Bias — scale weight by magnitude relative to GEX
+  // If DEX is small relative to GEX, it matters less
+  {
+    const dexMag = Math.abs(input.totalDEX);
+    const gexMag = Math.abs(input.totalGEX) || 1;
+    const dexScale = clamp(dexMag / gexMag, 0.2, 2) / 2; // 0.1 to 1.0 multiplier
+    if (input.totalDEX < 0) {
+      signals.push({
+        name: 'Dealer Delta',
+        direction: 'bullish',
+        weight: 0.10 * dexScale,
+        description: `Dealers short delta ($${abbr(input.totalDEX)}) — must buy underlying to hedge, supportive flow`,
+      });
+    } else if (input.totalDEX > 0) {
+      signals.push({
+        name: 'Dealer Delta',
+        direction: 'bearish',
+        weight: -0.05 * dexScale,
+        description: `Dealers long delta ($${abbr(input.totalDEX)}) — may sell into rallies`,
+      });
+    }
   }
 
   // 7. IV Regime
@@ -425,27 +445,26 @@ function scoreSignals(input: RecommendationInput): Signal[] {
     }
   }
 
-  // 11. Momentum — ATR-RELATIVE, not hardcoded
-  // A "big move" is >2σ or >1.5 ATR, NOT a fixed percentage
+  // 11. Momentum — ATR-RELATIVE with continuous weight scaling
+  // Weight ramps smoothly from 0 at 0.8σ to ±0.20 at 3σ+
   const absChange = Math.abs(input.changePercent);
   const moveSigma = dailySigma > 0 ? absChange / dailySigma : 0;
   const moveATR = atrPercent > 0 ? absChange / atrPercent : 0;
 
-  if (moveSigma > 2) {
+  if (moveSigma > 0.8) {
+    // Continuous: 0.8σ→0, 1.2σ→0.04, 2σ→0.10, 3σ→0.16, 4σ→0.20
+    const momMag = clamp(plerp(moveSigma, [0.8, 1.2, 2.0, 3.0, 4.0], [0.0, 0.04, 0.10, 0.16, 0.20]), 0, 0.20);
     const dir = input.changePercent > 0 ? 'bullish' : 'bearish';
+    const sign = input.changePercent > 0 ? 1 : -1;
     signals.push({
       name: 'Momentum',
-      direction: dir,
-      weight: dir === 'bullish' ? Math.min(0.2, moveSigma * 0.05) : Math.max(-0.2, -moveSigma * 0.05),
-      description: `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ move (${moveATR.toFixed(1)}x ATR) — statistically significant for this stock`,
-    });
-  } else if (moveSigma > 1.2) {
-    const dir = input.changePercent > 0 ? 'bullish' : 'bearish';
-    signals.push({
-      name: 'Momentum',
-      direction: dir,
-      weight: dir === 'bullish' ? 0.08 : -0.08,
-      description: `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ (${moveATR.toFixed(1)}x ATR) — above average for this stock's ${atrPercent.toFixed(1)}% daily ATR`,
+      direction: momMag > 0.01 ? dir : 'neutral',
+      weight: momMag * sign,
+      description: moveSigma > 2
+        ? `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ move (${moveATR.toFixed(1)}x ATR) — statistically significant for this stock`
+        : moveSigma > 1.2
+        ? `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ (${moveATR.toFixed(1)}x ATR) — above average for this stock's ${atrPercent.toFixed(1)}% daily ATR`
+        : `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ — within normal range (${atrPercent.toFixed(1)}% ATR)`,
     });
   } else if (absChange > 0.1) {
     signals.push({
@@ -773,11 +792,15 @@ function generateTrades(
 export function generateRecommendations(input: RecommendationInput): RecommendationOutput {
   const signals = scoreSignals(input);
   const totalWeight = signals.reduce((s, sig) => s + sig.weight, 0);
-  const biasScore = totalWeight * 100;
+  // Cap total weight to ±0.60 so score stays in [-60, +60] — prevents
+  // runaway stacking of many small signals from creating extreme scores
+  const cappedWeight = clamp(totalWeight, -0.60, 0.60);
+  const biasScore = cappedWeight * 100;
 
   let overallBias: Direction = 'neutral';
-  if (biasScore > 15) overallBias = 'bullish';
-  else if (biasScore < -15) overallBias = 'bearish';
+  // Wider neutral band (±20) so the label doesn't flip on minor noise
+  if (biasScore > 20) overallBias = 'bullish';
+  else if (biasScore < -20) overallBias = 'bearish';
 
   let volRegime: VolRegime = 'mid';
   if (input.ivRank > 60) volRegime = 'high';

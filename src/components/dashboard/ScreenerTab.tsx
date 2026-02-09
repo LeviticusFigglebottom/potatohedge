@@ -45,6 +45,10 @@ export default function ScreenerTab() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      // Accumulate results from progress events so partial scans still
+      // show data even if the serverless function times out before 'done'
+      const accumulated: ScreenerResult[] = [];
+      let gotDone = false;
 
       while (true) {
         const { value, done } = await reader.read();
@@ -63,12 +67,30 @@ export default function ScreenerTab() {
               setProgress(p => ({ ...p, total: data.total }));
             } else if (data.type === 'progress') {
               setProgress({ completed: data.completed, total: data.total, current: data.current });
+              // Accumulate full results as they stream in
+              if (data.result && data.result.symbol) {
+                accumulated.push(data.result as ScreenerResult);
+                // Update displayed results every 10 stocks so user sees live progress
+                if (accumulated.length % 10 === 0) {
+                  const sorted = [...accumulated].sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
+                  setResults(sorted);
+                }
+              }
             } else if (data.type === 'done') {
+              // Final sorted results from server (if we get here)
+              gotDone = true;
               setResults(data.results);
               setLastScanTime(new Date().toLocaleString());
             }
           } catch { /* skip malformed events */ }
         }
+      }
+
+      // If stream ended without 'done' (serverless timeout), finalize accumulated results
+      if (!gotDone && accumulated.length > 0) {
+        const sorted = accumulated.sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
+        setResults(sorted);
+        setLastScanTime(`${new Date().toLocaleString()} (partial: ${accumulated.length} stocks)`);
       }
     } catch (err) {
       if ((err as Error).name !== 'AbortError') {

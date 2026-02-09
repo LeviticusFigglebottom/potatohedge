@@ -1,7 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getHistory } from '@/lib/providers/tradier';
+import { getHistory, getQuote } from '@/lib/providers/tradier';
 import { getEquityHistory } from '@/lib/providers/polygon';
 import type { Interval, OHLCV } from '@/types/market';
+
+/**
+ * Format a Date as YYYY-MM-DD in US Eastern timezone.
+ * Serverless runs in UTC; using ET ensures we request the correct market date.
+ */
+function toEasternDate(d: Date): string {
+  return d.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+}
 
 /**
  * Sanitize outlier wicks that distort chart auto-scale.
@@ -70,29 +78,37 @@ export async function GET(request: NextRequest) {
 
   const ticker = symbol.toUpperCase();
 
+  const headers = { 'Cache-Control': 'no-cache, no-store, must-revalidate' };
+
   try {
     const isIntraday = ['1min', '5min', '15min'].includes(interval);
 
     if (isIntraday) {
       // Polygon for intraday — much longer history than Tradier's 5-day limit
       const history = await getPolygonIntraday(ticker, interval);
-      return NextResponse.json(sanitizeBars(history));
+      return NextResponse.json(sanitizeBars(history), { headers });
     } else {
       // Use Polygon for daily/weekly too — 2+ year lookback vs Tradier's ~1 year
       try {
-        const history = await getPolygonDaily(ticker, interval);
-        if (history.length > 10) return NextResponse.json(sanitizeBars(history));
+        let history = await getPolygonDaily(ticker, interval);
+        // Polygon daily bars only include completed days — the current day's
+        // bar won't appear until after market close. Append a synthetic bar
+        // from the live quote so the chart shows today's price.
+        if (interval === '1D' && history.length > 0) {
+          history = await appendTodayBar(ticker, history);
+        }
+        if (history.length > 10) return NextResponse.json(sanitizeBars(history), { headers });
       } catch { /* fall through to Tradier */ }
 
       // Fallback to Tradier
       const history = await getHistory(ticker, interval);
-      return NextResponse.json(sanitizeBars(history));
+      return NextResponse.json(sanitizeBars(history), { headers });
     }
   } catch (error) {
     // Fallback: try the other provider
     try {
       const history = await getHistory(ticker, interval);
-      return NextResponse.json(sanitizeBars(history));
+      return NextResponse.json(sanitizeBars(history), { headers });
     } catch {
       const message = error instanceof Error ? error.message : 'Unknown error';
       return NextResponse.json({ error: message }, { status: 500 });
@@ -119,8 +135,8 @@ async function getPolygonIntraday(
     ticker,
     mult,
     span,
-    from.toISOString().split('T')[0],
-    to.toISOString().split('T')[0]
+    toEasternDate(from),
+    toEasternDate(to)
   );
 
   return bars.map(bar => ({
@@ -151,8 +167,8 @@ async function getPolygonDaily(
     ticker,
     mult,
     span,
-    from.toISOString().split('T')[0],
-    to.toISOString().split('T')[0]
+    toEasternDate(from),
+    toEasternDate(to)
   );
 
   return bars.map(bar => ({
@@ -163,4 +179,34 @@ async function getPolygonDaily(
     close: bar.c,
     volume: bar.v,
   }));
+}
+
+/**
+ * Append a synthetic bar for today from the live Tradier quote.
+ * This ensures the chart shows current-day price action even though
+ * Polygon's daily bar won't be finalized until after market close.
+ */
+async function appendTodayBar(ticker: string, bars: OHLCV[]): Promise<OHLCV[]> {
+  try {
+    const lastBar = bars[bars.length - 1];
+    const lastBarDate = new Date(lastBar.time * 1000).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const todayET = toEasternDate(new Date());
+
+    if (lastBarDate >= todayET) return bars; // Already have today's bar
+
+    const quote = await getQuote(ticker);
+    if (!quote.last || quote.last <= 0 || !quote.open || quote.open <= 0) return bars;
+
+    // Create today's bar from quote data
+    const todayMidnight = new Date(todayET + 'T00:00:00-05:00').getTime() / 1000;
+    bars.push({
+      time: todayMidnight,
+      open: quote.open,
+      high: quote.high || Math.max(quote.open, quote.last),
+      low: quote.low || Math.min(quote.open, quote.last),
+      close: quote.last,
+      volume: quote.volume || 0,
+    });
+  } catch { /* Ignore — just show bars without today */ }
+  return bars;
 }
