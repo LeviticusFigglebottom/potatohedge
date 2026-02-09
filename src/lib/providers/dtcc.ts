@@ -11,8 +11,6 @@
  * Source: https://kgc0418-tdw-data-0.s3.amazonaws.com/sec/eod/
  */
 
-import { inflateRawSync } from 'zlib';
-
 export interface SwapData {
   maturitiesToday: number;
   notionalToday: number;
@@ -32,27 +30,70 @@ let swapCache: { result: SwapResult; timestamp: number } | null = null;
 const CACHE_TTL = 3600_000; // 1 hour
 
 /**
- * Minimal ZIP extractor using Node's built-in zlib.
- * Handles the common case: single deflate-compressed file in a ZIP archive.
+ * Inflate raw deflate data. Tries Node zlib first, falls back to Web API DecompressionStream.
  */
-function extractFirstFileFromZip(buf: Buffer): string {
+async function inflateRaw(data: Uint8Array): Promise<Uint8Array> {
+  // Try Node.js zlib (available in standard serverless, not edge)
+  try {
+    const zlib = await import('zlib');
+    return zlib.inflateRawSync(data);
+  } catch {
+    // zlib not available — use Web Streams DecompressionStream
+  }
+
+  // Web API fallback (works in Edge Runtime, Cloudflare Workers, modern Node)
+  if (typeof DecompressionStream !== 'undefined') {
+    const ds = new DecompressionStream('deflate-raw');
+    const writer = ds.writable.getWriter();
+    const reader = ds.readable.getReader();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    writer.write(data as any);
+    writer.close();
+
+    const chunks: Uint8Array[] = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+    const result = new Uint8Array(totalLen);
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return result;
+  }
+
+  throw new Error('No decompression available (neither zlib nor DecompressionStream)');
+}
+
+/**
+ * Minimal ZIP extractor. Handles the common case: single deflate-compressed file in a ZIP archive.
+ */
+async function extractFirstFileFromZip(buf: Uint8Array): Promise<string> {
   // ZIP local file header signature: PK\x03\x04
-  if (buf.length < 30 || buf.readUInt32LE(0) !== 0x04034b50) {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  if (buf.length < 30 || view.getUint32(0, true) !== 0x04034b50) {
     throw new Error('Not a ZIP file');
   }
 
-  const compressionMethod = buf.readUInt16LE(8);
-  const compressedSize = buf.readUInt32LE(18);
-  const filenameLength = buf.readUInt16LE(26);
-  const extraLength = buf.readUInt16LE(28);
+  const compressionMethod = view.getUint16(8, true);
+  const compressedSize = view.getUint32(18, true);
+  const filenameLength = view.getUint16(26, true);
+  const extraLength = view.getUint16(28, true);
   const dataOffset = 30 + filenameLength + extraLength;
 
   const compressedData = buf.subarray(dataOffset, dataOffset + compressedSize);
 
   if (compressionMethod === 0) {
-    return compressedData.toString('utf-8');
+    // Stored (no compression)
+    return new TextDecoder().decode(compressedData);
   } else if (compressionMethod === 8) {
-    return inflateRawSync(compressedData).toString('utf-8');
+    // Deflate
+    const decompressed = await inflateRaw(compressedData);
+    return new TextDecoder().decode(decompressed);
   } else {
     throw new Error(`Unsupported ZIP compression: ${compressionMethod}`);
   }
@@ -199,14 +240,14 @@ export async function fetchSwapData(): Promise<SwapResult> {
         }
       }
 
-      const buffer = Buffer.from(await res.arrayBuffer());
+      const buffer = new Uint8Array(await res.arrayBuffer());
       if (buffer.length < 100) throw new Error('Too small');
 
       let csvText: string;
       if (buffer[0] === 0x50 && buffer[1] === 0x4b) {
-        csvText = extractFirstFileFromZip(buffer);
+        csvText = await extractFirstFileFromZip(buffer);
       } else {
-        csvText = buffer.toString('utf-8');
+        csvText = new TextDecoder().decode(buffer);
       }
 
       if (csvText.length < 50 || csvText.includes('<html')) throw new Error('Invalid content');
@@ -280,13 +321,13 @@ export async function fetchSwapData(): Promise<SwapResult> {
             }
           }
         } else {
-          const buffer = Buffer.from(await res.arrayBuffer());
+          const buffer = new Uint8Array(await res.arrayBuffer());
           if (buffer.length > 100) {
             let csvText: string;
             if (buffer[0] === 0x50 && buffer[1] === 0x4b) {
-              csvText = extractFirstFileFromZip(buffer);
+              csvText = await extractFirstFileFromZip(buffer);
             } else {
-              csvText = buffer.toString('utf-8');
+              csvText = new TextDecoder().decode(buffer);
             }
             const map = parseSwapCSV(csvText, today, weekEnd);
             if (map.size > 0) {
