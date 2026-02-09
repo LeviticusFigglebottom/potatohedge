@@ -18,6 +18,7 @@ import { generateRecommendations, type RecommendationInput } from '@/lib/math/re
 import type { EquityBar } from '@/lib/providers/equityBars';
 import { getMarketSwapSummary } from '@/lib/providers/dtcc';
 import { fetchRegSHOThreshold, fetchShortInterest, fetchShortSaleVolume, type ShortInterestData, type ShortVolumeData } from '@/lib/providers/finra';
+import { scanMarketFlow, type FlowResult } from '@/lib/providers/polygonFlow';
 
 export const maxDuration = 60;
 
@@ -280,6 +281,7 @@ function buildBriefingPrompt(
   regSHOList: string[],
   shortInterestData: { symbol: string; daysToCover: number; shortInterest: number }[],
   shortVolumeData: { symbol: string; shortRatio: number; shortVolume: number; totalVolume: number }[],
+  flowData: FlowResult,
 ): string {
   const indices = stocks.filter(s => INDICES.includes(s.symbol));
   const sectors = stocks.filter(s => SECTOR_ETFS.includes(s.symbol));
@@ -329,6 +331,36 @@ ${sectors.map(fmtStock).join('\n\n')}
 
 ─── MAGNIFICENT 7 ───
 ${mag7.map(fmtStock).join('\n\n')}`;
+
+  // Real-time options flow data
+  if (flowData.flow.tickersScanned > 0) {
+    const f = flowData.flow;
+    prompt += `\n\n─── REAL-TIME OPTIONS FLOW (${f.tickersScanned} tickers, ${f.contractsAnalyzed.toLocaleString()} contracts) ───`;
+    prompt += `\nNet Premium Flow: ${abbr(f.netPremium)} (${f.sentiment.toUpperCase()})`;
+    prompt += `\nCall Premium: ${abbr(f.netCallPremium)} | Put Premium: ${abbr(f.netPutPremium)}`;
+    prompt += `\nVolume P/C Ratio: ${f.putCallRatio.toFixed(2)} (${f.totalCallVolume.toLocaleString()}C / ${f.totalPutVolume.toLocaleString()}P)`;
+    prompt += `\n(Net premium = call premium - put premium. Positive = net call buying = institutions positioning bullish. P/C < 0.7 = aggressive call buying, > 1.2 = heavy hedging)`;
+
+    if (flowData.perTickerFlow.length > 0) {
+      prompt += `\n\nPer-Ticker Flow (sorted by magnitude):`;
+      for (const tf of flowData.perTickerFlow.slice(0, 10)) {
+        const dir = tf.netPremium > 0 ? '+' : '';
+        prompt += `\n  ${tf.ticker}: ${dir}${abbr(tf.netPremium)} (C: ${abbr(tf.callPremium)} / P: ${abbr(tf.putPremium)})`;
+      }
+    }
+
+    if (flowData.alerts.length > 0) {
+      prompt += `\n\nTop Flow Alerts (by premium):`;
+      for (const a of flowData.alerts.slice(0, 15)) {
+        const dir = a.sentiment === 'bullish' ? '▲' : a.sentiment === 'bearish' ? '▼' : '—';
+        prompt += `\n  ${dir} ${a.ticker} ${a.contractType.toUpperCase()} $${a.strike} ${a.expiry}: ${abbr(a.premium)} ${a.tradeType.toUpperCase()} (Vol/OI: ${a.volumeOIRatio}x, IV: ${(a.impliedVol * 100).toFixed(0)}%)`;
+      }
+    }
+
+    if (flowData.isDeveloper) {
+      prompt += `\n(Enhanced with trade-level sweep/block detection from Polygon Developer)`;
+    }
+  }
 
   // DTCC swap data
   if (swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0 || swapSummary.asOf) {
@@ -412,7 +444,7 @@ Then analyze:
 
 3. **MAGNIFICENT 7 BREAKDOWN** — For each Mag7 stock with notable positioning, state the directional lean and which Greek(s) drive it. Flag any that diverge from their index. Count how many are long vs short — does narrow leadership make QQQ vulnerable?
 
-${swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0 ? '4. **INSTITUTIONAL FLOW** — Interpret swap maturities. Extreme clusters create forced dealer rebalancing. Mention the notional and which specific names have the largest maturities.\n\n' : ''}${regSHOList.length > 0 || shortInterestData.length > 0 ? '5. **SHORT INTEREST / REG SHO** — Notable names with persistent FTDs or high days-to-cover. Cross-reference with positioning data.\n\n' : ''}6. **WATCHLIST** — Name 3-5 specific stocks (from any scanned) with the highest-conviction setups. For each: state the direction, the dominant Greek signal, key level to watch, and what would invalidate the thesis. Include hard-to-borrow or unusual volume context where available.
+${flowData.flow.tickersScanned > 0 ? '4. **OPTIONS FLOW ANALYSIS** — Analyze the real-time options premium flow. What does the net premium tell us? Which tickers have the most aggressive institutional positioning? Are sweeps/blocks confirming or diverging from dealer gamma positioning? Cross-reference flow direction with GEX regime for each ticker.\n\n' : ''}${swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0 ? '5. **SWAP MATURITIES** — Interpret swap maturities. Extreme clusters create forced dealer rebalancing. Cross-reference with flow alerts: are institutions positioning ahead of maturity unwinds?\n\n' : ''}${regSHOList.length > 0 || shortInterestData.length > 0 ? '6. **SHORT INTEREST / REG SHO** — Notable names with persistent FTDs or high days-to-cover. Cross-reference with options flow: are shorts being squeezed (bullish flow + high SI)?\n\n' : ''}7. **WATCHLIST** — Name 3-5 specific stocks (from any scanned) with the highest-conviction setups. For each: state the direction, the dominant Greek signal, key level to watch, and what would invalidate the thesis. Include flow context (sweeps, blocks, unusual volume) alongside dealer positioning.
 
 7. **KEY LEVELS** — For SPY specifically: gamma flip, call wall, put wall, max pain. What happens at each level.
 
@@ -448,12 +480,18 @@ export async function POST() {
     const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
       Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 
-    const [vixQuote, swapSummary, regSHOSet, shortInterestMap, shortVolumeMap] = await Promise.all([
+    const emptyFlow: FlowResult = {
+      flow: { netCallPremium: 0, netPutPremium: 0, netPremium: 0, totalCallVolume: 0, totalPutVolume: 0, putCallRatio: 0, sentiment: 'neutral', tickersScanned: 0, contractsAnalyzed: 0 },
+      alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
+    };
+
+    const [vixQuote, swapSummary, regSHOSet, shortInterestMap, shortVolumeMap, flowResult] = await Promise.all([
       getQuote('VIX').catch(() => null),
       raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 4000, emptySwap),
       raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
       raceTimeout(fetchShortInterest().catch(() => new Map<string, ShortInterestData>()), 5000, new Map<string, ShortInterestData>()),
       raceTimeout(fetchShortSaleVolume().catch(() => new Map<string, ShortVolumeData>()), 5000, new Map<string, ShortVolumeData>()),
+      raceTimeout(scanMarketFlow().catch(() => emptyFlow), 10000, emptyFlow),
     ]);
     const vixPrice = vixQuote?.last ?? 0;
     const vixChangePct = vixQuote?.changePct ?? 0;
@@ -482,7 +520,7 @@ export async function POST() {
     }
 
     // Phase 2: Build prompt and call Claude
-    const prompt = buildBriefingPrompt(results, vixPrice, vixChangePct, swapSummary, regSHOList, shortInterestData, shortVolumeData);
+    const prompt = buildBriefingPrompt(results, vixPrice, vixChangePct, swapSummary, regSHOList, shortInterestData, shortVolumeData, flowResult);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const body: Record<string, any> = {

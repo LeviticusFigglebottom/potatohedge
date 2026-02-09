@@ -4,7 +4,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import {
   Building2, RefreshCw, Loader2, ArrowRightLeft, ShieldAlert, AlertTriangle, Clock,
-  Zap, ChevronDown, ChevronUp, Waves, TrendingUp, TrendingDown,
+  Zap, ChevronDown, ChevronUp, Waves, TrendingUp, TrendingDown, Info,
 } from 'lucide-react';
 
 // ─── Types ──────────────────────────────────────────────────
@@ -136,6 +136,25 @@ function MetricCard({ label, value, color = 'muted', sub }: {
       <div className="text-[10px] text-text-muted font-mono uppercase tracking-wider mb-0.5">{label}</div>
       <div className={`text-lg font-bold font-mono ${c}`}>{value}</div>
       {sub && <div className="text-[10px] text-text-muted/60 font-mono">{sub}</div>}
+    </div>
+  );
+}
+
+// ─── Info Callout ───────────────────────────────────────────
+
+function InfoBox({ children }: { children: React.ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-2">
+      <button onClick={() => setOpen(o => !o)} className="flex items-center gap-1 text-[10px] text-text-muted/50 hover:text-text-muted transition-colors font-mono">
+        <Info className="w-3 h-3" />
+        {open ? 'Hide explanation' : 'What does this mean?'}
+      </button>
+      {open && (
+        <div className="mt-1.5 text-[10px] text-text-muted/60 leading-relaxed bg-bg-secondary/30 rounded-lg px-3 py-2 border border-border/10 space-y-1">
+          {children}
+        </div>
+      )}
     </div>
   );
 }
@@ -289,17 +308,18 @@ export default function InstitutionalTab() {
                  data.vix.current < 35 ? 'VIX high — significant fear, potential mean reversion opportunity.' :
                  'VIX extreme — panic/crisis conditions, historically marks bottoming zones.'}
                 {data.skew && data.skew.current > 145 ? ' SKEW elevated — market pricing larger tail risk than VIX alone suggests.' : ''}
+                {data.marketFlow && data.marketFlow.tickersScanned > 0
+                  ? ` Scanned ${data.marketFlow.contractsAnalyzed.toLocaleString()} contracts across ${data.marketFlow.tickersScanned} tickers.`
+                  : ''}
               </p>
             )}
 
-            {data.marketFlow && data.marketFlow.tickersScanned > 0 && (
-              <p className="text-[10px] text-text-muted/50 px-1">
-                Scanned {data.marketFlow.contractsAnalyzed.toLocaleString()} contracts across {data.marketFlow.tickersScanned} tickers.
-                {data.marketFlow.netPremium > 0 ? ' Net call premium = institutional buying pressure.' : ''}
-                {data.marketFlow.netPremium < 0 ? ' Net put premium = institutional hedging/bearish bets.' : ''}
-                {data.marketFlow.putCallRatio > 1.0 ? ` P/C ${data.marketFlow.putCallRatio.toFixed(2)} > 1.0 = elevated put demand.` : ''}
-              </p>
-            )}
+            <InfoBox>
+              <p><strong className="text-text-muted">VIX</strong> — The CBOE Volatility Index measures expected 30-day S&P 500 volatility. Historical mean is ~20. Below 15 is extreme complacency (options are cheap — good for buying). Above 25 indicates significant hedging demand. Above 35 historically marks major bottoming zones (mean reversion opportunity).</p>
+              <p><strong className="text-text-muted">SKEW</strong> — Measures the cost of OTM puts vs calls. Normal range: 120-140. Above 145: market is pricing larger tail risk than VIX alone suggests. When SKEW diverges from VIX (high SKEW + low VIX), smart money is quietly hedging while the market appears calm.</p>
+              <p><strong className="text-text-muted">Net Premium Flow</strong> — Total call premium minus total put premium across major tickers (SPY, QQQ, IWM, NVDA, TSLA, AAPL, AMZN, META, MSFT, AMD). Positive = institutions buying calls (bullish). Typical daily range: $100M-$500M. Above $500M = very aggressive positioning. Cross-reference with VIX: if net premium is bullish but VIX is rising, institutions may be buying calls to hedge short positions.</p>
+              <p><strong className="text-text-muted">P/C Ratio</strong> — Put volume / call volume. Historical average: ~0.85. Below 0.7 = aggressive call buying (bullish). Above 1.2 = heavy put activity (bearish/hedging). Extreme readings (&gt;1.5) often mark sentiment washouts and subsequent reversals.</p>
+            </InfoBox>
           </div>
         </Section>
       )}
@@ -353,8 +373,13 @@ export default function InstitutionalTab() {
             })}
           </div>
           <p className="text-[10px] text-text-muted/50 px-1 mt-2">
-            Net premium = call premium - put premium. Green = net call buying (bullish), Red = net put buying (bearish).
+            Net premium = call premium - put premium. Green = net call buying (bullish), Red = net put buying (bearish). Click a ticker to view its full analysis.
           </p>
+          <InfoBox>
+            <p><strong className="text-text-muted">How to read this</strong> — Each card shows the NET premium direction for that ticker. Positive (green) means more money is flowing into calls than puts. Magnitude matters: $100M+ is significant for single names, $50M+ for ETFs.</p>
+            <p><strong className="text-text-muted">Sector rotation</strong> — Compare flow across tickers: if SPY/QQQ are green but IWM is red, institutions are favoring large-caps over small-caps. If tech names (NVDA, AMZN, META) are all strongly positive while defensives are flat, it's a risk-on rotation.</p>
+            <p><strong className="text-text-muted">Divergence signals</strong> — When a ticker's flow diverges from its index (e.g., TSLA deeply red while QQQ is green), it may signal stock-specific hedging or conviction that the name will underperform. Cross-reference with the dealer tab for that ticker.</p>
+          </InfoBox>
         </Section>
       )}
 
@@ -417,6 +442,14 @@ export default function InstitutionalTab() {
               ? 'Sweeps = aggressive fills across exchanges. Blocks = single fill 100+ contracts. Enhanced with trade-level data.'
               : 'Unusual = volume/OI > 2x. Large = $100K+ premium. Upgrade to Polygon Developer for sweep/block detection.'}
           </p>
+          <InfoBox>
+            <p><strong className="text-yellow-400/80">SWEEP</strong> — Fills on 3+ exchanges within 2 seconds. The trader is aggressively lifting every available offer simultaneously, accepting worse prices for speed. This is the strongest signal of directional conviction — they need the position NOW.</p>
+            <p><strong className="text-purple-400/80">BLOCK</strong> — A single negotiated fill of 100+ contracts. Typically institutional-to-institutional dark pool trades. Blocks indicate large, deliberate positioning rather than speculative activity.</p>
+            <p><strong className="text-amber-400/80">LARGE</strong> — $100K+ premium on a single contract line. Significant capital commitment that's unlikely to be retail. Multiple large alerts on the same ticker/direction = high institutional conviction.</p>
+            <p><strong className="text-cyan-400/80">UNUSUAL</strong> — Volume exceeds 2x open interest, meaning most activity is new positions being opened (not closing). When combined with rising OI, this represents fresh money entering the trade.</p>
+            <p><strong className="text-text-muted">Vol/OI ratio</strong> — How many times today's volume exceeds existing open interest. 1x = normal turnover. 2-5x = notable. 10x+ = very aggressive new positioning. 50x+ = likely a one-day event trade (earnings, binary catalyst).</p>
+            <p><strong className="text-text-muted">Sentiment dot</strong> — Green = bullish (call price rising or put price falling). Red = bearish (put price rising or call price falling). Derived from whether the contract's price went up or down today relative to open.</p>
+          </InfoBox>
         </Section>
       )}
 
@@ -435,6 +468,12 @@ export default function InstitutionalTab() {
           }
         >
           <div className="space-y-4">
+            <InfoBox>
+              <p><strong className="text-text-muted">Days-to-Cover (DTC)</strong> — Short interest divided by average daily volume. Tells you how many days it would take all short sellers to cover. DTC &gt; 5 = elevated squeeze risk. DTC &gt; 10 = significant. DTC &gt; 20 = extreme — any positive catalyst could trigger cascading short covering. Note: SI data is reported bi-monthly (15-day delay).</p>
+              <p><strong className="text-text-muted">Short Volume Ratio</strong> — Percentage of today's total volume that was short selling. Above 50% means more than half of all trades were short sales. Sustained high short volume (&gt;60%) indicates active bearish conviction. However, market maker short selling for liquidity can inflate this number — cross-reference with DTC and Reg SHO for true bearish intent.</p>
+              <p><strong className="text-text-muted">Squeeze setup checklist</strong> — Look for: (1) DTC &gt; 10 + (2) Short ratio &gt; 50% + (3) On Reg SHO list + (4) Bullish options flow (sweeps/blocks on calls). All four together = highest probability squeeze.</p>
+            </InfoBox>
+
             {data.siScreener.length > 0 && (
               <div>
                 <div className="text-xs text-text-muted font-mono mb-2 uppercase tracking-wider">Highest Days-to-Cover</div>
@@ -513,6 +552,9 @@ export default function InstitutionalTab() {
                 <p className="text-[10px] text-text-muted/50 px-1 mt-1">
                   Persistent FTDs — forced covering potential. Cross-reference with high SI for squeeze setups.
                 </p>
+                <InfoBox>
+                  <p><strong className="text-text-muted">Reg SHO Threshold</strong> — Securities with persistent failures-to-deliver (FTDs) for 5+ consecutive settlement days. Being on this list means market makers have repeatedly failed to locate shares to borrow, creating forced buying pressure. Cross-reference with high short interest (DTC &gt; 10 days) for squeeze candidates.</p>
+                </InfoBox>
               </div>
             )}
           </div>
@@ -557,6 +599,12 @@ export default function InstitutionalTab() {
             <p className="text-[10px] text-text-muted/50 px-1">
               When swaps mature, dealers must unwind hedges — creating directional flow. Large maturity clusters = forced rebalancing.
             </p>
+            <InfoBox>
+              <p><strong className="text-text-muted">Equity Swaps</strong> — OTC derivatives where one party pays the return on an equity (or basket) in exchange for a fixed/floating rate. When swaps mature, the dealer holding the hedge must sell or buy the underlying stock to unwind their position.</p>
+              <p><strong className="text-text-muted">Maturity Clusters</strong> — When many swaps on the same name mature together, the forced unwinding creates large directional flow that the market must absorb. This is NOT discretionary trading — dealers MUST execute regardless of price.</p>
+              <p><strong className="text-text-muted">How to use</strong> — Look for names with: (1) High swap maturity notional + (2) Small average daily volume = maximum price impact. Cross-reference with options flow: if institutions are positioning ahead of large maturity dates, they may be front-running the forced flow.</p>
+              <p><strong className="text-text-muted">Notional context</strong> — $1B+ notional maturing on a single name is significant for mid/large-caps. For mega-caps (AAPL, MSFT), even $5B+ may be absorbed normally. For small-caps, $100M+ is notable.</p>
+            </InfoBox>
           </div>
         </Section>
       )}
