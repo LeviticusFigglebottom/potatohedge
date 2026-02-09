@@ -4,7 +4,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import {
   Building2, RefreshCw, Loader2, ArrowRightLeft, ShieldAlert, AlertTriangle, Clock,
-  Zap, ChevronDown, ChevronUp, Eye, Landmark, Waves, Lock,
+  Zap, ChevronDown, ChevronUp, Waves, TrendingUp, TrendingDown,
 } from 'lucide-react';
 
 // ─── Types ──────────────────────────────────────────────────
@@ -17,45 +17,42 @@ interface MarketIndicator {
   date: string;
 }
 
-interface MarketTide {
+interface MarketFlow {
   netCallPremium: number;
   netPutPremium: number;
   netPremium: number;
-  callVolume: number;
-  putVolume: number;
+  totalCallVolume: number;
+  totalPutVolume: number;
+  putCallRatio: number;
   sentiment: 'bullish' | 'bearish' | 'neutral';
+  tickersScanned: number;
+  contractsAnalyzed: number;
 }
 
 interface FlowAlert {
   ticker: string;
+  contractType: 'call' | 'put';
   strike: number;
   expiry: string;
-  contractType: 'call' | 'put';
   premium: number;
   volume: number;
   openInterest: number;
+  volumeOIRatio: number;
+  impliedVol: number;
+  delta: number;
   tradeType: string;
   sentiment: string;
-  timestamp: string;
+  underlyingPrice: number;
 }
 
-interface DarkPoolPrint {
+interface TickerFlow {
   ticker: string;
-  price: number;
-  size: number;
-  notional: number;
-  date: string;
-  timestamp: string;
-}
-
-interface CongressTrade {
-  politician: string;
-  ticker: string;
-  transactionType: string;
-  amount: string;
-  transactionDate: string;
-  disclosureDate: string;
-  chamber: string;
+  netPremium: number;
+  callPremium: number;
+  putPremium: number;
+  callVolume: number;
+  putVolume: number;
+  contractsActive: number;
 }
 
 interface InstitutionalAPIData {
@@ -63,11 +60,10 @@ interface InstitutionalAPIData {
   sources: string[];
   vix: MarketIndicator | null;
   skew: MarketIndicator | null;
-  uwAvailable: boolean;
-  marketTide: MarketTide | null;
+  marketFlow: MarketFlow | null;
   flowAlerts: FlowAlert[];
-  darkPool: DarkPoolPrint[];
-  congressTrades: CongressTrade[];
+  perTickerFlow: TickerFlow[];
+  flowDeveloper: boolean;
   siScreener: { symbol: string; daysToCover: number; shortInterest: number; avgDailyVolume: number }[];
   siAsOf: string;
   svScreener: { symbol: string; shortVolume: number; totalVolume: number; shortRatio: number }[];
@@ -109,14 +105,6 @@ function fmtDate(d: string): string {
   catch { return d; }
 }
 
-function fmtTimestamp(ts: string): string {
-  if (!ts) return '';
-  try {
-    const d = new Date(ts);
-    return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
-  } catch { return ts; }
-}
-
 // ─── Collapsible Section ────────────────────────────────────
 
 function Section({ title, icon, badge, defaultOpen = true, children }: {
@@ -152,22 +140,26 @@ function MetricCard({ label, value, color = 'muted', sub }: {
   );
 }
 
-// ─── UW Upsell Banner ───────────────────────────────────────
+// ─── Trade Type Badge ───────────────────────────────────────
 
-function UWBanner() {
+function TradeTypeBadge({ type }: { type: string }) {
+  const styles: Record<string, string> = {
+    sweep: 'bg-yellow-500/15 text-yellow-400 border-yellow-500/30',
+    block: 'bg-purple-500/15 text-purple-400 border-purple-500/30',
+    large_premium: 'bg-amber-500/15 text-amber-400 border-amber-500/30',
+    unusual_volume: 'bg-cyan-500/15 text-cyan-400 border-cyan-500/30',
+  };
+  const labels: Record<string, string> = {
+    sweep: 'SWEEP',
+    block: 'BLOCK',
+    large_premium: 'LARGE',
+    unusual_volume: 'UNUSUAL',
+  };
+  const s = styles[type] || 'bg-bg-tertiary text-text-muted border-border/30';
   return (
-    <div className="panel border border-accent-purple/20 bg-accent-purple/5">
-      <div className="px-4 py-3 flex items-start gap-3">
-        <Lock className="w-4 h-4 text-accent-purple mt-0.5 shrink-0" />
-        <div>
-          <p className="text-xs text-text-primary font-semibold mb-1">Unlock Options Flow, Dark Pool & Congressional Data</p>
-          <p className="text-[11px] text-text-muted leading-relaxed">
-            Set <code className="text-accent-purple bg-bg-tertiary px-1 rounded text-[10px]">UNUSUAL_WHALES_API_KEY</code> in
-            your Vercel env to activate real-time institutional options flow, dark pool prints, and congressional trading.
-          </p>
-        </div>
-      </div>
-    </div>
+    <span className={`text-[9px] font-mono font-bold px-1.5 py-0.5 rounded border ${s}`}>
+      {labels[type] || type.toUpperCase()}
+    </span>
   );
 }
 
@@ -231,31 +223,30 @@ export default function InstitutionalTab() {
       {loading && !data && (
         <div className="panel p-8 flex items-center justify-center">
           <Loader2 className="w-5 h-5 animate-spin text-accent-purple mr-3" />
-          <span className="text-text-muted font-mono text-sm">Loading institutional data...</span>
+          <span className="text-text-muted font-mono text-sm">Scanning options flow across 10 tickers...</span>
         </div>
       )}
 
       {/* ═══════════════════════════════════════════════════════
-          MARKET REGIME — VIX, SKEW, Market Tide
+          MARKET REGIME — VIX, SKEW, Net Premium Flow
           ═══════════════════════════════════════════════════════ */}
-      {data && (data.vix || data.skew || data.marketTide) && (
+      {data && (data.vix || data.skew || data.marketFlow) && (
         <Section
           title="Market Regime"
           icon={<Waves className="w-3.5 h-3.5 text-cyan-400" />}
-          badge={data.marketTide ? (
+          badge={data.marketFlow ? (
             <span className={`text-xs font-mono font-bold px-2 py-0.5 rounded ${
-              data.marketTide.sentiment === 'bullish' ? 'bg-green-500/10 text-green-400' :
-              data.marketTide.sentiment === 'bearish' ? 'bg-red-500/10 text-red-400' :
+              data.marketFlow.sentiment === 'bullish' ? 'bg-green-500/10 text-green-400' :
+              data.marketFlow.sentiment === 'bearish' ? 'bg-red-500/10 text-red-400' :
               'bg-bg-tertiary text-text-muted'
             }`}>
-              {data.marketTide.sentiment === 'bullish' ? 'Risk-On' :
-               data.marketTide.sentiment === 'bearish' ? 'Risk-Off' : 'Neutral'}
+              {data.marketFlow.sentiment === 'bullish' ? 'Risk-On' :
+               data.marketFlow.sentiment === 'bearish' ? 'Risk-Off' : 'Neutral'}
             </span>
           ) : null}
         >
           <div className="space-y-4">
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-              {/* VIX */}
               {data.vix && (
                 <MetricCard
                   label="VIX"
@@ -264,7 +255,6 @@ export default function InstitutionalTab() {
                   sub={`${data.vix.change >= 0 ? '+' : ''}${data.vix.change.toFixed(2)} (${data.vix.changePercent >= 0 ? '+' : ''}${data.vix.changePercent.toFixed(1)}%)`}
                 />
               )}
-              {/* SKEW */}
               {data.skew && (
                 <MetricCard
                   label="SKEW"
@@ -273,26 +263,24 @@ export default function InstitutionalTab() {
                   sub={data.skew.current > 145 ? 'Elevated tail risk' : data.skew.current > 130 ? 'Normal range' : 'Low tail risk'}
                 />
               )}
-              {/* Market Tide — Net Premium */}
-              {data.marketTide && (
+              {data.marketFlow && (
                 <>
                   <MetricCard
                     label="Net Premium Flow"
-                    value={fmt$(data.marketTide.netPremium)}
-                    color={data.marketTide.netPremium > 0 ? 'green' : data.marketTide.netPremium < 0 ? 'red' : 'muted'}
-                    sub={data.marketTide.sentiment === 'bullish' ? 'Institutions buying calls' : data.marketTide.sentiment === 'bearish' ? 'Institutions buying puts' : 'Balanced flow'}
+                    value={fmt$(data.marketFlow.netPremium)}
+                    color={data.marketFlow.netPremium > 0 ? 'green' : data.marketFlow.netPremium < 0 ? 'red' : 'muted'}
+                    sub={`Calls: ${fmt$(data.marketFlow.netCallPremium)} | Puts: ${fmt$(data.marketFlow.netPutPremium)}`}
                   />
                   <MetricCard
-                    label="Call / Put Volume"
-                    value={`${fmtVol(data.marketTide.callVolume)} / ${fmtVol(data.marketTide.putVolume)}`}
-                    color="muted"
-                    sub={`P/C: ${data.marketTide.putVolume > 0 ? (data.marketTide.putVolume / data.marketTide.callVolume).toFixed(2) : '—'}`}
+                    label="Put/Call Ratio"
+                    value={data.marketFlow.putCallRatio.toFixed(2)}
+                    color={data.marketFlow.putCallRatio > 1.2 ? 'red' : data.marketFlow.putCallRatio < 0.7 ? 'green' : 'muted'}
+                    sub={`${fmtVol(data.marketFlow.totalCallVolume)}C / ${fmtVol(data.marketFlow.totalPutVolume)}P`}
                   />
                 </>
               )}
             </div>
 
-            {/* VIX interpretation */}
             {data.vix && (
               <p className="text-[10px] text-text-muted/50 px-1">
                 {data.vix.current < 15 ? 'VIX below 15 — extreme complacency, options cheap, potential for vol expansion.' :
@@ -303,32 +291,105 @@ export default function InstitutionalTab() {
                 {data.skew && data.skew.current > 145 ? ' SKEW elevated — market pricing larger tail risk than VIX alone suggests.' : ''}
               </p>
             )}
+
+            {data.marketFlow && data.marketFlow.tickersScanned > 0 && (
+              <p className="text-[10px] text-text-muted/50 px-1">
+                Scanned {data.marketFlow.contractsAnalyzed.toLocaleString()} contracts across {data.marketFlow.tickersScanned} tickers.
+                {data.marketFlow.netPremium > 0 ? ' Net call premium = institutional buying pressure.' : ''}
+                {data.marketFlow.netPremium < 0 ? ' Net put premium = institutional hedging/bearish bets.' : ''}
+                {data.marketFlow.putCallRatio > 1.0 ? ` P/C ${data.marketFlow.putCallRatio.toFixed(2)} > 1.0 = elevated put demand.` : ''}
+              </p>
+            )}
           </div>
         </Section>
       )}
 
       {/* ═══════════════════════════════════════════════════════
-          INSTITUTIONAL OPTIONS FLOW (Unusual Whales)
+          FLOW HEATMAP — Per-Ticker Net Premium
           ═══════════════════════════════════════════════════════ */}
-      {data && data.uwAvailable && data.flowAlerts.length > 0 && (
+      {data && data.perTickerFlow && data.perTickerFlow.length > 0 && (
         <Section
-          title="Institutional Options Flow"
+          title="Options Flow by Ticker"
           icon={<Zap className="w-3.5 h-3.5 text-yellow-400" />}
-          badge={<span className="text-xs text-text-muted font-mono">{data.flowAlerts.length} alerts</span>}
+          badge={
+            <span className="text-[10px] text-text-muted font-mono">
+              {data.perTickerFlow.length} tickers
+            </span>
+          }
+        >
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+            {data.perTickerFlow.map(tf => {
+              const bullish = tf.netPremium > 0;
+              const magnitude = Math.abs(tf.netPremium);
+              const intensity = magnitude > 10e6 ? 'strong' : magnitude > 1e6 ? 'moderate' : 'mild';
+              return (
+                <div
+                  key={tf.ticker}
+                  className={`rounded-lg px-3 py-2 border cursor-pointer transition-colors hover:brightness-110 ${
+                    bullish
+                      ? intensity === 'strong' ? 'bg-green-500/15 border-green-500/30' :
+                        intensity === 'moderate' ? 'bg-green-500/10 border-green-500/20' :
+                        'bg-green-500/5 border-green-500/10'
+                      : intensity === 'strong' ? 'bg-red-500/15 border-red-500/30' :
+                        intensity === 'moderate' ? 'bg-red-500/10 border-red-500/20' :
+                        'bg-red-500/5 border-red-500/10'
+                  }`}
+                  onClick={() => nav(tf.ticker)}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-mono font-bold text-sm text-text-primary">{tf.ticker}</span>
+                    {bullish
+                      ? <TrendingUp className="w-3 h-3 text-green-400" />
+                      : <TrendingDown className="w-3 h-3 text-red-400" />}
+                  </div>
+                  <div className={`font-mono font-bold text-sm ${bullish ? 'text-green-400' : 'text-red-400'}`}>
+                    {bullish ? '+' : ''}{fmt$(tf.netPremium)}
+                  </div>
+                  <div className="text-[9px] text-text-muted/60 font-mono mt-0.5">
+                    C: {fmt$(tf.callPremium)} P: {fmt$(tf.putPremium)}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <p className="text-[10px] text-text-muted/50 px-1 mt-2">
+            Net premium = call premium - put premium. Green = net call buying (bullish), Red = net put buying (bearish).
+          </p>
+        </Section>
+      )}
+
+      {/* ═══════════════════════════════════════════════════════
+          TOP FLOW ALERTS — Biggest Premium Contracts
+          ═══════════════════════════════════════════════════════ */}
+      {data && data.flowAlerts.length > 0 && (
+        <Section
+          title="Top Flow Alerts"
+          icon={<Zap className="w-3.5 h-3.5 text-amber-400" />}
+          badge={
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-text-muted font-mono">{data.flowAlerts.length} alerts</span>
+              {data.flowDeveloper && (
+                <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-accent-purple/10 text-accent-purple border border-accent-purple/20">
+                  DEVELOPER
+                </span>
+              )}
+            </div>
+          }
         >
           <div className="space-y-1">
-            <div className="grid grid-cols-[1fr_auto_auto_auto_auto] gap-x-3 text-[10px] font-mono text-text-muted uppercase tracking-wider border-b border-border/30 pb-1 mb-1 px-2">
+            <div className="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-3 text-[10px] font-mono text-text-muted uppercase tracking-wider border-b border-border/30 pb-1 mb-1 px-2">
               <span>Ticker</span>
               <span className="text-right">Premium</span>
               <span className="text-right">Type</span>
               <span className="text-right">Contract</span>
-              <span className="text-right">Time</span>
+              <span className="text-right">Vol/OI</span>
+              <span className="text-right">IV</span>
             </div>
-            {data.flowAlerts.slice(0, 15).map((f, i) => {
-              const isBullish = f.sentiment.toLowerCase().includes('bullish') || (f.contractType === 'call' && f.sentiment.toLowerCase().includes('ask'));
-              const isBearish = f.sentiment.toLowerCase().includes('bearish') || (f.contractType === 'put' && f.sentiment.toLowerCase().includes('ask'));
+            {data.flowAlerts.slice(0, 20).map((f, i) => {
+              const isBullish = f.sentiment === 'bullish';
+              const isBearish = f.sentiment === 'bearish';
               return (
-                <div key={i} className="grid grid-cols-[1fr_auto_auto_auto_auto] gap-x-3 text-xs font-mono py-1.5 px-2 rounded hover:bg-bg-hover/50 cursor-pointer items-center"
+                <div key={i} className="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-3 text-xs font-mono py-1.5 px-2 rounded hover:bg-bg-hover/50 cursor-pointer items-center"
                   onClick={() => nav(f.ticker)}>
                   <div className="flex items-center gap-2">
                     <span className={`w-1.5 h-1.5 rounded-full ${isBullish ? 'bg-green-400' : isBearish ? 'bg-red-400' : 'bg-text-muted'}`} />
@@ -337,94 +398,27 @@ export default function InstitutionalTab() {
                   <span className={`text-right font-semibold ${f.premium >= 1e6 ? 'text-yellow-400' : f.premium >= 500000 ? 'text-text-primary' : 'text-text-secondary'}`}>
                     {fmt$(f.premium)}
                   </span>
-                  <span className="text-right text-text-muted capitalize">{f.tradeType}</span>
+                  <span className="text-right"><TradeTypeBadge type={f.tradeType} /></span>
                   <span className={`text-right ${f.contractType === 'call' ? 'text-green-400/80' : 'text-red-400/80'}`}>
                     {f.contractType.toUpperCase()} ${f.strike} {fmtDate(f.expiry)}
                   </span>
-                  <span className="text-right text-text-muted/60">{fmtTimestamp(f.timestamp)}</span>
+                  <span className={`text-right ${f.volumeOIRatio > 5 ? 'text-cyan-400 font-semibold' : f.volumeOIRatio > 2 ? 'text-text-secondary' : 'text-text-muted'}`}>
+                    {f.volumeOIRatio.toFixed(1)}x
+                  </span>
+                  <span className="text-right text-text-muted/80">
+                    {(f.impliedVol * 100).toFixed(0)}%
+                  </span>
                 </div>
               );
             })}
           </div>
           <p className="text-[10px] text-text-muted/50 px-1 mt-2">
-            Sweeps = aggressive fills across exchanges. Blocks = negotiated large trades. Premium $1M+ = likely institutional.
+            {data.flowDeveloper
+              ? 'Sweeps = aggressive fills across exchanges. Blocks = single fill 100+ contracts. Enhanced with trade-level data.'
+              : 'Unusual = volume/OI > 2x. Large = $100K+ premium. Upgrade to Polygon Developer for sweep/block detection.'}
           </p>
         </Section>
       )}
-
-      {/* ═══════════════════════════════════════════════════════
-          DARK POOL ACTIVITY (Unusual Whales)
-          ═══════════════════════════════════════════════════════ */}
-      {data && data.uwAvailable && data.darkPool.length > 0 && (
-        <Section
-          title="Dark Pool Prints"
-          icon={<Eye className="w-3.5 h-3.5 text-purple-400" />}
-          badge={<span className="text-xs text-text-muted font-mono">{data.darkPool.length} prints</span>}
-        >
-          <div className="space-y-1">
-            <div className="grid grid-cols-[1fr_auto_auto_auto] gap-x-4 text-[10px] font-mono text-text-muted uppercase tracking-wider border-b border-border/30 pb-1 mb-1 px-2">
-              <span>Ticker</span>
-              <span className="text-right">Notional</span>
-              <span className="text-right">Size</span>
-              <span className="text-right">Price</span>
-            </div>
-            {data.darkPool.slice(0, 15).map((p, i) => (
-              <div key={i} className="grid grid-cols-[1fr_auto_auto_auto] gap-x-4 text-xs font-mono py-1.5 px-2 rounded hover:bg-bg-hover/50 cursor-pointer items-center"
-                onClick={() => nav(p.ticker)}>
-                <span className="font-semibold text-text-primary">{p.ticker}</span>
-                <span className={`text-right font-semibold ${p.notional >= 10e6 ? 'text-accent-purple' : p.notional >= 1e6 ? 'text-text-primary' : 'text-text-secondary'}`}>
-                  {fmt$(p.notional)}
-                </span>
-                <span className="text-right text-text-muted">{fmtVol(p.size)} shares</span>
-                <span className="text-right text-text-muted/80">${p.price.toFixed(2)}</span>
-              </div>
-            ))}
-          </div>
-          <p className="text-[10px] text-text-muted/50 px-1 mt-2">
-            Off-exchange prints. Large notional ($10M+) = institutional block trades. Track accumulation by watching repeat tickers.
-          </p>
-        </Section>
-      )}
-
-      {/* ═══════════════════════════════════════════════════════
-          CONGRESSIONAL TRADING (Unusual Whales)
-          ═══════════════════════════════════════════════════════ */}
-      {data && data.uwAvailable && data.congressTrades.length > 0 && (
-        <Section
-          title="Congressional Trading"
-          icon={<Landmark className="w-3.5 h-3.5 text-blue-400" />}
-          badge={<span className="text-xs text-text-muted font-mono">{data.congressTrades.length} trades</span>}
-          defaultOpen={false}
-        >
-          <div className="space-y-1">
-            {data.congressTrades.slice(0, 15).map((t, i) => {
-              const isBuy = t.transactionType.toLowerCase().includes('purchase') || t.transactionType.toLowerCase().includes('buy');
-              return (
-                <div key={i} className="flex items-center justify-between text-xs font-mono py-1.5 px-2 rounded hover:bg-bg-hover/50 cursor-pointer"
-                  onClick={() => nav(t.ticker)}>
-                  <div className="flex items-center gap-2 min-w-0">
-                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${isBuy ? 'bg-green-400' : 'bg-red-400'}`} />
-                    <span className="font-semibold text-text-primary truncate">{t.politician}</span>
-                  </div>
-                  <div className="flex items-center gap-3 shrink-0">
-                    <span className={`font-semibold ${isBuy ? 'text-green-400/80' : 'text-red-400/80'}`}>
-                      {isBuy ? 'BUY' : 'SELL'} {t.ticker}
-                    </span>
-                    <span className="text-text-muted">{t.amount}</span>
-                    <span className="text-text-muted/60 w-14 text-right">{fmtDate(t.transactionDate)}</span>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-          <p className="text-[10px] text-text-muted/50 px-1 mt-2">
-            SEC-mandated disclosures. Trades reported up to 45 days after execution. Track patterns, not individual trades.
-          </p>
-        </Section>
-      )}
-
-      {/* UW upsell banner if not configured */}
-      {data && !data.uwAvailable && <UWBanner />}
 
       {/* ═══════════════════════════════════════════════════════
           SHORT PRESSURE — SI + SV screeners
@@ -441,7 +435,6 @@ export default function InstitutionalTab() {
           }
         >
           <div className="space-y-4">
-            {/* SI Screener */}
             {data.siScreener.length > 0 && (
               <div>
                 <div className="text-xs text-text-muted font-mono mb-2 uppercase tracking-wider">Highest Days-to-Cover</div>
@@ -473,7 +466,6 @@ export default function InstitutionalTab() {
               </div>
             )}
 
-            {/* SV Screener */}
             {data.svScreener.length > 0 && (
               <div>
                 <div className="text-xs text-text-muted font-mono mb-2 uppercase tracking-wider">Highest Short Volume Ratio</div>
@@ -505,7 +497,6 @@ export default function InstitutionalTab() {
               </div>
             )}
 
-            {/* Reg SHO */}
             {data.regSHOList.length > 0 && (
               <div>
                 <div className="text-xs text-text-muted font-mono mb-2 uppercase tracking-wider">
