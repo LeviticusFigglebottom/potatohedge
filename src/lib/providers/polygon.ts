@@ -138,6 +138,7 @@ export async function getShortInterestBulk(params?: {
   ticker?: string;
   daysToCoverGte?: number;
   avgDailyVolumeGte?: number;
+  settlementDateGte?: string;
   limit?: number;
   sort?: string;
   order?: 'asc' | 'desc';
@@ -150,6 +151,7 @@ export async function getShortInterestBulk(params?: {
   if (params?.ticker) queryParams.ticker = params.ticker;
   if (params?.daysToCoverGte) queryParams['days_to_cover.gte'] = String(params.daysToCoverGte);
   if (params?.avgDailyVolumeGte) queryParams['avg_daily_volume.gte'] = String(params.avgDailyVolumeGte);
+  if (params?.settlementDateGte) queryParams['settlement_date.gte'] = params.settlementDateGte;
 
   const url = buildUrl('/stocks/v1/short-interest', queryParams);
   const res: Response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
@@ -178,6 +180,7 @@ export interface PolygonShortVolumeItem {
 export async function getShortVolumeBulk(params?: {
   ticker?: string;
   date?: string;
+  dateGte?: string;
   shortVolumeRatioGte?: number;
   totalVolumeGte?: number;
   limit?: number;
@@ -191,6 +194,7 @@ export async function getShortVolumeBulk(params?: {
   };
   if (params?.ticker) queryParams.ticker = params.ticker;
   if (params?.date) queryParams.date = params.date;
+  if (params?.dateGte) queryParams['date.gte'] = params.dateGte;
   if (params?.shortVolumeRatioGte) queryParams['short_volume_ratio.gte'] = String(params.shortVolumeRatioGte);
   if (params?.totalVolumeGte) queryParams['total_volume.gte'] = String(params.totalVolumeGte);
 

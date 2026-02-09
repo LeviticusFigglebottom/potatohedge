@@ -218,9 +218,13 @@ export async function fetchShortSaleVolume(): Promise<Map<string, ShortVolumeDat
 async function fetchShortSaleVolumeInner(): Promise<Map<string, ShortVolumeData>> {
   // ── Try Polygon first (all exchanges, venue-level breakdowns) ──
   try {
+    // Only fetch recent dates (last 5 business days)
+    const fiveDaysAgo = new Date();
+    fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 7);
     const items = await getShortVolumeBulk({
       shortVolumeRatioGte: 0.4,
       totalVolumeGte: 100000,
+      dateGte: fiveDaysAgo.toISOString().slice(0, 10),
       limit: 1000,
     });
     if (items.length > 0) {
@@ -340,9 +344,13 @@ export async function fetchShortInterest(): Promise<Map<string, ShortInterestDat
 async function fetchShortInterestInner(): Promise<Map<string, ShortInterestData>> {
   // ── Try Polygon first (all US exchanges, not just OTC) ──
   try {
+    // Only fetch recent settlement dates (last 60 days) to avoid stale data
+    const sixtyDaysAgo = new Date();
+    sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
     const items = await getShortInterestBulk({
       daysToCoverGte: 3,
       avgDailyVolumeGte: 1000,
+      settlementDateGte: sixtyDaysAgo.toISOString().slice(0, 10),
       limit: 1000,
     });
     if (items.length > 0) {
