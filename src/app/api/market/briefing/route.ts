@@ -452,7 +452,7 @@ export async function GET() {
       asOf: '',
     };
     const emptyRegSHO = { tickers: new Set<string>(), asOf: '' };
-    const emptySI = { data: new Map<string, { daysToCover: number; shortInterest: number }>(), asOf: '' };
+    const emptySI = { data: new Map<string, { daysToCover: number; shortInterest: number; avgDailyVolume: number }>(), asOf: '' };
     const emptySV = { data: new Map<string, ShortVolumeData>(), asOf: '' };
 
     // Independent per-provider timeouts — so DTCC being slow doesn't block RegSHO/SI
@@ -492,7 +492,8 @@ export async function GET() {
 
     const shortInterestHighlights: BriefingData['shortInterestHighlights'] = [];
     for (const [sym, data] of siResult.data) {
-      if (data.daysToCover > 3) {
+      // DTC 3-100 range, meaningful position size, reasonable liquidity
+      if (data.daysToCover >= 3 && data.daysToCover <= 100 && data.shortInterest >= 50000 && data.avgDailyVolume >= 1000) {
         shortInterestHighlights.push({ symbol: sym, daysToCover: data.daysToCover, shortInterest: data.shortInterest });
       }
     }

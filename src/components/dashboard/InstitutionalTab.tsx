@@ -288,18 +288,18 @@ export default function InstitutionalTab() {
               <div className="flex items-center gap-2">
                 <span className="panel-title flex items-center gap-2">
                   <ShieldAlert className="w-3.5 h-3.5 text-orange-400" />
-                  High Short Interest
+                  High Short Interest (OTC)
                 </span>
                 <DataAge asOf={data.shortInterestAsOf} />
               </div>
-              <span className="text-xs text-text-muted font-mono">{'>'}3 days to cover</span>
+              <span className="text-xs text-text-muted font-mono">3–100 DTC</span>
             </div>
             <div className="px-4 py-3">
               {data.shortInterestHighlights.length > 0 ? (
                 <div>
                   {data.shortInterestAsOf && (
                     <div className="text-xs text-text-muted/60 font-mono mb-2">
-                      Settlement date: {formatDate(data.shortInterestAsOf)} — FINRA short interest updates bi-monthly.
+                      Settlement date: {formatDate(data.shortInterestAsOf)} — FINRA OTC biweekly short interest. Exchange-listed SI requires paid API access.
                     </div>
                   )}
                   <div className="overflow-x-auto">
@@ -326,7 +326,7 @@ export default function InstitutionalTab() {
               ) : (
                 <div className="text-center py-6">
                   <p className="text-sm text-text-muted">No high short-interest data available.</p>
-                  <p className="text-xs text-text-muted/60 mt-1">FINRA short interest data updates bi-monthly. The most recent settlement date may not have data with {'>'}3 DTC.</p>
+                  <p className="text-xs text-text-muted/60 mt-1">Free FINRA CDN only covers OTC securities. Exchange-listed (NYSE/NASDAQ) short interest requires OAuth API access. OTC data updates bi-monthly.</p>
                 </div>
               )}
             </div>
@@ -533,7 +533,7 @@ export default function InstitutionalTab() {
           )}
 
           <div className="text-center text-[10px] text-text-muted/40 font-mono py-2">
-            DTCC Public Price Dissemination (S3 archive) &bull; FINRA Short Interest &amp; Reg SHO (api.finra.org) &bull; Options-derived positioning via Tradier &bull; Data shown is most recent available
+            DTCC Swap Data (S3 archive) &bull; FINRA Reg SHO &amp; Short Volume (api.finra.org) &bull; OTC Short Interest (cdn.finra.org) &bull; Options-derived positioning via Tradier
           </div>
         </>
       )}

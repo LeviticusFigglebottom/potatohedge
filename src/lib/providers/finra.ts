@@ -344,22 +344,25 @@ async function fetchShortInterestInner(): Promise<Map<string, ShortInterestData>
       const header = lines[0].toLowerCase();
       const cols = header.split('|').map(c => c.trim());
 
-      // Find column indices
+      // Find column indices (pipe-delimited: 11 columns)
       const symIdx = cols.findIndex(c => c.includes('symbol'));
       const siIdx = cols.findIndex(c => c.includes('currentshort') || c.includes('current_short'));
       const prevIdx = cols.findIndex(c => c.includes('previousshort') || c.includes('previous_short'));
       const avgIdx = cols.findIndex(c => c.includes('average') || c.includes('avg'));
+      const dtcIdx = cols.findIndex(c => c.includes('daystocover') || c.includes('days_to_cover'));
 
       if (symIdx === -1 || siIdx === -1) {
         // Try comma-separated format
         const commaCols = header.split(',').map(c => c.trim());
         const cSymIdx = commaCols.findIndex(c => c.includes('symbol'));
-        const cSiIdx = commaCols.findIndex(c => c.includes('currentshort') || c.includes('short') && c.includes('position'));
+        const cSiIdx = commaCols.findIndex(c => c.includes('currentshort') || (c.includes('short') && c.includes('position')));
+        const cAvgIdx = commaCols.findIndex(c => c.includes('average') || c.includes('avg'));
+        const cDtcIdx = commaCols.findIndex(c => c.includes('daystocover') || c.includes('days_to_cover'));
         if (cSymIdx !== -1 && cSiIdx !== -1) {
-          parseCSVLines(lines.slice(1), ',', cSymIdx, cSiIdx, -1, -1, settleDate, map);
+          parseCSVLines(lines.slice(1), ',', cSymIdx, cSiIdx, -1, cAvgIdx, cDtcIdx, settleDate, map);
         }
       } else {
-        parseCSVLines(lines.slice(1), '|', symIdx, siIdx, prevIdx, avgIdx, settleDate, map);
+        parseCSVLines(lines.slice(1), '|', symIdx, siIdx, prevIdx, avgIdx, dtcIdx, settleDate, map);
       }
 
       if (map.size > 0) {
@@ -384,6 +387,7 @@ function parseCSVLines(
   siIdx: number,
   prevIdx: number,
   avgIdx: number,
+  dtcIdx: number,
   settleDate: string,
   map: Map<string, ShortInterestData>,
 ): void {
@@ -393,16 +397,32 @@ function parseCSVLines(
     const sym = (fields[symIdx] || '').toUpperCase().trim();
     if (!sym || sym.length > 6 || !/^[A-Z]+$/.test(sym) || map.has(sym)) continue;
 
+    // Skip foreign ordinary shares (F suffix) — irrelevant for US dashboard
+    if (sym.length > 1 && sym.endsWith('F')) continue;
+
     const si = Math.abs(parseFloat(fields[siIdx]) || 0);
     if (si <= 0) continue;
 
     const adv = avgIdx >= 0 ? Math.abs(parseFloat(fields[avgIdx]) || 0) : 0;
-    const dtc = adv > 0 ? si / adv : 0;
+
+    // Use CSV-provided DTC when available; 999.99 means avg vol = 0 (N/A)
+    let dtc: number;
+    if (dtcIdx >= 0) {
+      const csvDtc = parseFloat(fields[dtcIdx]) || 0;
+      dtc = csvDtc >= 999 ? 0 : csvDtc;
+    } else {
+      dtc = adv > 0 ? si / adv : 0;
+    }
+
+    // Filter: require minimum liquidity, cap DTC, require meaningful SI
+    if (adv < 500) continue;          // Skip extremely illiquid stocks
+    if (dtc <= 0 || dtc > 200) continue; // Skip zero or absurd DTC
+    if (si < 10000) continue;          // Skip trivially small positions
 
     map.set(sym, {
       shortInterest: si,
       avgDailyVolume: adv,
-      daysToCover: dtc,
+      daysToCover: Math.min(dtc, 200),
       settlementDate: settleDate,
     });
   }

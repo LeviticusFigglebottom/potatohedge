@@ -459,10 +459,10 @@ export async function POST() {
     const vixChangePct = vixQuote?.changePct ?? 0;
     const regSHOList = Array.from(regSHOSet).filter(s => /^[A-Z]+$/.test(s)).sort();
 
-    // Build short interest highlights (>3 days to cover)
+    // Build short interest highlights (3-100 DTC, meaningful positions only — OTC data)
     const shortInterestData: { symbol: string; daysToCover: number; shortInterest: number }[] = [];
     for (const [sym, data] of shortInterestMap) {
-      if (data.daysToCover > 3) {
+      if (data.daysToCover >= 3 && data.daysToCover <= 100 && data.shortInterest >= 50000 && data.avgDailyVolume >= 1000) {
         shortInterestData.push({ symbol: sym, daysToCover: data.daysToCover, shortInterest: data.shortInterest });
       }
     }
