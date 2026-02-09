@@ -1,37 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getQuote, getExpirations, getOptionsChain } from '@/lib/providers/tradier';
-import { fetchEquityBars } from '@/lib/providers/equityBars';
-import {
-  computeDealerExposureFromChain,
-  findGammaFlip,
-  findCallWall,
-  findPutWall,
-  computeMaxPain,
-} from '@/lib/math/blackScholes';
-import {
-  computeHistoricalVolatility,
-  computeIVRankPercentile,
-  computeSkew,
-  computeStockProfile,
-} from '@/lib/math/analytics';
-import {
-  generateRecommendations,
-  type RecommendationInput,
-} from '@/lib/math/recommendations';
-import type { EquityBar } from '@/lib/providers/equityBars';
-import { getSwapDataForTicker } from '@/lib/providers/dtcc';
-import { fetchRegSHOThreshold, getShortInterestForTicker } from '@/lib/providers/finra';
 
 export const maxDuration = 30;
 
+interface EquityBar {
+  o: number; h: number; l: number; c: number; v: number; t: number;
+}
+
 /**
  * Lightweight correlation context from equity bars — no extra API calls needed.
- * Computes mean reversion stats and vol regime performance from daily bars.
  */
 function computeQuickCorrelationCtx(
   bars: EquityBar[],
   hvCurrent: number,
-): RecommendationInput['correlationCtx'] {
+) {
   if (bars.length < 60) return undefined;
 
   const returns: number[] = [];
@@ -40,7 +21,6 @@ function computeQuickCorrelationCtx(
   }
   if (returns.length < 40) return undefined;
 
-  // Rolling 20-day HV for vol regime classification
   const hvValues: number[] = [];
   for (let i = 20; i < returns.length; i++) {
     const window = returns.slice(i - 20, i);
@@ -53,7 +33,6 @@ function computeQuickCorrelationCtx(
   const p33 = sortedHV[Math.floor(sortedHV.length * 0.33)] || 0;
   const p66 = sortedHV[Math.floor(sortedHV.length * 0.66)] || 999;
 
-  // Vol regime forward returns
   const lowVolRets: number[] = [];
   const highVolRets: number[] = [];
   const lowVolWins5d: boolean[] = [];
@@ -69,7 +48,6 @@ function computeQuickCorrelationCtx(
     }
   }
 
-  // Mean reversion: after 2σ+ moves
   const dailySigma = hvCurrent > 0 ? hvCurrent / Math.sqrt(252) : 0.015;
   const bigUps: { next1d: number }[] = [];
   const bigDowns: { next1d: number; next5d: number }[] = [];
@@ -107,6 +85,25 @@ export async function GET(request: NextRequest) {
   const ticker = symbol.toUpperCase();
 
   try {
+    // Dynamic imports — catches module-level errors that static imports would hide
+    const [tradierMod, barsMod, bsMod, analyticsMod, recMod, dtccMod, finraMod] = await Promise.all([
+      import('@/lib/providers/tradier').catch(e => { throw new Error(`Failed to import tradier: ${e.message}`); }),
+      import('@/lib/providers/equityBars').catch(e => { throw new Error(`Failed to import equityBars: ${e.message}`); }),
+      import('@/lib/math/blackScholes').catch(e => { throw new Error(`Failed to import blackScholes: ${e.message}`); }),
+      import('@/lib/math/analytics').catch(e => { throw new Error(`Failed to import analytics: ${e.message}`); }),
+      import('@/lib/math/recommendations').catch(e => { throw new Error(`Failed to import recommendations: ${e.message}`); }),
+      import('@/lib/providers/dtcc').catch(e => { throw new Error(`Failed to import dtcc: ${e.message}`); }),
+      import('@/lib/providers/finra').catch(e => { throw new Error(`Failed to import finra: ${e.message}`); }),
+    ]);
+
+    const { getQuote, getExpirations, getOptionsChain } = tradierMod;
+    const { fetchEquityBars } = barsMod;
+    const { computeDealerExposureFromChain, findGammaFlip, findCallWall, findPutWall, computeMaxPain } = bsMod;
+    const { computeHistoricalVolatility, computeIVRankPercentile, computeSkew, computeStockProfile } = analyticsMod;
+    const { generateRecommendations } = recMod;
+    const { getSwapDataForTicker } = dtccMod;
+    const { fetchRegSHOThreshold, getShortInterestForTicker } = finraMod;
+
     const [quote, expirations, historyBars] = await Promise.all([
       getQuote(ticker),
       getExpirations(ticker),
@@ -179,7 +176,6 @@ export async function GET(request: NextRequest) {
     const closes = historyBars.map(b => b.c).reverse();
     const hvCurrent = computeHistoricalVolatility(closes, 20);
 
-    // If ATM IV came back as 0 (missing data), fall back to HV * 1.15 as proxy
     if (currentIV === 0 && hvCurrent > 0) {
       currentIV = hvCurrent * 1.15;
     }
@@ -193,15 +189,12 @@ export async function GET(request: NextRequest) {
 
     const skew = computeSkew(nearChain.calls, nearChain.puts, spotPrice);
 
-    // ── Stock Profile: ATR, daily sigma, avg range ──
-    // historyBars are chronological (oldest first) from Polygon
     const profile = computeStockProfile(
       historyBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c })),
       spotPrice,
       hvCurrent
     );
 
-    // Lightweight correlation context from existing bars
     const correlationCtx = computeQuickCorrelationCtx(historyBars, hvCurrent);
 
     // Fetch DTCC + FINRA data in parallel (non-blocking — graceful if unavailable)
@@ -211,7 +204,7 @@ export async function GET(request: NextRequest) {
       getShortInterestForTicker(ticker).catch(() => null),
     ]);
 
-    const input: RecommendationInput = {
+    const input = {
       symbol: ticker,
       spotPrice,
       totalGEX,
@@ -243,12 +236,10 @@ export async function GET(request: NextRequest) {
       weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
       monthlyExp: nearExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
       correlationCtx,
-      // DTCC swap data
       swapMaturitiesToday: swapData?.maturitiesToday,
       swapNotionalToday: swapData?.notionalToday,
       swapMaturitiesWeek: swapData?.maturitiesWeek,
       swapNotionalWeek: swapData?.notionalWeek,
-      // FINRA data
       shortInterest: siData?.shortInterest,
       daysToCover: siData?.daysToCover,
       regSHOThreshold: regSHOSet.has(ticker),

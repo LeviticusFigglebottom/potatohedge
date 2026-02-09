@@ -1,23 +1,4 @@
 import { NextResponse } from 'next/server';
-import { getQuote, getExpirations, getOptionsChain } from '@/lib/providers/tradier';
-import { fetchEquityBars } from '@/lib/providers/equityBars';
-import {
-  computeDealerExposureFromChain,
-  findGammaFlip,
-  findCallWall,
-  findPutWall,
-  computeMaxPain,
-} from '@/lib/math/blackScholes';
-import {
-  computeHistoricalVolatility,
-  computeIVRankPercentile,
-  computeSkew,
-  computeStockProfile,
-} from '@/lib/math/analytics';
-import { generateRecommendations, type RecommendationInput } from '@/lib/math/recommendations';
-import type { EquityBar } from '@/lib/providers/equityBars';
-import { getMarketSwapSummary } from '@/lib/providers/dtcc';
-import { fetchRegSHOWithDate, fetchShortInterestWithDate, type ShortInterestData } from '@/lib/providers/finra';
 
 export const maxDuration = 120;
 
@@ -51,11 +32,7 @@ export interface BriefingData {
   indices: IndexAnalysis[];
   vix: { price: number; changePct: number } | null;
   dia: { price: number; changePct: number } | null;
-  mag7: {
-    symbol: string;
-    price: number;
-    changePct: number;
-  }[];
+  mag7: { symbol: string; price: number; changePct: number }[];
   swapSummary: {
     totalMaturitiesToday: number;
     totalNotionalToday: number;
@@ -67,24 +44,18 @@ export interface BriefingData {
   };
   regSHOList: string[];
   regSHOAsOf: string;
-  shortInterestHighlights: {
-    symbol: string;
-    daysToCover: number;
-    shortInterest: number;
-  }[];
+  shortInterestHighlights: { symbol: string; daysToCover: number; shortInterest: number }[];
   shortInterestAsOf: string;
   finraAvailable: boolean;
   narrative: string[];
   alerts: string[];
 }
 
-/**
- * Lightweight correlation context from equity bars.
- */
-function computeQuickCorrelationCtx(
-  bars: EquityBar[],
-  hvCurrent: number,
-): RecommendationInput['correlationCtx'] {
+interface EquityBar {
+  o: number; h: number; l: number; c: number; v: number; t: number;
+}
+
+function computeQuickCorrelationCtx(bars: EquityBar[], hvCurrent: number) {
   if (bars.length < 60) return undefined;
   const returns: number[] = [];
   for (let i = 1; i < bars.length; i++) {
@@ -133,128 +104,6 @@ function computeQuickCorrelationCtx(
   };
 }
 
-/** Run full GEX/IV/flow analysis for a single ticker */
-async function analyzeIndex(ticker: string): Promise<IndexAnalysis | null> {
-  try {
-    const [quote, expirations, historyBars] = await Promise.all([
-      getQuote(ticker),
-      getExpirations(ticker),
-      fetchEquityBars(ticker, 400),
-    ]);
-
-    const spotPrice = quote.last;
-    if (!spotPrice || spotPrice <= 0) return null;
-
-    const nearExps = expirations.slice(0, 4);
-    if (nearExps.length === 0) return null;
-
-    const chains = await Promise.all(
-      nearExps.map(e => getOptionsChain(ticker, e.date).catch(() => null))
-    ).then(c => c.filter((x): x is NonNullable<typeof x> => x !== null));
-    if (chains.length === 0) return null;
-
-    // Aggregate GEX
-    const allExposures = chains.flatMap(chain =>
-      computeDealerExposureFromChain(
-        chain.calls.map(c => ({ strike: c.strike, openInterest: c.openInterest, impliedVolatility: c.impliedVolatility, gamma: c.gamma, delta: c.delta, dte: c.dte })),
-        chain.puts.map(p => ({ strike: p.strike, openInterest: p.openInterest, impliedVolatility: p.impliedVolatility, gamma: p.gamma, delta: p.delta, dte: p.dte })),
-        spotPrice
-      )
-    );
-    const byStrike = new Map<number, typeof allExposures[0]>();
-    for (const e of allExposures) {
-      const ex = byStrike.get(e.strike);
-      if (ex) { ex.netGEX += e.netGEX; ex.netDEX += e.netDEX; ex.callGEX += e.callGEX; ex.putGEX += e.putGEX; }
-      else byStrike.set(e.strike, { ...e });
-    }
-    const agg = Array.from(byStrike.values()).sort((a, b) => a.strike - b.strike);
-    const totalGEX = agg.reduce((s, e) => s + e.netGEX, 0);
-    const totalDEX = agg.reduce((s, e) => s + e.netDEX, 0);
-    const gammaFlip = findGammaFlip(agg, spotPrice);
-    const callWall = findCallWall(agg);
-    const putWall = findPutWall(agg);
-
-    const nearChain = chains[0];
-    const maxPainResult = computeMaxPain(
-      nearChain.calls.map(c => ({ strike: c.strike, openInterest: c.openInterest })),
-      nearChain.puts.map(p => ({ strike: p.strike, openInterest: p.openInterest }))
-    );
-
-    const totalCallVol = chains.reduce((s, c) => s + c.calls.reduce((sv, o) => sv + o.volume, 0), 0);
-    const totalPutVol = chains.reduce((s, c) => s + c.puts.reduce((sv, o) => sv + o.volume, 0), 0);
-    const totalCallOI = chains.reduce((s, c) => s + c.calls.reduce((sv, o) => sv + o.openInterest, 0), 0);
-    const totalPutOI = chains.reduce((s, c) => s + c.puts.reduce((sv, o) => sv + o.openInterest, 0), 0);
-    const volumePCR = totalCallVol > 0 ? totalPutVol / totalCallVol : 1;
-    const oiPCR = totalCallOI > 0 ? totalPutOI / totalCallOI : 1;
-
-    // ATM IV
-    const atmTolerance = spotPrice < 20 ? 0.10 : spotPrice < 50 ? 0.05 : 0.02;
-    const atmOpts = [...nearChain.calls, ...nearChain.puts]
-      .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < atmTolerance && o.impliedVolatility > 0.01)
-      .sort((a, b) => Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice));
-    let currentIV = atmOpts.length > 0
-      ? atmOpts.slice(0, 4).reduce((s, o) => s + o.impliedVolatility, 0) / Math.min(4, atmOpts.length)
-      : 0;
-
-    const closes = historyBars.map(b => b.c).reverse();
-    const hvCurrent = computeHistoricalVolatility(closes, 20);
-    if (currentIV === 0 && hvCurrent > 0) currentIV = hvCurrent * 1.15;
-
-    const historicalIVs = closes.slice(0, 252).map((_, i) => {
-      const hv = computeHistoricalVolatility(closes.slice(i), 20);
-      return hv > 0 ? hv * 1.15 : 0;
-    }).filter(v => v > 0);
-    const ivMetrics = computeIVRankPercentile(currentIV, historicalIVs);
-    const ivHvRatio = hvCurrent > 0 ? currentIV / hvCurrent : 1;
-    const skew = computeSkew(nearChain.calls, nearChain.puts, spotPrice);
-    const profile = computeStockProfile(
-      historyBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c })),
-      spotPrice, hvCurrent
-    );
-    const correlationCtx = computeQuickCorrelationCtx(historyBars, hvCurrent);
-
-    const input: RecommendationInput = {
-      symbol: ticker, spotPrice, totalGEX, totalDEX, gammaFlip, callWall, putWall,
-      maxPain: maxPainResult.strike, volumePCR, oiPCR,
-      totalCallVol, totalPutVol, totalCallOI, totalPutOI,
-      ivRank: ivMetrics.ivRank, ivPercentile: ivMetrics.ivPercentile,
-      currentIV, hvCurrent, ivHvRatio,
-      skewBias: skew.skewBias, skewRatio: skew.skewRatio,
-      changePercent: quote.changePct,
-      atr14: profile.atr14, atrPercent: profile.atrPercent,
-      dailySigma: profile.dailySigma, avgDailyRangePct: profile.avgDailyRangePct,
-      nearestExp: nearExps[0]?.date || '', nearestDTE: nearExps[0]?.dte || 0,
-      weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
-      monthlyExp: nearExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
-      correlationCtx,
-    };
-
-    const rec = generateRecommendations(input);
-
-    return {
-      symbol: ticker,
-      price: spotPrice,
-      changePct: quote.changePct,
-      bias: rec.overallBias,
-      biasScore: rec.biasScore,
-      volRegime: rec.volRegime,
-      gammaRegime: rec.gammaRegime,
-      ivRank: ivMetrics.ivRank,
-      currentIV,
-      hvCurrent,
-      volumePCR,
-      gammaFlip, callWall, putWall,
-      maxPain: maxPainResult.strike,
-      topSignals: rec.signals.filter(s => s.weight !== 0).sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight)).slice(0, 5),
-      atrPercent: profile.atrPercent,
-      dailySigma: profile.dailySigma,
-    };
-  } catch (err) {
-    console.error(`[briefing] Failed ${ticker}:`, err instanceof Error ? err.message : err);
-    return null;
-  }
-}
-
 function abbr(n: number): string {
   const abs = Math.abs(n);
   if (abs >= 1e9) return `$${(abs / 1e9).toFixed(1)}B`;
@@ -263,19 +112,16 @@ function abbr(n: number): string {
   return `$${abs.toFixed(0)}`;
 }
 
-/** Generate narrative insights from the analysis data */
 function generateNarrative(
   indices: IndexAnalysis[],
   vix: { price: number; changePct: number } | null,
   swapAvailable: boolean,
   swapSummary: BriefingData['swapSummary'],
   regSHOCount: number,
-  mag7: BriefingData['mag7'],
 ): { narrative: string[]; alerts: string[] } {
   const narrative: string[] = [];
   const alerts: string[] = [];
 
-  // 1. Market regime overview
   const spy = indices.find(i => i.symbol === 'SPY');
   const qqq = indices.find(i => i.symbol === 'QQQ');
   const iwm = indices.find(i => i.symbol === 'IWM');
@@ -309,7 +155,6 @@ function generateNarrative(
     );
   }
 
-  // 2. Cross-index divergences
   if (spy && qqq && iwm) {
     const allBullish = [spy, qqq, iwm].every(i => i.bias === 'bullish');
     const allBearish = [spy, qqq, iwm].every(i => i.bias === 'bearish');
@@ -329,7 +174,6 @@ function generateNarrative(
       }
     }
 
-    // Small-cap vs large-cap signal
     const iwmVsSpy = iwm.changePct - spy.changePct;
     if (Math.abs(iwmVsSpy) > 1) {
       narrative.push(
@@ -340,7 +184,6 @@ function generateNarrative(
     }
   }
 
-  // 3. VIX context
   if (vix) {
     if (vix.price > 25) {
       narrative.push(`VIX at ${vix.price.toFixed(2)} — elevated fear. Expect wide ranges and premium-rich environment.`);
@@ -351,7 +194,6 @@ function generateNarrative(
     }
   }
 
-  // 4. QQQ/IWM specifics
   if (qqq) {
     if (Math.abs(qqq.biasScore) > 25) {
       narrative.push(
@@ -368,7 +210,6 @@ function generateNarrative(
     }
   }
 
-  // 5. DTCC swap data
   if (swapAvailable && swapSummary.totalMaturitiesToday > 0) {
     narrative.push(
       `DTCC: ${swapSummary.totalMaturitiesToday.toLocaleString()} equity swaps (${abbr(swapSummary.totalNotionalToday)} notional) maturing today — dealer rebalancing expected.`
@@ -379,12 +220,10 @@ function generateNarrative(
     }
   }
 
-  // 6. Reg SHO
   if (regSHOCount > 0) {
     narrative.push(`${regSHOCount} securities on Reg SHO threshold list (persistent FTDs — potential squeeze catalysts).`);
   }
 
-  // 7. Alerts
   if (spy) {
     const moveSigma = spy.dailySigma > 0 ? Math.abs(spy.changePct) / spy.dailySigma : 0;
     if (moveSigma > 2) {
@@ -405,6 +244,145 @@ function generateNarrative(
 
 export async function GET() {
   try {
+    // Dynamic imports — catches module-level errors that static imports would hide
+    const [tradierMod, barsMod, bsMod, analyticsMod, recMod, dtccMod, finraMod] = await Promise.all([
+      import('@/lib/providers/tradier').catch(e => { throw new Error(`Failed to import tradier: ${e.message}`); }),
+      import('@/lib/providers/equityBars').catch(e => { throw new Error(`Failed to import equityBars: ${e.message}`); }),
+      import('@/lib/math/blackScholes').catch(e => { throw new Error(`Failed to import blackScholes: ${e.message}`); }),
+      import('@/lib/math/analytics').catch(e => { throw new Error(`Failed to import analytics: ${e.message}`); }),
+      import('@/lib/math/recommendations').catch(e => { throw new Error(`Failed to import recommendations: ${e.message}`); }),
+      import('@/lib/providers/dtcc').catch(e => { throw new Error(`Failed to import dtcc: ${e.message}`); }),
+      import('@/lib/providers/finra').catch(e => { throw new Error(`Failed to import finra: ${e.message}`); }),
+    ]);
+
+    const { getQuote, getExpirations, getOptionsChain } = tradierMod;
+    const { fetchEquityBars } = barsMod;
+    const { computeDealerExposureFromChain, findGammaFlip, findCallWall, findPutWall, computeMaxPain } = bsMod;
+    const { computeHistoricalVolatility, computeIVRankPercentile, computeSkew, computeStockProfile } = analyticsMod;
+    const { generateRecommendations } = recMod;
+    const { getMarketSwapSummary } = dtccMod;
+    const { fetchRegSHOWithDate, fetchShortInterestWithDate } = finraMod;
+
+    /** Run full GEX/IV/flow analysis for a single ticker */
+    async function analyzeIndex(ticker: string): Promise<IndexAnalysis | null> {
+      try {
+        const [quote, expirations, historyBars] = await Promise.all([
+          getQuote(ticker),
+          getExpirations(ticker),
+          fetchEquityBars(ticker, 400),
+        ]);
+
+        const spotPrice = quote.last;
+        if (!spotPrice || spotPrice <= 0) return null;
+
+        const nearExps = expirations.slice(0, 4);
+        if (nearExps.length === 0) return null;
+
+        const chains = await Promise.all(
+          nearExps.map(e => getOptionsChain(ticker, e.date).catch(() => null))
+        ).then(c => c.filter((x): x is NonNullable<typeof x> => x !== null));
+        if (chains.length === 0) return null;
+
+        const allExposures = chains.flatMap(chain =>
+          computeDealerExposureFromChain(
+            chain.calls.map(c => ({ strike: c.strike, openInterest: c.openInterest, impliedVolatility: c.impliedVolatility, gamma: c.gamma, delta: c.delta, dte: c.dte })),
+            chain.puts.map(p => ({ strike: p.strike, openInterest: p.openInterest, impliedVolatility: p.impliedVolatility, gamma: p.gamma, delta: p.delta, dte: p.dte })),
+            spotPrice
+          )
+        );
+        const byStrike = new Map<number, typeof allExposures[0]>();
+        for (const e of allExposures) {
+          const ex = byStrike.get(e.strike);
+          if (ex) { ex.netGEX += e.netGEX; ex.netDEX += e.netDEX; ex.callGEX += e.callGEX; ex.putGEX += e.putGEX; }
+          else byStrike.set(e.strike, { ...e });
+        }
+        const agg = Array.from(byStrike.values()).sort((a, b) => a.strike - b.strike);
+        const totalGEX = agg.reduce((s, e) => s + e.netGEX, 0);
+        const totalDEX = agg.reduce((s, e) => s + e.netDEX, 0);
+        const gammaFlip = findGammaFlip(agg, spotPrice);
+        const callWall = findCallWall(agg);
+        const putWall = findPutWall(agg);
+
+        const nearChain = chains[0];
+        const maxPainResult = computeMaxPain(
+          nearChain.calls.map(c => ({ strike: c.strike, openInterest: c.openInterest })),
+          nearChain.puts.map(p => ({ strike: p.strike, openInterest: p.openInterest }))
+        );
+
+        const totalCallVol = chains.reduce((s, c) => s + c.calls.reduce((sv, o) => sv + o.volume, 0), 0);
+        const totalPutVol = chains.reduce((s, c) => s + c.puts.reduce((sv, o) => sv + o.volume, 0), 0);
+        const totalCallOI = chains.reduce((s, c) => s + c.calls.reduce((sv, o) => sv + o.openInterest, 0), 0);
+        const totalPutOI = chains.reduce((s, c) => s + c.puts.reduce((sv, o) => sv + o.openInterest, 0), 0);
+        const volumePCR = totalCallVol > 0 ? totalPutVol / totalCallVol : 1;
+        const oiPCR = totalCallOI > 0 ? totalPutOI / totalCallOI : 1;
+
+        const atmTolerance = spotPrice < 20 ? 0.10 : spotPrice < 50 ? 0.05 : 0.02;
+        const atmOpts = [...nearChain.calls, ...nearChain.puts]
+          .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < atmTolerance && o.impliedVolatility > 0.01)
+          .sort((a, b) => Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice));
+        let currentIV = atmOpts.length > 0
+          ? atmOpts.slice(0, 4).reduce((s, o) => s + o.impliedVolatility, 0) / Math.min(4, atmOpts.length)
+          : 0;
+
+        const closes = historyBars.map(b => b.c).reverse();
+        const hvCurrent = computeHistoricalVolatility(closes, 20);
+        if (currentIV === 0 && hvCurrent > 0) currentIV = hvCurrent * 1.15;
+
+        const historicalIVs = closes.slice(0, 252).map((_, i) => {
+          const hv = computeHistoricalVolatility(closes.slice(i), 20);
+          return hv > 0 ? hv * 1.15 : 0;
+        }).filter(v => v > 0);
+        const ivMetrics = computeIVRankPercentile(currentIV, historicalIVs);
+        const ivHvRatio = hvCurrent > 0 ? currentIV / hvCurrent : 1;
+        const skew = computeSkew(nearChain.calls, nearChain.puts, spotPrice);
+        const profile = computeStockProfile(
+          historyBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c })),
+          spotPrice, hvCurrent
+        );
+        const correlationCtx = computeQuickCorrelationCtx(historyBars, hvCurrent);
+
+        const input = {
+          symbol: ticker, spotPrice, totalGEX, totalDEX, gammaFlip, callWall, putWall,
+          maxPain: maxPainResult.strike, volumePCR, oiPCR,
+          totalCallVol, totalPutVol, totalCallOI, totalPutOI,
+          ivRank: ivMetrics.ivRank, ivPercentile: ivMetrics.ivPercentile,
+          currentIV, hvCurrent, ivHvRatio,
+          skewBias: skew.skewBias, skewRatio: skew.skewRatio,
+          changePercent: quote.changePct,
+          atr14: profile.atr14, atrPercent: profile.atrPercent,
+          dailySigma: profile.dailySigma, avgDailyRangePct: profile.avgDailyRangePct,
+          nearestExp: nearExps[0]?.date || '', nearestDTE: nearExps[0]?.dte || 0,
+          weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
+          monthlyExp: nearExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
+          correlationCtx,
+        };
+
+        const rec = generateRecommendations(input);
+
+        return {
+          symbol: ticker,
+          price: spotPrice,
+          changePct: quote.changePct,
+          bias: rec.overallBias,
+          biasScore: rec.biasScore,
+          volRegime: rec.volRegime,
+          gammaRegime: rec.gammaRegime,
+          ivRank: ivMetrics.ivRank,
+          currentIV,
+          hvCurrent,
+          volumePCR,
+          gammaFlip, callWall, putWall,
+          maxPain: maxPainResult.strike,
+          topSignals: rec.signals.filter(s => s.weight !== 0).sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight)).slice(0, 5),
+          atrPercent: profile.atrPercent,
+          dailySigma: profile.dailySigma,
+        };
+      } catch (err) {
+        console.error(`[briefing] Failed ${ticker}:`, err instanceof Error ? err.message : err);
+        return null;
+      }
+    }
+
     // Phase 1: Fetch VIX, DIA quotes + DTCC/FINRA data in parallel with index analysis
     const [vixQuote, diaQuote, swapSummary, regSHOResult, siResult, ...indexResults] = await Promise.all([
       getQuote('VIX').catch(() => null),
@@ -416,7 +394,7 @@ export async function GET() {
         asOf: '',
       })),
       fetchRegSHOWithDate().catch(() => ({ tickers: new Set<string>(), asOf: '' })),
-      fetchShortInterestWithDate().catch(() => ({ data: new Map<string, ShortInterestData>(), asOf: '' })),
+      fetchShortInterestWithDate().catch(() => ({ data: new Map<string, { daysToCover: number; shortInterest: number }>(), asOf: '' })),
       ...KEY_INDICES.map(t => analyzeIndex(t)),
     ]);
 
@@ -433,10 +411,8 @@ export async function GET() {
     const vix = vixQuote ? { price: vixQuote.last, changePct: vixQuote.changePct } : null;
     const dia = diaQuote ? { price: diaQuote.last, changePct: diaQuote.changePct } : null;
 
-    // Reg SHO list
     const regSHOList = Array.from(regSHOResult.tickers).filter(s => /^[A-Z]+$/.test(s)).sort();
 
-    // Short interest highlights
     const shortInterestHighlights: BriefingData['shortInterestHighlights'] = [];
     for (const [sym, data] of siResult.data) {
       if (data.daysToCover > 3) {
@@ -448,11 +424,10 @@ export async function GET() {
     const swapAvailable = swapSummary.asOf !== '' || swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0;
     const finraAvailable = regSHOResult.tickers.size > 0 || siResult.data.size > 0;
 
-    // Generate narrative
     const { narrative, alerts } = generateNarrative(
       indices, vix, swapAvailable,
       { ...swapSummary, available: swapAvailable },
-      regSHOList.length, mag7,
+      regSHOList.length,
     );
 
     const briefing: BriefingData = {
