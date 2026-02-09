@@ -82,6 +82,8 @@ interface DashboardStore {
   metricHistory: DailyMetricRecord[];
   loading: Record<string, boolean>;
   error: string | null;
+  errors: string[];
+  diagnostics: { debug?: unknown; health?: unknown; ranAt?: string } | null;
   lastUpdate: number;
 
   setSymbol: (s: string) => void;
@@ -97,11 +99,18 @@ interface DashboardStore {
   fetchCorrelations: () => Promise<void>;
   loadSymbol: (s: string) => Promise<void>;
   saveAndLoadMetricHistory: () => void;
+  runDiagnostics: () => Promise<void>;
 }
 
 const api = async (path: string) => {
   const res = await fetch(path);
-  if (!res.ok) throw new Error(`${res.status}: ${await res.text().catch(() => 'Error')}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => 'Error');
+    // Truncate HTML bodies to show just enough to identify the error type
+    const isHtml = body.includes('<!DOCTYPE') || body.includes('<html');
+    const truncated = isHtml ? `[HTML error page - serverless function crashed]` : (body.length > 300 ? body.slice(0, 200) + '...' : body);
+    throw new Error(`[${path}] ${res.status}: ${truncated}`);
+  }
   return res.json();
 };
 
@@ -113,18 +122,18 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
   expirations: [], selectedExpiration: null, interval: '1D',
   multiGEX: null, snapshot: null, recommendations: null, correlations: null,
   metricHistory: [],
-  loading: {}, error: null, lastUpdate: 0,
+  loading: {}, error: null, errors: [], diagnostics: null, lastUpdate: 0,
 
   setSymbol: (symbol) => set({ symbol: symbol.toUpperCase() }),
   setInterval: (interval) => { set({ interval }); get().fetchHistory(); },
   setSelectedExpiration: (exp) => { set({ selectedExpiration: exp }); get().fetchChain(); },
 
   fetchQuote: async () => {
-    set(s => ({ loading: { ...s.loading, quote: true }, error: null }));
+    set(s => ({ loading: { ...s.loading, quote: true } }));
     try {
       const quote = await api(`/api/market/quote?symbol=${get().symbol}`);
       set(s => ({ quote, loading: { ...s.loading, quote: false }, lastUpdate: Date.now() }));
-    } catch (e) { set(s => ({ loading: { ...s.loading, quote: false }, error: (e as Error).message })); }
+    } catch (e) { set(s => ({ loading: { ...s.loading, quote: false }, error: (e as Error).message, errors: [...s.errors, (e as Error).message] })); }
   },
 
   fetchHistory: async () => {
@@ -132,7 +141,7 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     try {
       const history = await api(`/api/market/history?symbol=${get().symbol}&interval=${get().interval}`);
       set(s => ({ history, loading: { ...s.loading, history: false } }));
-    } catch (e) { set(s => ({ loading: { ...s.loading, history: false }, error: (e as Error).message })); }
+    } catch (e) { set(s => ({ loading: { ...s.loading, history: false }, error: (e as Error).message, errors: [...s.errors, (e as Error).message] })); }
   },
 
   fetchExpirations: async () => {
@@ -142,7 +151,7 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
       const nearest = expirations[0]?.date || null;
       set(s => ({ expirations, selectedExpiration: nearest, loading: { ...s.loading, expirations: false } }));
       if (nearest) get().fetchChain();
-    } catch (e) { set(s => ({ loading: { ...s.loading, expirations: false }, error: (e as Error).message })); }
+    } catch (e) { set(s => ({ loading: { ...s.loading, expirations: false }, error: (e as Error).message, errors: [...s.errors, (e as Error).message] })); }
   },
 
   fetchChain: async () => {
@@ -152,7 +161,7 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     try {
       const chain = await api(`/api/market/chain?symbol=${symbol}&expiration=${selectedExpiration}`);
       set(s => ({ chain, loading: { ...s.loading, chain: false } }));
-    } catch (e) { set(s => ({ loading: { ...s.loading, chain: false }, error: (e as Error).message })); }
+    } catch (e) { set(s => ({ loading: { ...s.loading, chain: false }, error: (e as Error).message, errors: [...s.errors, (e as Error).message] })); }
   },
 
   fetchMultiGEX: async () => {
@@ -160,7 +169,7 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     try {
       const multiGEX = await api(`/api/market/multi-gex?symbol=${get().symbol}&max=4`);
       set(s => ({ multiGEX, loading: { ...s.loading, multiGEX: false } }));
-    } catch (e) { set(s => ({ loading: { ...s.loading, multiGEX: false }, error: (e as Error).message })); }
+    } catch (e) { set(s => ({ loading: { ...s.loading, multiGEX: false }, error: (e as Error).message, errors: [...s.errors, (e as Error).message] })); }
   },
 
   fetchSnapshot: async () => {
@@ -168,7 +177,7 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     try {
       const snapshot = await api(`/api/market/snapshot?symbol=${get().symbol}`);
       set(s => ({ snapshot, loading: { ...s.loading, snapshot: false } }));
-    } catch (e) { set(s => ({ loading: { ...s.loading, snapshot: false }, error: (e as Error).message })); }
+    } catch (e) { set(s => ({ loading: { ...s.loading, snapshot: false }, error: (e as Error).message, errors: [...s.errors, (e as Error).message] })); }
   },
 
   fetchRecommendations: async () => {
@@ -176,7 +185,7 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     try {
       const recommendations = await api(`/api/market/recommendations?symbol=${get().symbol}`);
       set(s => ({ recommendations, loading: { ...s.loading, recommendations: false } }));
-    } catch (e) { set(s => ({ loading: { ...s.loading, recommendations: false }, error: (e as Error).message })); }
+    } catch (e) { set(s => ({ loading: { ...s.loading, recommendations: false }, error: (e as Error).message, errors: [...s.errors, (e as Error).message] })); }
   },
 
   fetchCorrelations: async () => {
@@ -184,13 +193,12 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     try {
       const correlations = await api(`/api/market/correlations?symbol=${get().symbol}`);
       set(s => ({ correlations, loading: { ...s.loading, correlations: false } }));
-    } catch (e) { set(s => ({ loading: { ...s.loading, correlations: false }, error: (e as Error).message })); }
+    } catch (e) { set(s => ({ loading: { ...s.loading, correlations: false }, error: (e as Error).message, errors: [...s.errors, (e as Error).message] })); }
   },
 
   saveAndLoadMetricHistory: () => {
     const { symbol, multiGEX, snapshot } = get();
     if (!multiGEX || !snapshot) {
-      // Load existing history even if we can't save yet
       const existing = loadMetricHistory(symbol);
       if (existing.length > 0) set({ metricHistory: existing });
       return;
@@ -221,19 +229,33 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     set({ metricHistory: loadMetricHistory(symbol) });
   },
 
+  runDiagnostics: async () => {
+    const diag: { debug?: unknown; health?: unknown; ranAt?: string } = { ranAt: new Date().toISOString() };
+    try {
+      const debugRes = await fetch('/api/debug');
+      diag.debug = debugRes.ok ? await debugRes.json() : { error: `${debugRes.status}: ${await debugRes.text().catch(() => 'Error')}` };
+    } catch (e) { diag.debug = { error: (e as Error).message }; }
+    try {
+      const healthRes = await fetch('/api/health');
+      diag.health = healthRes.ok ? await healthRes.json() : { error: `${healthRes.status}: ${await healthRes.text().catch(() => 'Error')}` };
+    } catch (e) { diag.health = { error: (e as Error).message }; }
+    set({ diagnostics: diag });
+  },
+
   loadSymbol: async (symbol: string) => {
     set({
       symbol: symbol.toUpperCase(), quote: null, history: [], chain: null,
       expirations: [], selectedExpiration: null, multiGEX: null, snapshot: null,
-      recommendations: null, correlations: null, metricHistory: [], error: null,
+      recommendations: null, correlations: null, metricHistory: [], error: null, errors: [],
     });
-    // Load existing metric history from localStorage immediately
     const existing = loadMetricHistory(symbol.toUpperCase());
     if (existing.length > 0) set({ metricHistory: existing });
 
+    // Run diagnostics in background while loading data
+    get().runDiagnostics();
+
     await Promise.allSettled([get().fetchQuote(), get().fetchHistory(), get().fetchExpirations()]);
     await Promise.allSettled([get().fetchMultiGEX(), get().fetchSnapshot(), get().fetchRecommendations(), get().fetchCorrelations()]);
-    // Save today's metrics after all data is loaded
     get().saveAndLoadMetricHistory();
   },
 }));

@@ -22,23 +22,39 @@ import CorrelationPanel from '@/components/dashboard/CorrelationPanel';
 import { Activity, Zap, AlertTriangle, X } from 'lucide-react';
 
 function ErrorBanner() {
-  const { error } = useDashboardStore();
+  const { errors, diagnostics } = useDashboardStore();
   const [dismissed, setDismissed] = useState(false);
 
-  useEffect(() => { setDismissed(false); }, [error]);
+  useEffect(() => { setDismissed(false); }, [errors]);
 
-  if (!error || dismissed) return null;
+  if ((errors.length === 0 && !diagnostics) || dismissed) return null;
+
+  const uniqueErrors = [...new Set(errors)];
 
   return (
-    <div className="bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-3 flex items-start gap-3">
-      <AlertTriangle className="w-4 h-4 text-red-400 mt-0.5 shrink-0" />
-      <div className="flex-1 min-w-0">
-        <div className="text-sm font-semibold text-red-400 mb-1">API Error</div>
-        <pre className="text-xs text-red-300/80 font-mono whitespace-pre-wrap break-all max-h-40 overflow-auto">{error}</pre>
-      </div>
-      <button onClick={() => setDismissed(true)} className="text-red-400/60 hover:text-red-400 shrink-0">
-        <X className="w-4 h-4" />
-      </button>
+    <div className="space-y-2">
+      {uniqueErrors.length > 0 && (
+        <div className="bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-3 flex items-start gap-3">
+          <AlertTriangle className="w-4 h-4 text-red-400 mt-0.5 shrink-0" />
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-semibold text-red-400 mb-1">API Errors ({uniqueErrors.length})</div>
+            {uniqueErrors.map((err, i) => (
+              <pre key={i} className="text-xs text-red-300/80 font-mono whitespace-pre-wrap break-all mb-1 pb-1 border-b border-red-500/10 last:border-0">{err}</pre>
+            ))}
+          </div>
+          <button onClick={() => setDismissed(true)} className="text-red-400/60 hover:text-red-400 shrink-0">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+      {diagnostics && (
+        <details className="bg-blue-500/10 border border-blue-500/30 rounded-lg px-4 py-3" open>
+          <summary className="text-sm font-semibold text-blue-400 cursor-pointer">Diagnostics (/api/debug + /api/health)</summary>
+          <pre className="text-xs text-blue-300/80 font-mono whitespace-pre-wrap break-all mt-2 max-h-60 overflow-auto">
+            {JSON.stringify(diagnostics, null, 2)}
+          </pre>
+        </details>
+      )}
     </div>
   );
 }
