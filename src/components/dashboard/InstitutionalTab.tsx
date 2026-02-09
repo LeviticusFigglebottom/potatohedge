@@ -291,7 +291,7 @@ export default function InstitutionalTab() {
               <div className="flex items-center gap-2">
                 <span className="panel-title flex items-center gap-2">
                   <ShieldAlert className="w-3.5 h-3.5 text-orange-400" />
-                  High Short Interest (OTC)
+                  High Short Interest
                 </span>
                 <DataAge asOf={data.shortInterestAsOf} />
               </div>
@@ -302,7 +302,7 @@ export default function InstitutionalTab() {
                 <div>
                   {data.shortInterestAsOf && (
                     <div className="text-xs text-text-muted/60 font-mono mb-2">
-                      Settlement date: {formatDate(data.shortInterestAsOf)} — FINRA OTC biweekly short interest. Exchange-listed SI requires paid API access.
+                      Settlement date: {formatDate(data.shortInterestAsOf)} — Biweekly short interest (all US exchanges via Polygon).
                     </div>
                   )}
                   <div className="overflow-x-auto">
@@ -338,7 +338,7 @@ export default function InstitutionalTab() {
               ) : (
                 <div className="text-center py-6">
                   <p className="text-sm text-text-muted">No high short-interest data available.</p>
-                  <p className="text-xs text-text-muted/60 mt-1">Free FINRA CDN only covers OTC securities. Exchange-listed (NYSE/NASDAQ) short interest requires OAuth API access. OTC data updates bi-monthly.</p>
+                  <p className="text-xs text-text-muted/60 mt-1">Short interest data updates bi-monthly. No securities currently meet the DTC threshold.</p>
                 </div>
               )}
             </div>
@@ -545,7 +545,7 @@ export default function InstitutionalTab() {
           )}
 
           <div className="text-center text-[10px] text-text-muted/40 font-mono py-2">
-            DTCC Swap Data (S3 archive) &bull; FINRA Reg SHO &amp; Short Volume (api.finra.org) &bull; OTC Short Interest (cdn.finra.org) &bull; Options-derived positioning via Tradier
+            DTCC Swap Data &bull; FINRA Reg SHO &bull; Short Interest &amp; Volume via Polygon.io &bull; Options-derived positioning via Tradier
           </div>
         </>
       )}

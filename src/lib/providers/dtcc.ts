@@ -9,6 +9,8 @@
  * directional flow pressure. Clusters of maturities = forced rebalancing.
  *
  * Source: https://kgc0418-tdw-data-0.s3.amazonaws.com/sec/eod/
+ * Proxy: Set DTCC_PROXY_URL env var to a Cloudflare Worker that proxies S3.
+ *        See workers/dtcc-proxy/ for the worker code.
  */
 
 export interface SwapData {
@@ -38,8 +40,8 @@ function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T
 }
 
 /** Overall budget for the entire fetchSwapData call (prevents serverless timeout).
- * Kept short because DTCC S3 blocks cloud/serverless IPs — no point waiting long. */
-const TOTAL_BUDGET_MS = 3_000;
+ * Budget allows time for proxy attempt + S3 fallback. */
+const TOTAL_BUDGET_MS = 6_000;
 
 /**
  * Inflate raw deflate data using the Web API DecompressionStream.
@@ -216,13 +218,54 @@ export async function fetchSwapData(): Promise<SwapResult> {
 async function fetchSwapDataInner(): Promise<SwapResult> {
   const today = new Date().toISOString().slice(0, 10);
   const weekEnd = getWeekEnd(today);
-  const recentDays = getRecentBusinessDays(2); // Only check last 2 business days
+  const recentDays = getRecentBusinessDays(2);
   const deadline = Date.now() + TOTAL_BUDGET_MS;
+  const proxyUrl = process.env.DTCC_PROXY_URL;
 
-  // Try S3-hosted cumulative equity reports, most recent first
-  // Try both naming variants in PARALLEL for each date to reduce total time
+  // ── Try Cloudflare Worker proxy first (bypasses S3 IP blocking) ──
+  if (proxyUrl) {
+    for (const reportDate of recentDays) {
+      if (Date.now() > deadline - 1000) break;
+      try {
+        const remaining = Math.max(deadline - Date.now(), 1000);
+        const res = await fetch(`${proxyUrl}?date=${reportDate}`, {
+          signal: AbortSignal.timeout(Math.min(2500, remaining)),
+        });
+
+        if (!res.ok) {
+          console.log(`[DTCC] Proxy returned ${res.status} for ${reportDate}`);
+          continue;
+        }
+
+        const buffer = new Uint8Array(await res.arrayBuffer());
+        if (buffer.length < 100) continue;
+
+        let csvText: string;
+        if (buffer[0] === 0x50 && buffer[1] === 0x4b) {
+          csvText = await extractFirstFileFromZip(buffer);
+        } else {
+          csvText = new TextDecoder().decode(buffer);
+        }
+
+        if (csvText.length < 50 || csvText.includes('<html')) continue;
+
+        const map = parseSwapCSV(csvText, today, weekEnd);
+        if (map.size > 0) {
+          const result: SwapResult = { data: map, asOf: reportDate };
+          swapCache = { result, timestamp: Date.now() };
+          console.log(`[DTCC] Proxy: ${csvText.split('\n').length} rows → ${map.size} tickers (${reportDate})`);
+          return result;
+        }
+      } catch (err) {
+        console.log(`[DTCC] Proxy error for ${reportDate}:`, err instanceof Error ? err.message : String(err));
+      }
+    }
+    console.log('[DTCC] Proxy returned no data, trying S3 direct...');
+  }
+
+  // ── Fallback: Direct S3 (blocked from most cloud IPs) ──
   for (const reportDate of recentDays) {
-    if (Date.now() > deadline - 1000) break; // leave 1s margin
+    if (Date.now() > deadline - 1000) break;
     const s3Date = formatS3Date(reportDate);
     const remaining = Math.max(deadline - Date.now(), 1000);
     const perReqTimeout = Math.min(2000, remaining);
@@ -232,7 +275,6 @@ async function fetchSwapDataInner(): Promise<SwapResult> {
       `https://kgc0418-tdw-data-0.s3.amazonaws.com/sec/eod/SEC_CUMULATIVE_EQUITIES_${s3Date}.zip`,
     ];
 
-    // Race both variants — take whichever succeeds first
     const results = await Promise.allSettled(urls.map(async (url) => {
       const res = await fetch(url, {
         headers: {
@@ -272,13 +314,13 @@ async function fetchSwapDataInner(): Promise<SwapResult> {
       if (map.size > 0) {
         const result: SwapResult = { data: map, asOf: reportDate };
         swapCache = { result, timestamp: Date.now() };
-        console.log(`[DTCC] Parsed ${r.value.split('\n').length} rows → ${map.size} tickers (report date: ${reportDate})`);
+        console.log(`[DTCC] S3 direct: ${r.value.split('\n').length} rows → ${map.size} tickers (${reportDate})`);
         return result;
       }
     }
   }
 
-  console.log('[DTCC] No data found from S3 endpoints');
+  console.log('[DTCC] No data found from proxy or S3');
   const emptyResult: SwapResult = { data: new Map(), asOf: '' };
   swapCache = { result: emptyResult, timestamp: Date.now() };
   return emptyResult;

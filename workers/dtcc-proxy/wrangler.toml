@@ -1,0 +1,7 @@
+name = "dtcc-proxy"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+
+# Free tier: 100K requests/day — more than enough for hourly cache refreshes
+# Deploy: npx wrangler deploy
+# Then set DTCC_PROXY_URL in Vercel env vars to the deployed URL
