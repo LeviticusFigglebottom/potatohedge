@@ -183,8 +183,10 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
   fetchRecommendations: async () => {
     set(s => ({ loading: { ...s.loading, recommendations: true } }));
     try {
-      const recommendations = await api(`/api/market/recommendations?symbol=${get().symbol}`);
-      set(s => ({ recommendations, loading: { ...s.loading, recommendations: false } }));
+      const data = await api(`/api/market/recs?symbol=${get().symbol}`);
+      // Validate response shape — stripped/debug routes may return different shapes
+      const valid = data && Array.isArray(data.signals) && Array.isArray(data.trades);
+      set(s => ({ recommendations: valid ? data : null, loading: { ...s.loading, recommendations: false } }));
     } catch (e) { set(s => ({ loading: { ...s.loading, recommendations: false }, error: (e as Error).message, errors: [...s.errors, (e as Error).message] })); }
   },
 
@@ -249,13 +251,23 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     // Test 3: stripped /recommendations (bare minimum — just returns JSON)
     try {
       const r = await fetch(`/api/market/recommendations?symbol=${sym}`);
-      diag.recsStripped = r.ok ? await r.json() : { status: r.status, html: r.headers.get('content-type')?.includes('html') };
+      const ct = r.headers.get('content-type') || '';
+      if (ct.includes('json')) {
+        diag.recsStripped = { _status: r.status, ...(await r.json()) };
+      } else {
+        diag.recsStripped = { _status: r.status, html: ct.includes('html'), contentType: ct };
+      }
     } catch (e) { diag.recsStripped = { error: (e as Error).message }; }
 
-    // Test 4: new /recs endpoint (full computation at fresh path)
+    // Test 4: new /recs endpoint (full computation at fresh path — step-by-step diagnostics)
     try {
       const r = await fetch(`/api/market/recs?symbol=${sym}`);
-      diag.recsFull = r.ok ? await r.json() : { status: r.status, html: r.headers.get('content-type')?.includes('html') };
+      const ct = r.headers.get('content-type') || '';
+      if (ct.includes('json')) {
+        diag.recsFull = { _status: r.status, ...(await r.json()) };
+      } else {
+        diag.recsFull = { _status: r.status, html: ct.includes('html'), contentType: ct };
+      }
     } catch (e) { diag.recsFull = { error: (e as Error).message }; }
 
     set({ diagnostics: diag });
