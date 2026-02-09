@@ -1,4 +1,22 @@
 import { NextResponse } from 'next/server';
+import { getQuote, getExpirations, getOptionsChain } from '@/lib/providers/tradier';
+import { fetchEquityBars } from '@/lib/providers/equityBars';
+import {
+  computeDealerExposureFromChain,
+  findGammaFlip,
+  findCallWall,
+  findPutWall,
+  computeMaxPain,
+} from '@/lib/math/blackScholes';
+import {
+  computeHistoricalVolatility,
+  computeIVRankPercentile,
+  computeSkew,
+  computeStockProfile,
+} from '@/lib/math/analytics';
+import { generateRecommendations } from '@/lib/math/recommendations';
+import { getMarketSwapSummary } from '@/lib/providers/dtcc';
+import { fetchRegSHOWithDate, fetchShortInterestWithDate } from '@/lib/providers/finra';
 
 export const maxDuration = 120;
 
@@ -244,25 +262,6 @@ function generateNarrative(
 
 export async function GET() {
   try {
-    // Dynamic imports — catches module-level errors that static imports would hide
-    const [tradierMod, barsMod, bsMod, analyticsMod, recMod, dtccMod, finraMod] = await Promise.all([
-      import('@/lib/providers/tradier').catch(e => { throw new Error(`Failed to import tradier: ${e.message}`); }),
-      import('@/lib/providers/equityBars').catch(e => { throw new Error(`Failed to import equityBars: ${e.message}`); }),
-      import('@/lib/math/blackScholes').catch(e => { throw new Error(`Failed to import blackScholes: ${e.message}`); }),
-      import('@/lib/math/analytics').catch(e => { throw new Error(`Failed to import analytics: ${e.message}`); }),
-      import('@/lib/math/recommendations').catch(e => { throw new Error(`Failed to import recommendations: ${e.message}`); }),
-      import('@/lib/providers/dtcc').catch(e => { throw new Error(`Failed to import dtcc: ${e.message}`); }),
-      import('@/lib/providers/finra').catch(e => { throw new Error(`Failed to import finra: ${e.message}`); }),
-    ]);
-
-    const { getQuote, getExpirations, getOptionsChain } = tradierMod;
-    const { fetchEquityBars } = barsMod;
-    const { computeDealerExposureFromChain, findGammaFlip, findCallWall, findPutWall, computeMaxPain } = bsMod;
-    const { computeHistoricalVolatility, computeIVRankPercentile, computeSkew, computeStockProfile } = analyticsMod;
-    const { generateRecommendations } = recMod;
-    const { getMarketSwapSummary } = dtccMod;
-    const { fetchRegSHOWithDate, fetchShortInterestWithDate } = finraMod;
-
     /** Run full GEX/IV/flow analysis for a single ticker */
     async function analyzeIndex(ticker: string): Promise<IndexAnalysis | null> {
       try {

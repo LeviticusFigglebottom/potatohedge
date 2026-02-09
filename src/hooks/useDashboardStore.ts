@@ -183,7 +183,7 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
   fetchRecommendations: async () => {
     set(s => ({ loading: { ...s.loading, recommendations: true } }));
     try {
-      const data = await api(`/api/market/recs?symbol=${get().symbol}`);
+      const data = await api(`/api/market/recommendations?symbol=${get().symbol}`);
       // Validate response shape — stripped/debug routes may return different shapes
       const valid = data && Array.isArray(data.signals) && Array.isArray(data.trades);
       set(s => ({ recommendations: valid ? data : null, loading: { ...s.loading, recommendations: false } }));
