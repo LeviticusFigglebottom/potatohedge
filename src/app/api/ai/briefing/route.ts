@@ -20,7 +20,7 @@ import { getMarketSwapSummary } from '@/lib/providers/dtcc';
 import { fetchRegSHOThreshold, fetchShortInterest, fetchShortSaleVolume, type ShortInterestData, type ShortVolumeData } from '@/lib/providers/finra';
 import { scanMarketFlow, type FlowResult } from '@/lib/providers/polygonFlow';
 
-export const maxDuration = 60;
+export const maxDuration = 60; // Briefing: scan 21 stocks + Claude analysis
 
 // Stocks to analyze for the briefing
 const INDICES = ['SPY', 'QQQ', 'IWM'];
