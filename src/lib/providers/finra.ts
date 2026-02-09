@@ -210,48 +210,59 @@ async function fetchShortInterestInner(): Promise<Map<string, ShortInterestData>
   let asOf = '';
   const deadline = Date.now() + TOTAL_BUDGET_MS;
 
-  // Try recent settlement dates (short interest publishes ~2x/month around 15th and end-of-month)
-  // We look back up to 2 business days; if nothing found, fallback query without date
-  const recentDays = getRecentBusinessDays(2);
+  // Short interest publishes bi-monthly (~15th and end of month).
+  // Try the dateless query FIRST — it returns the latest available data sorted by date.
+  // This is much faster than guessing specific dates that may not have data.
+  try {
+    const remaining = Math.max(deadline - Date.now(), 1000);
+    const res = await fetch('https://api.finra.org/data/group/otcMarket/name/equityShortInterestStandardized', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({
+        fields: ['issueSymbolIdentifier', 'currentShortPositionQuantity', 'averageDailyVolumeQuantity', 'daysToCoverQuantity', 'settlementDate'],
+        limit: 100,
+        sortFields: ['-settlementDate'],
+      }),
+      signal: AbortSignal.timeout(Math.min(3000, remaining)),
+    });
 
-  for (const settlementDate of recentDays) {
-    if (Date.now() > deadline - 1000) break;
-    try {
-      const page = await fetchSIPage(settlementDate, 0);
-      if (page.records.length === 0) continue;
+    const contentType = res.headers.get('content-type') || '';
+    if (res.ok && contentType.includes('json')) {
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) {
+        asOf = data[0]?.settlementDate || '';
+        processSIRecords(data, map);
 
-      // Found data! Load all records for this date
-      asOf = settlementDate;
-      processSIRecords(page.records, map);
+        // If we got data with a settlement date, paginate for more records of that date
+        if (asOf && map.size >= 100 && Date.now() < deadline - 1000) {
+          const page2 = await fetchSIPage(asOf, 100);
+          if (page2.records.length > 0) {
+            processSIRecords(page2.records, map);
+            if (page2.records.length >= 100 && Date.now() < deadline - 1000) {
+              const page3 = await fetchSIPage(asOf, 200);
+              if (page3.records.length > 0) processSIRecords(page3.records, map);
+            }
+          }
+        }
 
-      // Paginate if needed (max 100 per request, cap at 3 pages = 300 records)
-      let offset = page.records.length;
-      let pages = 1;
-      while (page.records.length >= 100 && pages < 3 && Date.now() < deadline - 1000) {
-        const nextPage = await fetchSIPage(settlementDate, offset);
-        if (nextPage.records.length === 0) break;
-        processSIRecords(nextPage.records, map);
-        offset += nextPage.records.length;
-        pages++;
-        if (nextPage.records.length < 100) break;
+        console.log(`[FINRA] Short interest: ${map.size} securities (latest settlement: ${asOf})`);
       }
-
-      console.log(`[FINRA] Short interest: ${map.size} securities loaded (settlement: ${settlementDate})`);
-      break; // found data, stop looking back
-    } catch (err) {
-      console.log(`[FINRA] SI error for ${settlementDate}:`, err instanceof Error ? err.message : String(err));
+    } else {
+      console.log(`[FINRA] SI dateless query: ${res.status} (${contentType})`);
     }
+  } catch (err) {
+    console.log(`[FINRA] SI dateless query error:`, err instanceof Error ? err.message : String(err));
   }
 
-  // If date-specific queries all failed, try without date filter to get whatever's latest
-  if (map.size === 0 && Date.now() < deadline - 1000) {
+  // Fallback: try the equityShortInterest (non-standardized) endpoint if standardized returned nothing
+  if (map.size === 0 && Date.now() < deadline - 1500) {
     try {
       const remaining = Math.max(deadline - Date.now(), 1000);
-      const res = await fetch('https://api.finra.org/data/group/otcMarket/name/equityShortInterestStandardized', {
+      const res = await fetch('https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({
-          fields: ['issueSymbolIdentifier', 'currentShortPositionQuantity', 'averageDailyVolumeQuantity', 'daysToCoverQuantity', 'settlementDate'],
+          fields: ['symbolCode', 'currentShortPositionQuantity', 'averageDailyVolumeQuantity', 'daysToCoverQuantity', 'settlementDate'],
           limit: 100,
           sortFields: ['-settlementDate'],
         }),
@@ -264,7 +275,7 @@ async function fetchShortInterestInner(): Promise<Map<string, ShortInterestData>
         if (Array.isArray(data) && data.length > 0) {
           asOf = data[0]?.settlementDate || '';
           processSIRecords(data, map);
-          console.log(`[FINRA] Short interest (no date filter): ${map.size} securities (latest: ${asOf})`);
+          console.log(`[FINRA] Short interest (consolidated fallback): ${map.size} securities (latest: ${asOf})`);
         }
       }
     } catch { /* silent */ }
