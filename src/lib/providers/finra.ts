@@ -15,11 +15,12 @@
  */
 
 export interface ShortInterestData {
-  shortInterest: number;        // total shares short
+  shortInterest: number;        // total shares short (current period)
+  previousShortInterest: number; // previous period's short position
+  changePercent: number;         // % change from previous period
   avgDailyVolume: number;       // for computing days-to-cover
   daysToCover: number;          // shortInterest / avgDailyVolume
   settlementDate: string;       // date of the SI report
-  percentOfFloat?: number;      // if available
 }
 
 /** Daily short sale volume data from regShoDaily (no auth required) */
@@ -404,6 +405,8 @@ function parseCSVLines(
     if (si <= 0) continue;
 
     const adv = avgIdx >= 0 ? Math.abs(parseFloat(fields[avgIdx]) || 0) : 0;
+    const prevSI = prevIdx >= 0 ? Math.abs(parseFloat(fields[prevIdx]) || 0) : 0;
+    const changePct = prevSI > 0 ? ((si - prevSI) / prevSI) * 100 : 0;
 
     // Use CSV-provided DTC when available; 999.99 means avg vol = 0 (N/A)
     let dtc: number;
@@ -421,6 +424,8 @@ function parseCSVLines(
 
     map.set(sym, {
       shortInterest: si,
+      previousShortInterest: prevSI,
+      changePercent: Math.round(changePct * 100) / 100,
       avgDailyVolume: adv,
       daysToCover: Math.min(dtc, 200),
       settlementDate: settleDate,

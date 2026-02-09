@@ -71,7 +71,7 @@ export interface BriefingData {
   };
   regSHOList: string[];
   regSHOAsOf: string;
-  shortInterestHighlights: { symbol: string; daysToCover: number; shortInterest: number }[];
+  shortInterestHighlights: { symbol: string; daysToCover: number; shortInterest: number; previousShortInterest: number; changePercent: number; avgDailyVolume: number }[];
   shortInterestAsOf: string;
   shortVolumeHighlights: { symbol: string; shortVolume: number; totalVolume: number; shortRatio: number }[];
   shortVolumeAsOf: string;
@@ -452,7 +452,7 @@ export async function GET() {
       asOf: '',
     };
     const emptyRegSHO = { tickers: new Set<string>(), asOf: '' };
-    const emptySI = { data: new Map<string, { daysToCover: number; shortInterest: number; avgDailyVolume: number }>(), asOf: '' };
+    const emptySI = { data: new Map<string, { daysToCover: number; shortInterest: number; previousShortInterest: number; changePercent: number; avgDailyVolume: number }>(), asOf: '' };
     const emptySV = { data: new Map<string, ShortVolumeData>(), asOf: '' };
 
     // Independent per-provider timeouts — so DTCC being slow doesn't block RegSHO/SI
@@ -494,7 +494,14 @@ export async function GET() {
     for (const [sym, data] of siResult.data) {
       // DTC 3-100 range, meaningful position size, reasonable liquidity
       if (data.daysToCover >= 3 && data.daysToCover <= 100 && data.shortInterest >= 50000 && data.avgDailyVolume >= 1000) {
-        shortInterestHighlights.push({ symbol: sym, daysToCover: data.daysToCover, shortInterest: data.shortInterest });
+        shortInterestHighlights.push({
+          symbol: sym,
+          daysToCover: data.daysToCover,
+          shortInterest: data.shortInterest,
+          previousShortInterest: data.previousShortInterest ?? 0,
+          changePercent: data.changePercent ?? 0,
+          avgDailyVolume: data.avgDailyVolume,
+        });
       }
     }
     shortInterestHighlights.sort((a, b) => b.daysToCover - a.daysToCover);

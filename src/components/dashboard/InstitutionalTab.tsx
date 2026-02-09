@@ -24,6 +24,9 @@ interface InstitutionalData {
     symbol: string;
     daysToCover: number;
     shortInterest: number;
+    previousShortInterest: number;
+    changePercent: number;
+    avgDailyVolume: number;
   }[];
   shortInterestAsOf: string;
   shortVolumeHighlights?: {
@@ -307,21 +310,30 @@ export default function InstitutionalTab() {
                       <thead>
                         <tr className="border-b border-border/30">
                           <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Symbol</th>
-                          <th className="px-3 py-2 text-right text-xs font-mono text-text-muted">Days to Cover</th>
+                          <th className="px-3 py-2 text-right text-xs font-mono text-text-muted">DTC</th>
                           <th className="px-3 py-2 text-right text-xs font-mono text-text-muted">Short Interest</th>
+                          <th className="px-3 py-2 text-right text-xs font-mono text-text-muted">Chg %</th>
+                          <th className="px-3 py-2 text-right text-xs font-mono text-text-muted">Avg Daily Vol</th>
                         </tr>
                       </thead>
                       <tbody>
                         {data.shortInterestHighlights.map((s, idx) => (
                           <tr key={s.symbol} className={`border-b border-border/10 hover:bg-bg-hover/50 cursor-pointer transition-colors ${idx % 2 === 0 ? 'bg-bg-secondary/30' : ''}`} onClick={() => navigateToStock(s.symbol)}>
                             <td className="px-3 py-2 font-mono font-semibold text-text-primary">{s.symbol}</td>
-                            <td className={`px-3 py-2 font-mono text-right ${s.daysToCover > 5 ? 'text-orange-400 font-semibold' : 'text-yellow-400'}`}>{s.daysToCover.toFixed(1)}d</td>
-                            <td className="px-3 py-2 font-mono text-right text-text-muted">{(s.shortInterest / 1e6).toFixed(2)}M shares</td>
+                            <td className={`px-3 py-2 font-mono text-right ${s.daysToCover > 20 ? 'text-orange-400 font-semibold' : s.daysToCover > 10 ? 'text-yellow-400' : 'text-text-secondary'}`}>{s.daysToCover.toFixed(1)}d</td>
+                            <td className="px-3 py-2 font-mono text-right text-text-secondary">{formatVolume(s.shortInterest)}</td>
+                            <td className={`px-3 py-2 font-mono text-right font-semibold ${s.changePercent > 0 ? 'text-red-400' : s.changePercent < 0 ? 'text-green-400' : 'text-text-muted'}`}>
+                              {s.changePercent !== 0 ? `${s.changePercent > 0 ? '+' : ''}${s.changePercent.toFixed(1)}%` : '—'}
+                            </td>
+                            <td className="px-3 py-2 font-mono text-right text-text-muted">{formatVolume(s.avgDailyVolume)}</td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
                   </div>
+                  <p className="text-[10px] text-text-muted/50 mt-2 px-3">
+                    DTC = Days to Cover (SI / avg daily vol). Chg % = change vs prior biweekly period. Red = SI increasing (more bearish), Green = SI decreasing.
+                  </p>
                 </div>
               ) : (
                 <div className="text-center py-6">
