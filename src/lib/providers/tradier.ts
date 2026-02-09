@@ -26,7 +26,10 @@ export async function getQuote(symbol: string): Promise<Quote> {
     { headers: getHeaders(token), next: { revalidate: 5 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) }
   );
 
-  if (!res.ok) throw new Error(`Tradier quote error: ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Tradier quote error: ${res.status} ${body.slice(0, 200)}`);
+  }
   const data = await res.json();
 
   const q = data.quotes?.quote;
@@ -91,7 +94,10 @@ export async function getHistory(
   }
 
   const res = await fetch(url, { headers: getHeaders(token), next: { revalidate: 30 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
-  if (!res.ok) throw new Error(`Tradier history error: ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Tradier history error: ${res.status} ${body.slice(0, 200)}`);
+  }
   const data = await res.json();
 
   if (isIntraday) {
@@ -130,7 +136,10 @@ export async function getExpirations(symbol: string): Promise<OptionExpiration[]
     { headers: getHeaders(token), next: { revalidate: 300 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) }
   );
 
-  if (!res.ok) throw new Error(`Tradier expirations error: ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Tradier expirations error: ${res.status} ${body.slice(0, 200)}`);
+  }
   const data = await res.json();
 
   const expirations = data.expirations?.expiration;
@@ -160,7 +169,10 @@ export async function getOptionsChain(symbol: string, expiration: string): Promi
     { headers: getHeaders(token), next: { revalidate: 10 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) }
   );
 
-  if (!res.ok) throw new Error(`Tradier chain error: ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Tradier chain error: ${res.status} ${body.slice(0, 200)}`);
+  }
   const data = await res.json();
 
   // Get underlying price
