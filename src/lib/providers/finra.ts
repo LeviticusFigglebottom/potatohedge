@@ -34,6 +34,17 @@ let shortInterestCache: { result: ShortInterestResult; timestamp: number } | nul
 const REG_SHO_TTL = 3600_000;     // 1 hour
 const SI_TTL = 3600_000 * 4;       // 4 hours (data only updates bi-monthly)
 
+/** Race a promise against a hard deadline. Returns fallback on timeout. */
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms)),
+  ]);
+}
+
+/** Overall budget for each FINRA function (prevents serverless timeout) */
+const TOTAL_BUDGET_MS = 6_000;
+
 /**
  * Get recent business days going back from today, most recent first.
  */
@@ -63,12 +74,20 @@ export async function fetchRegSHOThreshold(): Promise<Set<string>> {
     return regSHOCache.result.tickers;
   }
 
-  const recentDays = getRecentBusinessDays(3); // Only check last 3 business days
+  // Wrap in overall timeout budget to prevent serverless timeout
+  return withTimeout(fetchRegSHOThresholdInner(), TOTAL_BUDGET_MS, new Set<string>());
+}
+
+async function fetchRegSHOThresholdInner(): Promise<Set<string>> {
+  const recentDays = getRecentBusinessDays(2); // Only check last 2 business days
+  const deadline = Date.now() + TOTAL_BUDGET_MS;
 
   // Try the FINRA API with correct dataset name: ThresholdList
   for (const tradeDate of recentDays) {
+    if (Date.now() > deadline - 1000) break; // leave 1s margin
     try {
       const tickers = new Set<string>();
+      const remaining = Math.max(deadline - Date.now(), 1000);
 
       const res = await fetch('https://api.finra.org/data/group/otcMarket/name/ThresholdList', {
         method: 'POST',
@@ -87,14 +106,14 @@ export async function fetchRegSHOThreshold(): Promise<Set<string>> {
             },
           ],
         }),
-        signal: AbortSignal.timeout(6000),
+        signal: AbortSignal.timeout(Math.min(3000, remaining)),
       });
 
       const contentType = res.headers.get('content-type') || '';
       if (!res.ok || !contentType.includes('json')) {
         console.log(`[FINRA] Reg SHO API: ${res.status} (${contentType}) for ${tradeDate}`);
         // If API returns non-JSON, it might be blocked. Try archive once.
-        if (tradeDate === recentDays[0]) {
+        if (tradeDate === recentDays[0] && Date.now() < deadline - 1000) {
           const archiveTickers = await fetchRegSHOFromArchive(tradeDate);
           if (archiveTickers.size > 0) {
             regSHOCache = { result: { tickers: archiveTickers, asOf: tradeDate }, timestamp: Date.now() };
@@ -145,7 +164,7 @@ async function fetchRegSHOFromArchive(date: string): Promise<Set<string>> {
   try {
     const res = await fetch(url, {
       headers: { 'Accept': 'text/plain, text/csv' },
-      signal: AbortSignal.timeout(6000),
+      signal: AbortSignal.timeout(3000),
     });
 
     if (!res.ok) return tickers;
@@ -182,14 +201,21 @@ export async function fetchShortInterest(): Promise<Map<string, ShortInterestDat
     return shortInterestCache.result.data;
   }
 
+  // Wrap in overall timeout budget to prevent serverless timeout
+  return withTimeout(fetchShortInterestInner(), TOTAL_BUDGET_MS, new Map<string, ShortInterestData>());
+}
+
+async function fetchShortInterestInner(): Promise<Map<string, ShortInterestData>> {
   const map = new Map<string, ShortInterestData>();
   let asOf = '';
+  const deadline = Date.now() + TOTAL_BUDGET_MS;
 
   // Try recent settlement dates (short interest publishes ~2x/month around 15th and end-of-month)
-  // We look back up to 5 business days; if nothing found, fallback query without date
-  const recentDays = getRecentBusinessDays(5);
+  // We look back up to 2 business days; if nothing found, fallback query without date
+  const recentDays = getRecentBusinessDays(2);
 
   for (const settlementDate of recentDays) {
+    if (Date.now() > deadline - 1000) break;
     try {
       const page = await fetchSIPage(settlementDate, 0);
       if (page.records.length === 0) continue;
@@ -198,10 +224,10 @@ export async function fetchShortInterest(): Promise<Map<string, ShortInterestDat
       asOf = settlementDate;
       processSIRecords(page.records, map);
 
-      // Paginate if needed (max 100 per request, cap at 10 pages = 1000 records)
+      // Paginate if needed (max 100 per request, cap at 3 pages = 300 records)
       let offset = page.records.length;
       let pages = 1;
-      while (page.records.length >= 100 && pages < 10) {
+      while (page.records.length >= 100 && pages < 3 && Date.now() < deadline - 1000) {
         const nextPage = await fetchSIPage(settlementDate, offset);
         if (nextPage.records.length === 0) break;
         processSIRecords(nextPage.records, map);
@@ -218,8 +244,9 @@ export async function fetchShortInterest(): Promise<Map<string, ShortInterestDat
   }
 
   // If date-specific queries all failed, try without date filter to get whatever's latest
-  if (map.size === 0) {
+  if (map.size === 0 && Date.now() < deadline - 1000) {
     try {
+      const remaining = Math.max(deadline - Date.now(), 1000);
       const res = await fetch('https://api.finra.org/data/group/otcMarket/name/equityShortInterestStandardized', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -228,7 +255,7 @@ export async function fetchShortInterest(): Promise<Map<string, ShortInterestDat
           limit: 100,
           sortFields: ['-settlementDate'],
         }),
-        signal: AbortSignal.timeout(6000),
+        signal: AbortSignal.timeout(Math.min(3000, remaining)),
       });
 
       const contentType = res.headers.get('content-type') || '';
@@ -273,7 +300,7 @@ async function fetchSIPage(settlementDate: string, offset: number): Promise<{ re
         },
       ],
     }),
-    signal: AbortSignal.timeout(6000),
+    signal: AbortSignal.timeout(3000),
   });
 
   const contentType = res.headers.get('content-type') || '';

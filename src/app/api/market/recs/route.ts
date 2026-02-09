@@ -89,15 +89,27 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ steps, completedAt: 'chain' }, { status: 500 });
   }
 
-  // Step 6: DTCC + FINRA
+  // Step 6: DTCC + FINRA (with 6s hard budget)
   const t5 = Date.now();
   try {
-    const [swap, regSHO, si] = await Promise.all([
+    const instPromise = Promise.all([
       dtccMod.getSwapDataForTicker(ticker).catch(() => null),
       finraMod.fetchRegSHOThreshold().catch(() => new Set<string>()),
       finraMod.getShortInterestForTicker(ticker).catch(() => null),
     ]);
-    steps.institutional = { ok: true, ms: Date.now() - t5, data: { swap: !!swap, regSHO: regSHO.size, si: !!si } };
+    const instFallback: [null, Set<string>, null] = [null, new Set<string>(), null];
+    const [swap, regSHO, si] = await Promise.race([
+      instPromise,
+      new Promise<typeof instFallback>(resolve =>
+        setTimeout(() => resolve(instFallback), 6000)
+      ),
+    ]);
+    const timedOut = Date.now() - t5 > 5900;
+    steps.institutional = {
+      ok: !timedOut,
+      ms: Date.now() - t5,
+      data: { swap: !!swap, regSHO: regSHO.size, si: !!si, timedOut },
+    };
   } catch (e) {
     steps.institutional = { ok: false, ms: Date.now() - t5, error: (e as Error).message };
   }

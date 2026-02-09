@@ -18,7 +18,7 @@ import { generateRecommendations } from '@/lib/math/recommendations';
 import { getMarketSwapSummary } from '@/lib/providers/dtcc';
 import { fetchRegSHOWithDate, fetchShortInterestWithDate } from '@/lib/providers/finra';
 
-export const maxDuration = 120;
+export const maxDuration = 30;
 
 const KEY_INDICES = ['SPY', 'QQQ', 'IWM'];
 const MAG7 = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA'];
@@ -382,20 +382,40 @@ export async function GET() {
       }
     }
 
-    // Phase 1: Fetch VIX, DIA quotes + DTCC/FINRA data in parallel with index analysis
-    const [vixQuote, diaQuote, swapSummary, regSHOResult, siResult, ...indexResults] = await Promise.all([
+    // Phase 1: Fetch VIX, DIA quotes + index analysis + DTCC/FINRA data (with hard timeout)
+    const emptySwap = {
+      totalMaturitiesToday: 0, totalNotionalToday: 0,
+      totalMaturitiesWeek: 0, totalNotionalWeek: 0,
+      topMaturities: [] as { symbol: string; count: number; notional: number }[],
+      asOf: '',
+    };
+    const emptyRegSHO = { tickers: new Set<string>(), asOf: '' };
+    const emptySI = { data: new Map<string, { daysToCover: number; shortInterest: number }>(), asOf: '' };
+
+    // Wrap institutional data in a 7s hard budget so it never blocks the response
+    const institutionalPromise = Promise.all([
+      getMarketSwapSummary().catch(() => emptySwap),
+      fetchRegSHOWithDate().catch(() => emptyRegSHO),
+      fetchShortInterestWithDate().catch(() => emptySI),
+    ]);
+    const institutionalRace = Promise.race([
+      institutionalPromise,
+      new Promise<[typeof emptySwap, typeof emptyRegSHO, typeof emptySI]>(resolve =>
+        setTimeout(() => {
+          console.log('[briefing] Institutional data timeout — using empty fallback');
+          resolve([emptySwap, emptyRegSHO, emptySI]);
+        }, 7000)
+      ),
+    ]);
+
+    const [vixQuote, diaQuote, institutionalData, ...indexResults] = await Promise.all([
       getQuote('VIX').catch(() => null),
       getQuote('DIA').catch(() => null),
-      getMarketSwapSummary().catch(() => ({
-        totalMaturitiesToday: 0, totalNotionalToday: 0,
-        totalMaturitiesWeek: 0, totalNotionalWeek: 0,
-        topMaturities: [] as { symbol: string; count: number; notional: number }[],
-        asOf: '',
-      })),
-      fetchRegSHOWithDate().catch(() => ({ tickers: new Set<string>(), asOf: '' })),
-      fetchShortInterestWithDate().catch(() => ({ data: new Map<string, { daysToCover: number; shortInterest: number }>(), asOf: '' })),
+      institutionalRace,
       ...KEY_INDICES.map(t => analyzeIndex(t)),
     ]);
+
+    const [swapSummary, regSHOResult, siResult] = institutionalData;
 
     const indices = indexResults.filter((r): r is IndexAnalysis => r !== null);
 
