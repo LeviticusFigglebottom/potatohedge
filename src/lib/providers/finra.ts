@@ -63,7 +63,7 @@ export async function fetchRegSHOThreshold(): Promise<Set<string>> {
     return regSHOCache.result.tickers;
   }
 
-  const recentDays = getRecentBusinessDays(7);
+  const recentDays = getRecentBusinessDays(3); // Only check last 3 business days
 
   // Try the FINRA API with correct dataset name: ThresholdList
   for (const tradeDate of recentDays) {
@@ -87,18 +87,20 @@ export async function fetchRegSHOThreshold(): Promise<Set<string>> {
             },
           ],
         }),
-        signal: AbortSignal.timeout(10000),
+        signal: AbortSignal.timeout(6000),
       });
 
       const contentType = res.headers.get('content-type') || '';
       if (!res.ok || !contentType.includes('json')) {
         console.log(`[FINRA] Reg SHO API: ${res.status} (${contentType}) for ${tradeDate}`);
-        // On non-200, try archive fallback for this date before moving to next day
-        const archiveTickers = await fetchRegSHOFromArchive(tradeDate);
-        if (archiveTickers.size > 0) {
-          regSHOCache = { result: { tickers: archiveTickers, asOf: tradeDate }, timestamp: Date.now() };
-          console.log(`[FINRA] Reg SHO from archive: ${archiveTickers.size} securities (${tradeDate})`);
-          return archiveTickers;
+        // If API returns non-JSON, it might be blocked. Try archive once.
+        if (tradeDate === recentDays[0]) {
+          const archiveTickers = await fetchRegSHOFromArchive(tradeDate);
+          if (archiveTickers.size > 0) {
+            regSHOCache = { result: { tickers: archiveTickers, asOf: tradeDate }, timestamp: Date.now() };
+            console.log(`[FINRA] Reg SHO from archive: ${archiveTickers.size} securities (${tradeDate})`);
+            return archiveTickers;
+          }
         }
         continue;
       }
@@ -119,17 +121,6 @@ export async function fetchRegSHOThreshold(): Promise<Set<string>> {
     } catch (err) {
       console.log(`[FINRA] Reg SHO error for ${tradeDate}:`, err instanceof Error ? err.message : String(err));
     }
-  }
-
-  // All API attempts failed, try archive fallback for recent days
-  for (const tradeDate of recentDays.slice(0, 3)) {
-    try {
-      const archiveTickers = await fetchRegSHOFromArchive(tradeDate);
-      if (archiveTickers.size > 0) {
-        regSHOCache = { result: { tickers: archiveTickers, asOf: tradeDate }, timestamp: Date.now() };
-        return archiveTickers;
-      }
-    } catch { /* try next */ }
   }
 
   console.log('[FINRA] No Reg SHO data found');
@@ -154,7 +145,7 @@ async function fetchRegSHOFromArchive(date: string): Promise<Set<string>> {
   try {
     const res = await fetch(url, {
       headers: { 'Accept': 'text/plain, text/csv' },
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(6000),
     });
 
     if (!res.ok) return tickers;
@@ -195,8 +186,8 @@ export async function fetchShortInterest(): Promise<Map<string, ShortInterestDat
   let asOf = '';
 
   // Try recent settlement dates (short interest publishes ~2x/month around 15th and end-of-month)
-  // We look back up to 30 days to find the most recent publication
-  const recentDays = getRecentBusinessDays(14);
+  // We look back up to 5 business days; if nothing found, fallback query without date
+  const recentDays = getRecentBusinessDays(5);
 
   for (const settlementDate of recentDays) {
     try {
@@ -207,15 +198,16 @@ export async function fetchShortInterest(): Promise<Map<string, ShortInterestDat
       asOf = settlementDate;
       processSIRecords(page.records, map);
 
-      // Paginate if needed (max 100 per request)
+      // Paginate if needed (max 100 per request, cap at 10 pages = 1000 records)
       let offset = page.records.length;
-      while (page.records.length >= 100) {
+      let pages = 1;
+      while (page.records.length >= 100 && pages < 10) {
         const nextPage = await fetchSIPage(settlementDate, offset);
         if (nextPage.records.length === 0) break;
         processSIRecords(nextPage.records, map);
         offset += nextPage.records.length;
+        pages++;
         if (nextPage.records.length < 100) break;
-        if (offset > 50000) break; // safety limit
       }
 
       console.log(`[FINRA] Short interest: ${map.size} securities loaded (settlement: ${settlementDate})`);
@@ -236,7 +228,7 @@ export async function fetchShortInterest(): Promise<Map<string, ShortInterestDat
           limit: 100,
           sortFields: ['-settlementDate'],
         }),
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(6000),
       });
 
       const contentType = res.headers.get('content-type') || '';
@@ -281,7 +273,7 @@ async function fetchSIPage(settlementDate: string, offset: number): Promise<{ re
         },
       ],
     }),
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(6000),
   });
 
   const contentType = res.headers.get('content-type') || '';

@@ -167,61 +167,60 @@ export async function fetchSwapData(): Promise<SwapResult> {
 
   const today = new Date().toISOString().slice(0, 10);
   const weekEnd = getWeekEnd(today);
-  const recentDays = getRecentBusinessDays(7);
+  const recentDays = getRecentBusinessDays(3); // Only check last 3 business days
 
   // Try S3-hosted cumulative equity reports, most recent first
-  // Pattern: SEC_CUMULATIVE_EQUITY_YYYY_MM_DD.zip or SEC_CUMULATIVE_EQUITIES_YYYY_MM_DD.zip
+  // Try both naming variants in PARALLEL for each date to reduce total time
   for (const reportDate of recentDays) {
     const s3Date = formatS3Date(reportDate);
 
-    // Try both naming variants
     const urls = [
       `https://kgc0418-tdw-data-0.s3.amazonaws.com/sec/eod/SEC_CUMULATIVE_EQUITY_${s3Date}.zip`,
       `https://kgc0418-tdw-data-0.s3.amazonaws.com/sec/eod/SEC_CUMULATIVE_EQUITIES_${s3Date}.zip`,
     ];
 
-    for (const url of urls) {
-      try {
-        const res = await fetch(url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': '*/*',
-          },
-          signal: AbortSignal.timeout(30000),
-        });
+    // Race both variants — take whichever succeeds first
+    const results = await Promise.allSettled(urls.map(async (url) => {
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Accept': '*/*',
+        },
+        signal: AbortSignal.timeout(8000), // 8s per request, not 30s
+      });
 
-        if (!res.ok) continue;
+      if (!res.ok) throw new Error(`${res.status}`);
 
-        const contentType = res.headers.get('content-type') || '';
-        if (contentType.includes('html') || contentType.includes('text/plain')) {
-          const preview = await res.text().catch(() => '');
-          if (preview.includes('<html') || preview.includes('host_not_allowed') || preview.length < 100) {
-            console.log(`[DTCC] Non-data response for ${reportDate}: ${preview.slice(0, 80)}`);
-            continue;
-          }
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('html') || contentType.includes('text/plain')) {
+        const preview = await res.text().catch(() => '');
+        if (preview.includes('<html') || preview.includes('host_not_allowed') || preview.length < 100) {
+          throw new Error('Non-data response');
         }
+      }
 
-        const buffer = Buffer.from(await res.arrayBuffer());
-        if (buffer.length < 100) continue;
+      const buffer = Buffer.from(await res.arrayBuffer());
+      if (buffer.length < 100) throw new Error('Too small');
 
-        let csvText: string;
-        if (buffer[0] === 0x50 && buffer[1] === 0x4b) {
-          csvText = extractFirstFileFromZip(buffer);
-        } else {
-          csvText = buffer.toString('utf-8');
-        }
+      let csvText: string;
+      if (buffer[0] === 0x50 && buffer[1] === 0x4b) {
+        csvText = extractFirstFileFromZip(buffer);
+      } else {
+        csvText = buffer.toString('utf-8');
+      }
 
-        if (csvText.length < 50 || csvText.includes('<html')) continue;
+      if (csvText.length < 50 || csvText.includes('<html')) throw new Error('Invalid content');
+      return csvText;
+    }));
 
-        const map = parseSwapCSV(csvText, today, weekEnd);
-        if (map.size > 0) {
-          const result: SwapResult = { data: map, asOf: reportDate };
-          swapCache = { result, timestamp: Date.now() };
-          console.log(`[DTCC] Parsed ${csvText.split('\n').length} rows → ${map.size} tickers (report date: ${reportDate})`);
-          return result;
-        }
-      } catch {
-        // Try next URL/date
+    for (const r of results) {
+      if (r.status !== 'fulfilled') continue;
+      const map = parseSwapCSV(r.value, today, weekEnd);
+      if (map.size > 0) {
+        const result: SwapResult = { data: map, asOf: reportDate };
+        swapCache = { result, timestamp: Date.now() };
+        console.log(`[DTCC] Parsed ${r.value.split('\n').length} rows → ${map.size} tickers (report date: ${reportDate})`);
+        return result;
       }
     }
   }
@@ -234,7 +233,7 @@ export async function fetchSwapData(): Promise<SwapResult> {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': '*/*',
       },
-      signal: AbortSignal.timeout(30000),
+      signal: AbortSignal.timeout(8000),
     });
 
     if (res.ok) {
