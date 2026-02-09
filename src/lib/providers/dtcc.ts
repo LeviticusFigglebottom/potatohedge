@@ -1,12 +1,14 @@
 /**
  * DTCC Swap Data Provider
  *
- * Fetches equity swap maturity data from the DTCC Public Price Dissemination
- * (pddata.dtcc.com). SEC-mandated public data showing all open security-based
- * swaps including total return swaps on equities.
+ * Fetches equity swap maturity data from DTCC's S3-hosted cumulative reports.
+ * SEC-mandated public data showing all open security-based swaps including
+ * total return swaps on equities.
  *
  * Key insight: When swaps mature, dealers must unwind hedges — creating
  * directional flow pressure. Clusters of maturities = forced rebalancing.
+ *
+ * Source: https://kgc0418-tdw-data-0.s3.amazonaws.com/sec/eod/
  */
 
 import { inflateRawSync } from 'zlib';
@@ -20,8 +22,13 @@ export interface SwapData {
   totalNotional: number;
 }
 
+export interface SwapResult {
+  data: Map<string, SwapData>;
+  asOf: string; // YYYY-MM-DD of the report used
+}
+
 // In-memory cache — swap data changes daily, no need to refetch intraday
-let swapCache: { data: Map<string, SwapData>; timestamp: number } | null = null;
+let swapCache: { result: SwapResult; timestamp: number } | null = null;
 const CACHE_TTL = 3600_000; // 1 hour
 
 /**
@@ -43,10 +50,8 @@ function extractFirstFileFromZip(buf: Buffer): string {
   const compressedData = buf.subarray(dataOffset, dataOffset + compressedSize);
 
   if (compressionMethod === 0) {
-    // Stored (no compression)
     return compressedData.toString('utf-8');
   } else if (compressionMethod === 8) {
-    // Deflate
     return inflateRawSync(compressedData).toString('utf-8');
   } else {
     throw new Error(`Unsupported ZIP compression: ${compressionMethod}`);
@@ -55,17 +60,12 @@ function extractFirstFileFromZip(buf: Buffer): string {
 
 /**
  * Parse swap CSV and aggregate by underlier ticker.
- * DTCC SEC equity swap fields include:
- * - Underlier ID-Leg 1 (ticker/ISIN/CUSIP)
- * - Expiration Date
- * - Notional amount-Leg 1
  */
 function parseSwapCSV(csv: string, today: string, weekEnd: string): Map<string, SwapData> {
   const map = new Map<string, SwapData>();
   const lines = csv.split('\n');
   if (lines.length < 2) return map;
 
-  // Parse header to find column indices (DTCC column names vary by report version)
   const header = lines[0].toLowerCase();
   const cols = header.split(',').map(c => c.trim().replace(/"/g, ''));
 
@@ -87,15 +87,12 @@ function parseSwapCSV(csv: string, today: string, weekEnd: string): Map<string, 
     return map;
   }
 
-  // Process rows
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
 
-    // Simple CSV split (handles most cases; DTCC data is generally clean)
     const fields = line.split(',').map(f => f.trim().replace(/"/g, ''));
 
-    // Skip cancelled/terminated swaps
     if (actionIdx !== -1) {
       const action = fields[actionIdx]?.toUpperCase() || '';
       if (action === 'CANCEL' || action === 'TERMINATE') continue;
@@ -106,11 +103,7 @@ function parseSwapCSV(csv: string, today: string, weekEnd: string): Map<string, 
     const notional = notionalIdx !== -1 ? Math.abs(parseFloat(fields[notionalIdx]) || 0) : 0;
 
     if (!underlier || !expDate) continue;
-
-    // Normalize underlier to ticker format
-    // DTCC may use ISIN, CUSIP, or ticker. If it's a ticker (short alphanumeric), use directly.
-    // If it's ISIN (12 chars starting with US), skip for now — mapping would require a lookup table.
-    if (underlier.length > 6 || underlier.includes('.')) continue; // skip ISINs/CUSIPs
+    if (underlier.length > 6 || underlier.includes('.') || !/^[A-Z]+$/.test(underlier)) continue;
 
     let entry = map.get(underlier);
     if (!entry) {
@@ -142,20 +135,100 @@ function getWeekEnd(today: string): string {
   return d.toISOString().slice(0, 10);
 }
 
-export async function fetchSwapData(): Promise<Map<string, SwapData>> {
-  // Return cache if fresh
+/**
+ * Get recent business days going back from today, most recent first.
+ */
+function getRecentBusinessDays(count: number): string[] {
+  const days: string[] = [];
+  const d = new Date();
+  for (let i = 0; days.length < count; i++) {
+    const candidate = new Date(d);
+    candidate.setDate(d.getDate() - i);
+    const dow = candidate.getDay();
+    if (dow !== 0 && dow !== 6) { // skip weekends
+      days.push(candidate.toISOString().slice(0, 10));
+    }
+    if (i > 14) break; // safety limit
+  }
+  return days;
+}
+
+/**
+ * Format a YYYY-MM-DD date as YYYY_MM_DD for S3 file path.
+ */
+function formatS3Date(date: string): string {
+  return date.replace(/-/g, '_');
+}
+
+export async function fetchSwapData(): Promise<SwapResult> {
   if (swapCache && Date.now() - swapCache.timestamp < CACHE_TTL) {
-    return swapCache.data;
+    return swapCache.result;
   }
 
   const today = new Date().toISOString().slice(0, 10);
   const weekEnd = getWeekEnd(today);
+  const recentDays = getRecentBusinessDays(7);
 
+  // Try S3-hosted cumulative equity reports, most recent first
+  // Pattern: SEC_CUMULATIVE_EQUITY_YYYY_MM_DD.zip or SEC_CUMULATIVE_EQUITIES_YYYY_MM_DD.zip
+  for (const reportDate of recentDays) {
+    const s3Date = formatS3Date(reportDate);
+
+    // Try both naming variants
+    const urls = [
+      `https://kgc0418-tdw-data-0.s3.amazonaws.com/sec/eod/SEC_CUMULATIVE_EQUITY_${s3Date}.zip`,
+      `https://kgc0418-tdw-data-0.s3.amazonaws.com/sec/eod/SEC_CUMULATIVE_EQUITIES_${s3Date}.zip`,
+    ];
+
+    for (const url of urls) {
+      try {
+        const res = await fetch(url, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': '*/*',
+          },
+          signal: AbortSignal.timeout(30000),
+        });
+
+        if (!res.ok) continue;
+
+        const contentType = res.headers.get('content-type') || '';
+        if (contentType.includes('html') || contentType.includes('text/plain')) {
+          const preview = await res.text().catch(() => '');
+          if (preview.includes('<html') || preview.includes('host_not_allowed') || preview.length < 100) {
+            console.log(`[DTCC] Non-data response for ${reportDate}: ${preview.slice(0, 80)}`);
+            continue;
+          }
+        }
+
+        const buffer = Buffer.from(await res.arrayBuffer());
+        if (buffer.length < 100) continue;
+
+        let csvText: string;
+        if (buffer[0] === 0x50 && buffer[1] === 0x4b) {
+          csvText = extractFirstFileFromZip(buffer);
+        } else {
+          csvText = buffer.toString('utf-8');
+        }
+
+        if (csvText.length < 50 || csvText.includes('<html')) continue;
+
+        const map = parseSwapCSV(csvText, today, weekEnd);
+        if (map.size > 0) {
+          const result: SwapResult = { data: map, asOf: reportDate };
+          swapCache = { result, timestamp: Date.now() };
+          console.log(`[DTCC] Parsed ${csvText.split('\n').length} rows → ${map.size} tickers (report date: ${reportDate})`);
+          return result;
+        }
+      } catch {
+        // Try next URL/date
+      }
+    }
+  }
+
+  // Fallback: try the original pddata.dtcc.com API endpoint
   try {
-    // Try the DTCC cumulative equity report
-    // The SEC equity swap data is at the SEC dashboard endpoint
-    const url = `https://pddata.dtcc.com/ppd/api/report/cumulative/sec/EQUITY`;
-
+    const url = 'https://pddata.dtcc.com/ppd/api/report/cumulative/sec/EQUITY';
     const res = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -164,97 +237,84 @@ export async function fetchSwapData(): Promise<Map<string, SwapData>> {
       signal: AbortSignal.timeout(30000),
     });
 
-    if (!res.ok) {
-      console.log(`[DTCC] Fetch failed: ${res.status}`);
-      return new Map();
-    }
+    if (res.ok) {
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('html') && !contentType.includes('text/plain')) {
+        if (contentType.includes('json')) {
+          const json = await res.json();
+          if (Array.isArray(json) && json.length > 0) {
+            const map = new Map<string, SwapData>();
+            for (const record of json) {
+              const underlier = (
+                record['Underlier ID-Leg 1'] ||
+                record['underlier_id_leg_1'] ||
+                record['UNDERLIER_ID'] || ''
+              ).toUpperCase().trim();
+              const expDate = (
+                record['Expiration Date'] ||
+                record['expiration_date'] ||
+                record['END_DATE'] || ''
+              ).trim().slice(0, 10);
+              const notional = Math.abs(parseFloat(
+                record['Notional amount-Leg 1'] ||
+                record['notional_amount_leg_1'] ||
+                record['NOTIONAL_AMOUNT'] || '0'
+              ) || 0);
 
-    const contentType = res.headers.get('content-type') || '';
+              if (!underlier || !expDate || underlier.length > 6 || !/^[A-Z]+$/.test(underlier)) continue;
 
-    // Reject HTML error pages
-    if (contentType.includes('html') || contentType.includes('text/plain')) {
-      const preview = await res.text().catch(() => '');
-      if (preview.includes('<html') || preview.includes('host_not_allowed') || preview.length < 50) {
-        console.log(`[DTCC] Got non-data response (${contentType}): ${preview.slice(0, 100)}`);
-        return new Map();
-      }
-    }
-    let csvText: string;
-
-    if (contentType.includes('json')) {
-      // Some endpoints return JSON — try to handle
-      const json = await res.json();
-      console.log('[DTCC] Got JSON response, keys:', Object.keys(json).slice(0, 5));
-      // If it's an array of records, convert to CSV-like processing
-      if (Array.isArray(json)) {
-        // Process as array of objects
-        const map = new Map<string, SwapData>();
-        for (const record of json) {
-          const underlier = (
-            record['Underlier ID-Leg 1'] ||
-            record['underlier_id_leg_1'] ||
-            record['UNDERLIER_ID'] ||
-            ''
-          ).toUpperCase().trim();
-          const expDate = (
-            record['Expiration Date'] ||
-            record['expiration_date'] ||
-            record['END_DATE'] ||
-            ''
-          ).trim().slice(0, 10);
-          const notional = Math.abs(parseFloat(
-            record['Notional amount-Leg 1'] ||
-            record['notional_amount_leg_1'] ||
-            record['NOTIONAL_AMOUNT'] ||
-            '0'
-          ) || 0);
-
-          if (!underlier || !expDate || underlier.length > 6) continue;
-
-          let entry = map.get(underlier);
-          if (!entry) {
-            entry = { maturitiesToday: 0, notionalToday: 0, maturitiesWeek: 0, notionalWeek: 0, totalOpen: 0, totalNotional: 0 };
-            map.set(underlier, entry);
+              let entry = map.get(underlier);
+              if (!entry) {
+                entry = { maturitiesToday: 0, notionalToday: 0, maturitiesWeek: 0, notionalWeek: 0, totalOpen: 0, totalNotional: 0 };
+                map.set(underlier, entry);
+              }
+              entry.totalOpen++;
+              entry.totalNotional += notional;
+              if (expDate === today) { entry.maturitiesToday++; entry.notionalToday += notional; }
+              if (expDate >= today && expDate <= weekEnd) { entry.maturitiesWeek++; entry.notionalWeek += notional; }
+            }
+            if (map.size > 0) {
+              const result: SwapResult = { data: map, asOf: today };
+              swapCache = { result, timestamp: Date.now() };
+              console.log(`[DTCC] Parsed ${json.length} JSON records → ${map.size} tickers (pddata fallback)`);
+              return result;
+            }
           }
-          entry.totalOpen++;
-          entry.totalNotional += notional;
-          if (expDate === today) { entry.maturitiesToday++; entry.notionalToday += notional; }
-          if (expDate >= today && expDate <= weekEnd) { entry.maturitiesWeek++; entry.notionalWeek += notional; }
+        } else {
+          const buffer = Buffer.from(await res.arrayBuffer());
+          if (buffer.length > 100) {
+            let csvText: string;
+            if (buffer[0] === 0x50 && buffer[1] === 0x4b) {
+              csvText = extractFirstFileFromZip(buffer);
+            } else {
+              csvText = buffer.toString('utf-8');
+            }
+            const map = parseSwapCSV(csvText, today, weekEnd);
+            if (map.size > 0) {
+              const result: SwapResult = { data: map, asOf: today };
+              swapCache = { result, timestamp: Date.now() };
+              return result;
+            }
+          }
         }
-        swapCache = { data: map, timestamp: Date.now() };
-        console.log(`[DTCC] Parsed ${json.length} JSON records → ${map.size} tickers`);
-        return map;
       }
-      return new Map();
     }
-
-    // Binary response — likely ZIP
-    const buffer = Buffer.from(await res.arrayBuffer());
-
-    if (buffer[0] === 0x50 && buffer[1] === 0x4b) {
-      // ZIP file (PK header)
-      csvText = extractFirstFileFromZip(buffer);
-    } else {
-      // Raw CSV
-      csvText = buffer.toString('utf-8');
-    }
-
-    const map = parseSwapCSV(csvText, today, weekEnd);
-    swapCache = { data: map, timestamp: Date.now() };
-    console.log(`[DTCC] Parsed ${csvText.split('\n').length} rows → ${map.size} tickers with swap data`);
-    return map;
-  } catch (err) {
-    console.error('[DTCC] Error fetching swap data:', err instanceof Error ? err.message : String(err));
-    return new Map();
+  } catch {
+    // silent
   }
+
+  console.log('[DTCC] No data found across any endpoint or date');
+  const emptyResult: SwapResult = { data: new Map(), asOf: '' };
+  swapCache = { result: emptyResult, timestamp: Date.now() };
+  return emptyResult;
 }
 
 /**
  * Get swap data for a single ticker. Returns null if no data available.
  */
 export async function getSwapDataForTicker(symbol: string): Promise<SwapData | null> {
-  const map = await fetchSwapData();
-  return map.get(symbol.toUpperCase()) || null;
+  const { data } = await fetchSwapData();
+  return data.get(symbol.toUpperCase()) || null;
 }
 
 /**
@@ -266,8 +326,9 @@ export async function getMarketSwapSummary(): Promise<{
   totalMaturitiesWeek: number;
   totalNotionalWeek: number;
   topMaturities: { symbol: string; count: number; notional: number }[];
+  asOf: string;
 }> {
-  const map = await fetchSwapData();
+  const { data: map, asOf } = await fetchSwapData();
   let totalMaturitiesToday = 0;
   let totalNotionalToday = 0;
   let totalMaturitiesWeek = 0;
@@ -279,8 +340,12 @@ export async function getMarketSwapSummary(): Promise<{
     totalNotionalToday += data.notionalToday;
     totalMaturitiesWeek += data.maturitiesWeek;
     totalNotionalWeek += data.notionalWeek;
-    if (data.maturitiesToday > 0) {
-      perTicker.push({ symbol, count: data.maturitiesToday, notional: data.notionalToday });
+    if (data.maturitiesToday > 0 || data.maturitiesWeek > 0) {
+      perTicker.push({
+        symbol,
+        count: data.maturitiesToday || data.maturitiesWeek,
+        notional: data.notionalToday || data.notionalWeek,
+      });
     }
   }
 
@@ -292,5 +357,6 @@ export async function getMarketSwapSummary(): Promise<{
     totalMaturitiesWeek,
     totalNotionalWeek,
     topMaturities: perTicker.slice(0, 20),
+    asOf,
   };
 }

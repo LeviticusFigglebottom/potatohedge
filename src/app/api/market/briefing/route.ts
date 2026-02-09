@@ -16,8 +16,8 @@ import {
 } from '@/lib/math/analytics';
 import { generateRecommendations, type RecommendationInput } from '@/lib/math/recommendations';
 import type { EquityBar } from '@/lib/providers/equityBars';
-import { fetchSwapData, getMarketSwapSummary } from '@/lib/providers/dtcc';
-import { fetchRegSHOThreshold, fetchShortInterest, type ShortInterestData } from '@/lib/providers/finra';
+import { getMarketSwapSummary } from '@/lib/providers/dtcc';
+import { fetchRegSHOWithDate, fetchShortInterestWithDate, type ShortInterestData } from '@/lib/providers/finra';
 
 export const maxDuration = 120;
 
@@ -63,13 +63,16 @@ export interface BriefingData {
     totalNotionalWeek: number;
     topMaturities: { symbol: string; count: number; notional: number }[];
     available: boolean;
+    asOf: string;
   };
   regSHOList: string[];
+  regSHOAsOf: string;
   shortInterestHighlights: {
     symbol: string;
     daysToCover: number;
     shortInterest: number;
   }[];
+  shortInterestAsOf: string;
   finraAvailable: boolean;
   narrative: string[];
   alerts: string[];
@@ -403,16 +406,17 @@ function generateNarrative(
 export async function GET() {
   try {
     // Phase 1: Fetch VIX, DIA quotes + DTCC/FINRA data in parallel with index analysis
-    const [vixQuote, diaQuote, swapSummary, regSHOSet, siMap, ...indexResults] = await Promise.all([
+    const [vixQuote, diaQuote, swapSummary, regSHOResult, siResult, ...indexResults] = await Promise.all([
       getQuote('VIX').catch(() => null),
       getQuote('DIA').catch(() => null),
       getMarketSwapSummary().catch(() => ({
         totalMaturitiesToday: 0, totalNotionalToday: 0,
         totalMaturitiesWeek: 0, totalNotionalWeek: 0,
         topMaturities: [] as { symbol: string; count: number; notional: number }[],
+        asOf: '',
       })),
-      fetchRegSHOThreshold().catch(() => new Set<string>()),
-      fetchShortInterest().catch(() => new Map<string, ShortInterestData>()),
+      fetchRegSHOWithDate().catch(() => ({ tickers: new Set<string>(), asOf: '' })),
+      fetchShortInterestWithDate().catch(() => ({ data: new Map<string, ShortInterestData>(), asOf: '' })),
       ...KEY_INDICES.map(t => analyzeIndex(t)),
     ]);
 
@@ -430,19 +434,19 @@ export async function GET() {
     const dia = diaQuote ? { price: diaQuote.last, changePct: diaQuote.changePct } : null;
 
     // Reg SHO list
-    const regSHOList = Array.from(regSHOSet).filter(s => /^[A-Z]+$/.test(s)).sort();
+    const regSHOList = Array.from(regSHOResult.tickers).filter(s => /^[A-Z]+$/.test(s)).sort();
 
     // Short interest highlights
     const shortInterestHighlights: BriefingData['shortInterestHighlights'] = [];
-    for (const [sym, data] of siMap) {
+    for (const [sym, data] of siResult.data) {
       if (data.daysToCover > 3) {
         shortInterestHighlights.push({ symbol: sym, daysToCover: data.daysToCover, shortInterest: data.shortInterest });
       }
     }
     shortInterestHighlights.sort((a, b) => b.daysToCover - a.daysToCover);
 
-    const swapAvailable = swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0;
-    const finraAvailable = regSHOSet.size > 0 || siMap.size > 0;
+    const swapAvailable = swapSummary.asOf !== '' || swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0;
+    const finraAvailable = regSHOResult.tickers.size > 0 || siResult.data.size > 0;
 
     // Generate narrative
     const { narrative, alerts } = generateNarrative(
@@ -457,7 +461,9 @@ export async function GET() {
       vix, dia, mag7,
       swapSummary: { ...swapSummary, available: swapAvailable },
       regSHOList: regSHOList.slice(0, 50),
+      regSHOAsOf: regSHOResult.asOf,
       shortInterestHighlights: shortInterestHighlights.slice(0, 20),
+      shortInterestAsOf: siResult.asOf,
       finraAvailable,
       narrative, alerts,
     };

@@ -334,7 +334,7 @@ export async function GET(request: NextRequest) {
 
       // Pre-fetch DTCC + FINRA data once (shared across all stocks)
       const [swapMap, regSHOSet, siMap] = await Promise.all([
-        fetchSwapData().catch(() => new Map<string, SwapData>()),
+        fetchSwapData().then(r => r.data).catch(() => new Map<string, SwapData>()),
         fetchRegSHOThreshold().catch(() => new Set<string>()),
         fetchShortInterest().catch(() => new Map<string, ShortInterestData>()),
       ]);

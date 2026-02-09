@@ -197,7 +197,7 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
 function buildBriefingPrompt(
   stocks: StockScan[],
   vixPrice: number,
-  swapSummary: { totalMaturitiesToday: number; totalNotionalToday: number; topMaturities: { symbol: string; count: number; notional: number }[] },
+  swapSummary: { totalMaturitiesToday: number; totalNotionalToday: number; topMaturities: { symbol: string; count: number; notional: number }[]; asOf: string },
   regSHOList: string[],
 ): string {
   const indices = stocks.filter(s => INDICES.includes(s.symbol));
@@ -233,10 +233,15 @@ ${sectors.map(fmtStock).join('\n\n')}
 ─── MAGNIFICENT 7 ───
 ${mag7.map(fmtStock).join('\n\n')}`;
 
-  if (swapSummary.totalMaturitiesToday > 0) {
-    prompt += `\n\n─── DTCC SWAP MATURITIES ───
-Total today: ${swapSummary.totalMaturitiesToday.toLocaleString()} swaps ($${(swapSummary.totalNotionalToday / 1e6).toFixed(0)}M notional)
-Top: ${swapSummary.topMaturities.slice(0, 5).map(m => `${m.symbol}(${m.count},$${(m.notional / 1e6).toFixed(0)}M)`).join(', ')}`;
+  if (swapSummary.totalMaturitiesToday > 0 || swapSummary.asOf) {
+    const dateNote = swapSummary.asOf ? ` (report date: ${swapSummary.asOf})` : '';
+    prompt += `\n\n─── DTCC SWAP MATURITIES${dateNote} ───`;
+    if (swapSummary.totalMaturitiesToday > 0) {
+      prompt += `\nTotal today: ${swapSummary.totalMaturitiesToday.toLocaleString()} swaps ($${(swapSummary.totalNotionalToday / 1e6).toFixed(0)}M notional)`;
+      prompt += `\nTop: ${swapSummary.topMaturities.slice(0, 5).map(m => `${m.symbol}(${m.count},$${(m.notional / 1e6).toFixed(0)}M)`).join(', ')}`;
+    } else {
+      prompt += `\nNo swaps maturing today — report contains open positions only.`;
+    }
   }
 
   if (regSHOList.length > 0) {
@@ -299,6 +304,7 @@ export async function POST() {
         totalMaturitiesToday: 0, totalNotionalToday: 0,
         totalMaturitiesWeek: 0, totalNotionalWeek: 0,
         topMaturities: [] as { symbol: string; count: number; notional: number }[],
+        asOf: '',
       })),
       fetchRegSHOThreshold().catch(() => new Set<string>()),
     ]);
