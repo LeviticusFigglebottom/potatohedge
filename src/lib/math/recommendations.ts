@@ -792,10 +792,9 @@ function generateTrades(
 export function generateRecommendations(input: RecommendationInput): RecommendationOutput {
   const signals = scoreSignals(input);
   const totalWeight = signals.reduce((s, sig) => s + sig.weight, 0);
-  // Cap total weight to ±0.60 so score stays in [-60, +60] — prevents
-  // runaway stacking of many small signals from creating extreme scores
-  const cappedWeight = clamp(totalWeight, -0.60, 0.60);
-  const biasScore = cappedWeight * 100;
+  // No cap — if multiple independent signals genuinely align, the score
+  // should reflect that confluence. Individual weights are already bounded.
+  const biasScore = totalWeight * 100;
 
   let overallBias: Direction = 'neutral';
   // Wider neutral band (±20) so the label doesn't flip on minor noise
