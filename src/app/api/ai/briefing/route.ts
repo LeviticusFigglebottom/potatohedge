@@ -17,7 +17,7 @@ import {
 import { generateRecommendations, type RecommendationInput } from '@/lib/math/recommendations';
 import type { EquityBar } from '@/lib/providers/equityBars';
 import { getMarketSwapSummary } from '@/lib/providers/dtcc';
-import { fetchRegSHOThreshold, fetchShortInterest, type ShortInterestData } from '@/lib/providers/finra';
+import { fetchRegSHOThreshold, fetchShortInterest, fetchShortSaleVolume, type ShortInterestData, type ShortVolumeData } from '@/lib/providers/finra';
 
 export const maxDuration = 60;
 
@@ -279,6 +279,7 @@ function buildBriefingPrompt(
   swapSummary: { totalMaturitiesToday: number; totalNotionalToday: number; totalMaturitiesWeek: number; totalNotionalWeek: number; topMaturities: { symbol: string; count: number; notional: number }[]; asOf: string },
   regSHOList: string[],
   shortInterestData: { symbol: string; daysToCover: number; shortInterest: number }[],
+  shortVolumeData: { symbol: string; shortRatio: number; shortVolume: number; totalVolume: number }[],
 ): string {
   const indices = stocks.filter(s => INDICES.includes(s.symbol));
   const sectors = stocks.filter(s => SECTOR_ETFS.includes(s.symbol));
@@ -353,11 +354,23 @@ ${mag7.map(fmtStock).join('\n\n')}`;
 ${regSHOList.length} securities: ${regSHOList.slice(0, 25).join(', ')}${regSHOList.length > 25 ? ` +${regSHOList.length - 25} more` : ''}`;
   }
 
-  // Short Interest
+  // Short Interest (bi-monthly positions from CDN)
   if (shortInterestData.length > 0) {
     prompt += `\n\n─── HIGH SHORT INTEREST (>3 days to cover) ───`;
     for (const si of shortInterestData.slice(0, 10)) {
       prompt += `\n${si.symbol}: ${si.daysToCover.toFixed(1)} DTC, ${(si.shortInterest / 1e6).toFixed(2)}M shares short`;
+    }
+  }
+
+  // Daily Short Sale Volume (from regShoDaily — always available, no auth)
+  if (shortVolumeData.length > 0) {
+    const highShort = shortVolumeData.filter(sv => sv.shortRatio > 0.50);
+    if (highShort.length > 0) {
+      prompt += `\n\n─── DAILY SHORT SALE VOLUME (>50% short ratio) ───`;
+      prompt += `\n(Short volume ratio = short sales / total volume. Above 50% = majority of trading is short selling)`;
+      for (const sv of highShort.slice(0, 15)) {
+        prompt += `\n${sv.symbol}: ${(sv.shortRatio * 100).toFixed(0)}% short ratio (${abbr(sv.shortVolume)} short / ${abbr(sv.totalVolume)} total)`;
+      }
     }
   }
 
@@ -435,11 +448,12 @@ export async function POST() {
     const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
       Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 
-    const [vixQuote, swapSummary, regSHOSet, shortInterestMap] = await Promise.all([
+    const [vixQuote, swapSummary, regSHOSet, shortInterestMap, shortVolumeMap] = await Promise.all([
       getQuote('VIX').catch(() => null),
       raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 4000, emptySwap),
       raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
       raceTimeout(fetchShortInterest().catch(() => new Map<string, ShortInterestData>()), 5000, new Map<string, ShortInterestData>()),
+      raceTimeout(fetchShortSaleVolume().catch(() => new Map<string, ShortVolumeData>()), 5000, new Map<string, ShortVolumeData>()),
     ]);
     const vixPrice = vixQuote?.last ?? 0;
     const vixChangePct = vixQuote?.changePct ?? 0;
@@ -454,12 +468,21 @@ export async function POST() {
     }
     shortInterestData.sort((a, b) => b.daysToCover - a.daysToCover);
 
+    // Build short volume highlights (>40% short ratio with significant volume)
+    const shortVolumeData: { symbol: string; shortRatio: number; shortVolume: number; totalVolume: number }[] = [];
+    for (const [sym, data] of shortVolumeMap) {
+      if (data.shortRatio > 0.40 && data.totalVolume > 100000) {
+        shortVolumeData.push({ symbol: sym, shortRatio: data.shortRatio, shortVolume: data.shortVolume, totalVolume: data.totalVolume });
+      }
+    }
+    shortVolumeData.sort((a, b) => b.shortRatio - a.shortRatio);
+
     if (results.length === 0) {
       return NextResponse.json({ error: 'Failed to scan any stocks' }, { status: 500 });
     }
 
     // Phase 2: Build prompt and call Claude
-    const prompt = buildBriefingPrompt(results, vixPrice, vixChangePct, swapSummary, regSHOList, shortInterestData);
+    const prompt = buildBriefingPrompt(results, vixPrice, vixChangePct, swapSummary, regSHOList, shortInterestData, shortVolumeData);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const body: Record<string, any> = {

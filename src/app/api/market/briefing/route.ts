@@ -16,7 +16,7 @@ import {
 } from '@/lib/math/analytics';
 import { generateRecommendations } from '@/lib/math/recommendations';
 import { getMarketSwapSummary } from '@/lib/providers/dtcc';
-import { fetchRegSHOWithDate, fetchShortInterestWithDate } from '@/lib/providers/finra';
+import { fetchRegSHOWithDate, fetchShortInterestWithDate, fetchShortSaleVolumeWithDate, type ShortVolumeData } from '@/lib/providers/finra';
 
 export const maxDuration = 30;
 
@@ -73,6 +73,8 @@ export interface BriefingData {
   regSHOAsOf: string;
   shortInterestHighlights: { symbol: string; daysToCover: number; shortInterest: number }[];
   shortInterestAsOf: string;
+  shortVolumeHighlights: { symbol: string; shortVolume: number; totalVolume: number; shortRatio: number }[];
+  shortVolumeAsOf: string;
   finraAvailable: boolean;
   narrative: string[];
   alerts: string[];
@@ -451,6 +453,7 @@ export async function GET() {
     };
     const emptyRegSHO = { tickers: new Set<string>(), asOf: '' };
     const emptySI = { data: new Map<string, { daysToCover: number; shortInterest: number }>(), asOf: '' };
+    const emptySV = { data: new Map<string, ShortVolumeData>(), asOf: '' };
 
     // Independent per-provider timeouts — so DTCC being slow doesn't block RegSHO/SI
     const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
@@ -460,6 +463,7 @@ export async function GET() {
       raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 4000, emptySwap),
       raceTimeout(fetchRegSHOWithDate().catch(() => emptyRegSHO), 4000, emptyRegSHO),
       raceTimeout(fetchShortInterestWithDate().catch(() => emptySI), 5000, emptySI),
+      raceTimeout(fetchShortSaleVolumeWithDate().catch(() => emptySV), 5000, emptySV),
     ]);
 
     const [vixQuote, diaQuote, institutionalData, ...indexResults] = await Promise.all([
@@ -469,7 +473,7 @@ export async function GET() {
       ...KEY_INDICES.map(t => analyzeIndex(t)),
     ]);
 
-    const [swapSummary, regSHOResult, siResult] = institutionalData;
+    const [swapSummary, regSHOResult, siResult, svResult] = institutionalData;
 
     const indices = indexResults.filter((r): r is IndexAnalysis => r !== null);
 
@@ -494,8 +498,17 @@ export async function GET() {
     }
     shortInterestHighlights.sort((a, b) => b.daysToCover - a.daysToCover);
 
+    // Build short volume highlights (>40% short ratio — significant short selling activity)
+    const shortVolumeHighlights: BriefingData['shortVolumeHighlights'] = [];
+    for (const [sym, data] of svResult.data) {
+      if (data.shortRatio > 0.40 && data.totalVolume > 100000) {
+        shortVolumeHighlights.push({ symbol: sym, shortVolume: data.shortVolume, totalVolume: data.totalVolume, shortRatio: data.shortRatio });
+      }
+    }
+    shortVolumeHighlights.sort((a, b) => b.shortRatio - a.shortRatio);
+
     const swapAvailable = swapSummary.asOf !== '' || swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0;
-    const finraAvailable = regSHOResult.tickers.size > 0 || siResult.data.size > 0;
+    const finraAvailable = regSHOResult.tickers.size > 0 || siResult.data.size > 0 || svResult.data.size > 0;
 
     const { narrative, alerts } = generateNarrative(
       indices, vix, swapAvailable,
@@ -528,6 +541,8 @@ export async function GET() {
       regSHOAsOf: regSHOResult.asOf,
       shortInterestHighlights: shortInterestHighlights.slice(0, 20),
       shortInterestAsOf: siResult.asOf,
+      shortVolumeHighlights: shortVolumeHighlights.slice(0, 30),
+      shortVolumeAsOf: svResult.asOf,
       finraAvailable,
       narrative, alerts,
       vannaCharmAnalysis,

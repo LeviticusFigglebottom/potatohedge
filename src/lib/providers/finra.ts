@@ -4,10 +4,14 @@
  * 1. Reg SHO Threshold List — daily list of securities with persistent FTDs
  *    Source: https://api.finra.org/data/group/otcMarket/name/ThresholdList
  *
- * 2. Short Interest — bi-monthly publication of short positions
- *    Source: https://api.finra.org/data/group/otcMarket/name/equityShortInterestStandardized
+ * 2. Short Sale Volume — daily short volume per ticker (no auth required)
+ *    Source: https://api.finra.org/data/group/otcMarket/name/regShoDaily
  *
- * No authentication required for Market Transparency APIs.
+ * 3. Short Interest — bi-monthly positions via CDN CSV (no auth required)
+ *    Source: https://cdn.finra.org/equity/otcmarket/biweekly/shrt{YYYYMMDD}.csv
+ *
+ * NOTE: The equityShortInterestStandardized API requires OAuth 2.0 since mid-2022.
+ * It returns 200 OK with empty array without auth. We use CDN files + regShoDaily instead.
  */
 
 export interface ShortInterestData {
@@ -16,6 +20,16 @@ export interface ShortInterestData {
   daysToCover: number;          // shortInterest / avgDailyVolume
   settlementDate: string;       // date of the SI report
   percentOfFloat?: number;      // if available
+}
+
+/** Daily short sale volume data from regShoDaily (no auth required) */
+export interface ShortVolumeData {
+  symbol: string;
+  shortVolume: number;
+  shortExemptVolume: number;
+  totalVolume: number;
+  shortRatio: number;           // shortVolume / totalVolume (0-1)
+  tradeDate: string;
 }
 
 export interface RegSHOResult {
@@ -28,11 +42,18 @@ export interface ShortInterestResult {
   asOf: string; // settlement date of the data
 }
 
+export interface ShortVolumeResult {
+  data: Map<string, ShortVolumeData>;
+  asOf: string;
+}
+
 // ─── Caches ──────────────────────────────────────────────────
 let regSHOCache: { result: RegSHOResult; timestamp: number } | null = null;
 let shortInterestCache: { result: ShortInterestResult; timestamp: number } | null = null;
+let shortVolumeCache: { result: ShortVolumeResult; timestamp: number } | null = null;
 const REG_SHO_TTL = 3600_000;     // 1 hour
 const SI_TTL = 3600_000 * 4;       // 4 hours (data only updates bi-monthly)
+const SV_TTL = 3600_000;           // 1 hour
 
 /** Race a promise against a hard deadline. Returns fallback on timeout. */
 function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
@@ -67,24 +88,22 @@ function getRecentBusinessDays(count: number): string[] {
 
 /**
  * Fetch the current Reg SHO Threshold list from FINRA.
- * Tries the most recent business day first, then looks back up to 7 days.
+ * Tries the most recent business day first, then looks back up to 2 days.
  */
 export async function fetchRegSHOThreshold(): Promise<Set<string>> {
   if (regSHOCache && Date.now() - regSHOCache.timestamp < REG_SHO_TTL) {
     return regSHOCache.result.tickers;
   }
 
-  // Wrap in overall timeout budget to prevent serverless timeout
   return withTimeout(fetchRegSHOThresholdInner(), TOTAL_BUDGET_MS, new Set<string>());
 }
 
 async function fetchRegSHOThresholdInner(): Promise<Set<string>> {
-  const recentDays = getRecentBusinessDays(2); // Only check last 2 business days
+  const recentDays = getRecentBusinessDays(2);
   const deadline = Date.now() + TOTAL_BUDGET_MS;
 
-  // Try the FINRA API with correct dataset name: ThresholdList
   for (const tradeDate of recentDays) {
-    if (Date.now() > deadline - 1000) break; // leave 1s margin
+    if (Date.now() > deadline - 1000) break;
     try {
       const tickers = new Set<string>();
       const remaining = Math.max(deadline - Date.now(), 1000);
@@ -112,7 +131,6 @@ async function fetchRegSHOThresholdInner(): Promise<Set<string>> {
       const contentType = res.headers.get('content-type') || '';
       if (!res.ok || !contentType.includes('json')) {
         console.log(`[FINRA] Reg SHO API: ${res.status} (${contentType}) for ${tradeDate}`);
-        // If API returns non-JSON, it might be blocked. Try archive once.
         if (tradeDate === recentDays[0] && Date.now() < deadline - 1000) {
           const archiveTickers = await fetchRegSHOFromArchive(tradeDate);
           if (archiveTickers.size > 0) {
@@ -136,7 +154,6 @@ async function fetchRegSHOThresholdInner(): Promise<Set<string>> {
           return tickers;
         }
       }
-      // Empty result for this date — might be a holiday, try previous day
     } catch (err) {
       console.log(`[FINRA] Reg SHO error for ${tradeDate}:`, err instanceof Error ? err.message : String(err));
     }
@@ -148,9 +165,6 @@ async function fetchRegSHOThresholdInner(): Promise<Set<string>> {
   return new Set();
 }
 
-/**
- * Get the Reg SHO result with date info.
- */
 export async function fetchRegSHOWithDate(): Promise<RegSHOResult> {
   await fetchRegSHOThreshold();
   return regSHOCache?.result ?? { tickers: new Set(), asOf: '' };
@@ -187,21 +201,111 @@ async function fetchRegSHOFromArchive(date: string): Promise<Set<string>> {
   return tickers;
 }
 
-// ─── Short Interest ──────────────────────────────────────────
+// ─── Short Sale Volume (regShoDaily — no auth) ────────────────
 
 /**
- * Fetch short interest data from FINRA using the standardized endpoint.
- * Returns a Map of ticker → ShortInterestData.
- * Data is bi-monthly — not real-time.
+ * Fetch daily short sale volume data from regShoDaily API.
+ * No authentication required. Returns short volume ratio per ticker.
+ * This is daily SHORT SALE VOLUME (flow), not bi-monthly short INTEREST (positions).
+ * High short volume ratio (>50%) indicates heavy short selling activity.
+ */
+export async function fetchShortSaleVolume(): Promise<Map<string, ShortVolumeData>> {
+  if (shortVolumeCache && Date.now() - shortVolumeCache.timestamp < SV_TTL) {
+    return shortVolumeCache.result.data;
+  }
+
+  return withTimeout(fetchShortSaleVolumeInner(), TOTAL_BUDGET_MS, new Map<string, ShortVolumeData>());
+}
+
+async function fetchShortSaleVolumeInner(): Promise<Map<string, ShortVolumeData>> {
+  const map = new Map<string, ShortVolumeData>();
+  const recentDays = getRecentBusinessDays(3);
+  const deadline = Date.now() + TOTAL_BUDGET_MS;
+  let asOf = '';
+
+  for (const tradeDate of recentDays) {
+    if (Date.now() > deadline - 1000) break;
+    try {
+      const remaining = Math.max(deadline - Date.now(), 1000);
+      const res = await fetch('https://api.finra.org/data/group/otcMarket/name/regShoDaily', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+          fields: ['securitiesInformationProcessorSymbolIdentifier', 'shortVolume', 'shortExemptVolume', 'totalVolume', 'tradeReportDate'],
+          limit: 5000,
+          compareFilters: [{
+            fieldName: 'tradeReportDate',
+            fieldValue: tradeDate,
+            compareType: 'EQUAL',
+          }],
+          sortFields: ['-totalVolume'],
+        }),
+        signal: AbortSignal.timeout(Math.min(4000, remaining)),
+      });
+
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('json')) {
+        console.log(`[FINRA] regShoDaily: ${res.status} (${contentType}) for ${tradeDate}`);
+        continue;
+      }
+
+      const data = await res.json();
+      if (!Array.isArray(data) || data.length === 0) continue;
+
+      asOf = tradeDate;
+      for (const record of data) {
+        const sym = (record.securitiesInformationProcessorSymbolIdentifier || '').toUpperCase().trim();
+        if (!sym || sym.length > 6 || !/^[A-Z]+$/.test(sym) || map.has(sym)) continue;
+
+        const shortVol = record.shortVolume || 0;
+        const exemptVol = record.shortExemptVolume || 0;
+        const totalVol = record.totalVolume || 0;
+        if (totalVol <= 0) continue;
+
+        map.set(sym, {
+          symbol: sym,
+          shortVolume: shortVol + exemptVol,
+          shortExemptVolume: exemptVol,
+          totalVolume: totalVol,
+          shortRatio: (shortVol + exemptVol) / totalVol,
+          tradeDate,
+        });
+      }
+
+      if (map.size > 0) {
+        console.log(`[FINRA] regShoDaily: ${map.size} securities (${tradeDate})`);
+        break;
+      }
+    } catch (err) {
+      console.log(`[FINRA] regShoDaily error for ${tradeDate}:`, err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  const result: ShortVolumeResult = { data: map, asOf };
+  shortVolumeCache = { result, timestamp: Date.now() };
+  return map;
+}
+
+export async function fetchShortSaleVolumeWithDate(): Promise<ShortVolumeResult> {
+  await fetchShortSaleVolume();
+  return shortVolumeCache?.result ?? { data: new Map(), asOf: '' };
+}
+
+// ─── Short Interest (CDN biweekly CSV — no auth) ─────────────
+
+/**
+ * Fetch short interest data from FINRA CDN biweekly CSV files.
+ * The equityShortInterestStandardized API requires OAuth 2.0 since 2022
+ * and returns empty arrays without auth. CDN files are freely accessible.
  *
- * FINRA API has a max of 100 records per request, so we paginate.
+ * Settlement dates are typically around the 15th and last business day of each month.
+ * Files are published ~8-9 business days after settlement.
  */
 export async function fetchShortInterest(): Promise<Map<string, ShortInterestData>> {
   if (shortInterestCache && Date.now() - shortInterestCache.timestamp < SI_TTL) {
     return shortInterestCache.result.data;
   }
 
-  // Wrap in overall timeout budget to prevent serverless timeout
   return withTimeout(fetchShortInterestInner(), TOTAL_BUDGET_MS, new Map<string, ShortInterestData>());
 }
 
@@ -210,75 +314,62 @@ async function fetchShortInterestInner(): Promise<Map<string, ShortInterestData>
   let asOf = '';
   const deadline = Date.now() + TOTAL_BUDGET_MS;
 
-  // Short interest publishes bi-monthly (~15th and end of month).
-  // Try the dateless query FIRST — it returns the latest available data sorted by date.
-  // This is much faster than guessing specific dates that may not have data.
-  try {
-    const remaining = Math.max(deadline - Date.now(), 1000);
-    const res = await fetch('https://api.finra.org/data/group/otcMarket/name/equityShortInterestStandardized', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({
-        fields: ['issueSymbolIdentifier', 'currentShortPositionQuantity', 'averageDailyVolumeQuantity', 'daysToCoverQuantity', 'settlementDate'],
-        limit: 100,
-        sortFields: ['-settlementDate'],
-      }),
-      signal: AbortSignal.timeout(Math.min(3000, remaining)),
-    });
+  // Generate likely settlement dates: ~15th and last business day of each month, going back 3 months
+  const candidateDates = generateSettlementDates();
 
-    const contentType = res.headers.get('content-type') || '';
-    if (res.ok && contentType.includes('json')) {
-      const data = await res.json();
-      if (Array.isArray(data) && data.length > 0) {
-        asOf = data[0]?.settlementDate || '';
-        processSIRecords(data, map);
+  for (const settleDate of candidateDates) {
+    if (Date.now() > deadline - 1500) break;
+    const dateCompact = settleDate.replace(/-/g, '');
+    const url = `https://cdn.finra.org/equity/otcmarket/biweekly/shrt${dateCompact}.csv`;
 
-        // If we got data with a settlement date, paginate for more records of that date
-        if (asOf && map.size >= 100 && Date.now() < deadline - 1000) {
-          const page2 = await fetchSIPage(asOf, 100);
-          if (page2.records.length > 0) {
-            processSIRecords(page2.records, map);
-            if (page2.records.length >= 100 && Date.now() < deadline - 1000) {
-              const page3 = await fetchSIPage(asOf, 200);
-              if (page3.records.length > 0) processSIRecords(page3.records, map);
-            }
-          }
-        }
-
-        console.log(`[FINRA] Short interest: ${map.size} securities (latest settlement: ${asOf})`);
-      }
-    } else {
-      console.log(`[FINRA] SI dateless query: ${res.status} (${contentType})`);
-    }
-  } catch (err) {
-    console.log(`[FINRA] SI dateless query error:`, err instanceof Error ? err.message : String(err));
-  }
-
-  // Fallback: try the equityShortInterest (non-standardized) endpoint if standardized returned nothing
-  if (map.size === 0 && Date.now() < deadline - 1500) {
     try {
       const remaining = Math.max(deadline - Date.now(), 1000);
-      const res = await fetch('https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({
-          fields: ['symbolCode', 'currentShortPositionQuantity', 'averageDailyVolumeQuantity', 'daysToCoverQuantity', 'settlementDate'],
-          limit: 100,
-          sortFields: ['-settlementDate'],
-        }),
+      const res = await fetch(url, {
+        headers: { 'Accept': 'text/csv, text/plain' },
         signal: AbortSignal.timeout(Math.min(3000, remaining)),
       });
 
+      if (!res.ok) continue;
+
       const contentType = res.headers.get('content-type') || '';
-      if (res.ok && contentType.includes('json')) {
-        const data = await res.json();
-        if (Array.isArray(data) && data.length > 0) {
-          asOf = data[0]?.settlementDate || '';
-          processSIRecords(data, map);
-          console.log(`[FINRA] Short interest (consolidated fallback): ${map.size} securities (latest: ${asOf})`);
+      if (contentType.includes('html')) continue;
+
+      const text = await res.text();
+      if (text.length < 100 || text.includes('<html') || text.includes('<!DOCTYPE')) continue;
+
+      // Parse CSV: headers are in the first line
+      const lines = text.split('\n');
+      if (lines.length < 2) continue;
+
+      const header = lines[0].toLowerCase();
+      const cols = header.split('|').map(c => c.trim());
+
+      // Find column indices
+      const symIdx = cols.findIndex(c => c.includes('symbol'));
+      const siIdx = cols.findIndex(c => c.includes('currentshort') || c.includes('current_short'));
+      const prevIdx = cols.findIndex(c => c.includes('previousshort') || c.includes('previous_short'));
+      const avgIdx = cols.findIndex(c => c.includes('average') || c.includes('avg'));
+
+      if (symIdx === -1 || siIdx === -1) {
+        // Try comma-separated format
+        const commaCols = header.split(',').map(c => c.trim());
+        const cSymIdx = commaCols.findIndex(c => c.includes('symbol'));
+        const cSiIdx = commaCols.findIndex(c => c.includes('currentshort') || c.includes('short') && c.includes('position'));
+        if (cSymIdx !== -1 && cSiIdx !== -1) {
+          parseCSVLines(lines.slice(1), ',', cSymIdx, cSiIdx, -1, -1, settleDate, map);
         }
+      } else {
+        parseCSVLines(lines.slice(1), '|', symIdx, siIdx, prevIdx, avgIdx, settleDate, map);
       }
-    } catch { /* silent */ }
+
+      if (map.size > 0) {
+        asOf = settleDate;
+        console.log(`[FINRA] Short interest from CDN: ${map.size} securities (settlement: ${settleDate})`);
+        break;
+      }
+    } catch {
+      // Try next date
+    }
   }
 
   const result: ShortInterestResult = { data: map, asOf };
@@ -286,66 +377,66 @@ async function fetchShortInterestInner(): Promise<Map<string, ShortInterestData>
   return map;
 }
 
-/**
- * Get the short interest result with date info.
- */
+function parseCSVLines(
+  lines: string[],
+  delimiter: string,
+  symIdx: number,
+  siIdx: number,
+  prevIdx: number,
+  avgIdx: number,
+  settleDate: string,
+  map: Map<string, ShortInterestData>,
+): void {
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const fields = line.split(delimiter).map(f => f.trim().replace(/"/g, ''));
+    const sym = (fields[symIdx] || '').toUpperCase().trim();
+    if (!sym || sym.length > 6 || !/^[A-Z]+$/.test(sym) || map.has(sym)) continue;
+
+    const si = Math.abs(parseFloat(fields[siIdx]) || 0);
+    if (si <= 0) continue;
+
+    const adv = avgIdx >= 0 ? Math.abs(parseFloat(fields[avgIdx]) || 0) : 0;
+    const dtc = adv > 0 ? si / adv : 0;
+
+    map.set(sym, {
+      shortInterest: si,
+      avgDailyVolume: adv,
+      daysToCover: dtc,
+      settlementDate: settleDate,
+    });
+  }
+}
+
+/** Generate likely FINRA settlement dates (15th and last business day) for past 3 months */
+function generateSettlementDates(): string[] {
+  const dates: string[] = [];
+  const now = new Date();
+
+  for (let monthsBack = 0; monthsBack < 3; monthsBack++) {
+    const d = new Date(now.getFullYear(), now.getMonth() - monthsBack, 1);
+
+    // End of month: last business day
+    const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+    while (lastDay.getDay() === 0 || lastDay.getDay() === 6) lastDay.setDate(lastDay.getDate() - 1);
+    dates.push(lastDay.toISOString().slice(0, 10));
+
+    // Mid-month: 15th (or nearest business day)
+    const mid = new Date(d.getFullYear(), d.getMonth(), 15);
+    while (mid.getDay() === 0 || mid.getDay() === 6) mid.setDate(mid.getDate() - 1);
+    dates.push(mid.toISOString().slice(0, 10));
+  }
+
+  // Sort most recent first, filter out future dates
+  const today = now.toISOString().slice(0, 10);
+  return dates.filter(d => d <= today).sort((a, b) => b.localeCompare(a));
+}
+
 export async function fetchShortInterestWithDate(): Promise<ShortInterestResult> {
   await fetchShortInterest();
   return shortInterestCache?.result ?? { data: new Map(), asOf: '' };
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function fetchSIPage(settlementDate: string, offset: number): Promise<{ records: any[] }> {
-  const res = await fetch('https://api.finra.org/data/group/otcMarket/name/equityShortInterestStandardized', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-    body: JSON.stringify({
-      fields: ['issueSymbolIdentifier', 'currentShortPositionQuantity', 'averageDailyVolumeQuantity', 'daysToCoverQuantity', 'settlementDate'],
-      limit: 100,
-      offset,
-      compareFilters: [
-        {
-          fieldName: 'settlementDate',
-          fieldValue: settlementDate,
-          compareType: 'EQUAL',
-        },
-      ],
-    }),
-    signal: AbortSignal.timeout(3000),
-  });
-
-  const contentType = res.headers.get('content-type') || '';
-  if (!res.ok || !contentType.includes('json')) return { records: [] };
-
-  const data = await res.json();
-  return { records: Array.isArray(data) ? data : [] };
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function processSIRecords(records: any[], map: Map<string, ShortInterestData>): void {
-  for (const record of records) {
-    const sym = (record.issueSymbolIdentifier || record.symbolCode || '').toUpperCase().trim();
-    if (!sym || sym.length > 6 || !/^[A-Z]+$/.test(sym) || map.has(sym)) continue;
-
-    const si = record.currentShortPositionQuantity || record.currentShortShareNumber || 0;
-    const adv = record.averageDailyVolumeQuantity || record.averageShortShareNumber || 0;
-    const dtc = record.daysToCoverQuantity || record.daysToCoverNumber || (adv > 0 ? si / adv : 0);
-    const date = record.settlementDate || '';
-
-    if (si > 0) {
-      map.set(sym, {
-        shortInterest: si,
-        avgDailyVolume: adv,
-        daysToCover: dtc,
-        settlementDate: date,
-      });
-    }
-  }
-}
-
-/**
- * Get short interest for a single ticker.
- */
 export async function getShortInterestForTicker(symbol: string): Promise<ShortInterestData | null> {
   const map = await fetchShortInterest();
   return map.get(symbol.toUpperCase()) || null;

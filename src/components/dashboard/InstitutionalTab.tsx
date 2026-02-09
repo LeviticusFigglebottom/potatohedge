@@ -26,6 +26,13 @@ interface InstitutionalData {
     shortInterest: number;
   }[];
   shortInterestAsOf: string;
+  shortVolumeHighlights?: {
+    symbol: string;
+    shortVolume: number;
+    totalVolume: number;
+    shortRatio: number;
+  }[];
+  shortVolumeAsOf?: string;
   finraAvailable: boolean;
   // Enhanced: options-derived metrics
   vannaCharmAnalysis?: {
@@ -48,6 +55,13 @@ function formatNotional(n: number): string {
   if (n >= 1e6) return `$${(n / 1e6).toFixed(0)}M`;
   if (n >= 1e3) return `$${(n / 1e3).toFixed(0)}K`;
   return `$${n.toFixed(0)}`;
+}
+
+function formatVolume(n: number): string {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)}K`;
+  return `${n.toFixed(0)}`;
 }
 
 function formatGEX(n: number): string {
@@ -317,6 +331,51 @@ export default function InstitutionalTab() {
               )}
             </div>
           </div>
+
+          {/* Daily Short Sale Volume */}
+          {data.shortVolumeHighlights && data.shortVolumeHighlights.length > 0 && (
+            <div className="panel">
+              <div className="panel-header">
+                <div className="flex items-center gap-2">
+                  <span className="panel-title flex items-center gap-2">
+                    <Activity className="w-3.5 h-3.5 text-yellow-400" />
+                    Daily Short Sale Volume
+                  </span>
+                  <DataAge asOf={data.shortVolumeAsOf || ''} />
+                </div>
+                <span className="text-xs text-text-muted font-mono">{'>'}40% short ratio</span>
+              </div>
+              <div className="px-4 py-3">
+                <p className="text-xs text-text-muted mb-3">
+                  Securities with high short sale volume ratio today. A ratio above 50% means more than half of trading volume was short selling. Source: FINRA regShoDaily (no auth).
+                </p>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-border/30">
+                        <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Symbol</th>
+                        <th className="px-3 py-2 text-right text-xs font-mono text-text-muted">Short Ratio</th>
+                        <th className="px-3 py-2 text-right text-xs font-mono text-text-muted">Short Vol</th>
+                        <th className="px-3 py-2 text-right text-xs font-mono text-text-muted">Total Vol</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.shortVolumeHighlights.slice(0, 20).map((s, idx) => (
+                        <tr key={s.symbol} className={`border-b border-border/10 hover:bg-bg-hover/50 cursor-pointer transition-colors ${idx % 2 === 0 ? 'bg-bg-secondary/30' : ''}`} onClick={() => navigateToStock(s.symbol)}>
+                          <td className="px-3 py-2 font-mono font-semibold text-text-primary">{s.symbol}</td>
+                          <td className={`px-3 py-2 font-mono text-right font-semibold ${s.shortRatio > 0.6 ? 'text-red-400' : s.shortRatio > 0.5 ? 'text-orange-400' : 'text-yellow-400'}`}>
+                            {(s.shortRatio * 100).toFixed(0)}%
+                          </td>
+                          <td className="px-3 py-2 font-mono text-right text-text-muted">{formatVolume(s.shortVolume)}</td>
+                          <td className="px-3 py-2 font-mono text-right text-text-muted">{formatVolume(s.totalVolume)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Vanna / Charm Regime Analysis */}
           {data.vannaCharmAnalysis && data.vannaCharmAnalysis.length > 0 && (
