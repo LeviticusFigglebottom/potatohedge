@@ -195,21 +195,14 @@ export async function GET(request: NextRequest) {
 
     const correlationCtx = computeQuickCorrelationCtx(historyBars, hvCurrent);
 
-    // Fetch DTCC + FINRA data in parallel (non-blocking, 5s hard budget)
-    const institutionalPromise = Promise.all([
-      getSwapDataForTicker(ticker).catch(() => null),
-      fetchRegSHOThreshold().catch(() => new Set<string>()),
-      getShortInterestForTicker(ticker).catch(() => null),
-    ]);
-    const institutionalFallback: [null, Set<string>, null] = [null, new Set<string>(), null];
-    const [swapData, regSHOSet, siData] = await Promise.race([
-      institutionalPromise,
-      new Promise<typeof institutionalFallback>(resolve =>
-        setTimeout(() => {
-          console.log('[recommendations] Institutional data timeout — using empty fallback');
-          resolve(institutionalFallback);
-        }, 5000)
-      ),
+    // Fetch DTCC + FINRA data — independent per-provider timeouts so slow ones don't block fast ones
+    const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
+      Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
+
+    const [swapData, regSHOSet, siData] = await Promise.all([
+      raceTimeout(getSwapDataForTicker(ticker).catch(() => null), 4000, null),
+      raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
+      raceTimeout(getShortInterestForTicker(ticker).catch(() => null), 5000, null),
     ]);
 
     const input = {

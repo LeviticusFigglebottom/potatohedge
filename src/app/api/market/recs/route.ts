@@ -89,26 +89,42 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ steps, completedAt: 'chain' }, { status: 500 });
   }
 
-  // Step 6: DTCC + FINRA (with 6s hard budget)
+  // Step 6: DTCC + FINRA — independent timeouts per provider so slow ones don't block fast ones
   const t5 = Date.now();
   try {
-    const instPromise = Promise.all([
-      dtccMod.getSwapDataForTicker(ticker).catch(() => null),
-      finraMod.fetchRegSHOThreshold().catch(() => new Set<string>()),
-      finraMod.getShortInterestForTicker(ticker).catch(() => null),
-    ]);
-    const instFallback: [null, Set<string>, null] = [null, new Set<string>(), null];
-    const [swap, regSHO, si] = await Promise.race([
-      instPromise,
-      new Promise<typeof instFallback>(resolve =>
-        setTimeout(() => resolve(instFallback), 6000)
-      ),
-    ]);
-    const timedOut = Date.now() - t5 > 5900;
+    const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
+      Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
+
+    const swapT = Date.now();
+    const swapResult = await raceTimeout(dtccMod.getSwapDataForTicker(ticker).catch((e: Error) => ({ _err: e.message })), 4000, { _err: 'timeout' });
+    const swapMs = Date.now() - swapT;
+
+    const regSHOT = Date.now();
+    const regSHOResult = await raceTimeout(finraMod.fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>());
+    const regSHOMs = Date.now() - regSHOT;
+
+    const siT = Date.now();
+    const siResult = await raceTimeout(finraMod.getShortInterestForTicker(ticker).catch((e: Error) => ({ _err: e.message })), 5000, { _err: 'timeout' });
+    const siMs = Date.now() - siT;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const swap = (swapResult as any)?._err ? null : swapResult;
+    const regSHO = regSHOResult instanceof Set ? regSHOResult : new Set<string>();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const si = (siResult as any)?._err ? null : siResult;
+
     steps.institutional = {
-      ok: !timedOut,
+      ok: true,
       ms: Date.now() - t5,
-      data: { swap: !!swap, regSHO: regSHO.size, si: !!si, timedOut },
+      data: {
+        swap: !!swap, swapMs,
+        regSHO: regSHO.size, regSHOMs,
+        si: !!si, siMs,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        swapErr: (swapResult as any)?._err || null,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        siErr: (siResult as any)?._err || null,
+      },
     };
   } catch (e) {
     steps.institutional = { ok: false, ms: Date.now() - t5, error: (e as Error).message };

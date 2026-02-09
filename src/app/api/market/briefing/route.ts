@@ -452,20 +452,14 @@ export async function GET() {
     const emptyRegSHO = { tickers: new Set<string>(), asOf: '' };
     const emptySI = { data: new Map<string, { daysToCover: number; shortInterest: number }>(), asOf: '' };
 
-    // Wrap institutional data in a 7s hard budget so it never blocks the response
-    const institutionalPromise = Promise.all([
-      getMarketSwapSummary().catch(() => emptySwap),
-      fetchRegSHOWithDate().catch(() => emptyRegSHO),
-      fetchShortInterestWithDate().catch(() => emptySI),
-    ]);
-    const institutionalRace = Promise.race([
-      institutionalPromise,
-      new Promise<[typeof emptySwap, typeof emptyRegSHO, typeof emptySI]>(resolve =>
-        setTimeout(() => {
-          console.log('[briefing] Institutional data timeout — using empty fallback');
-          resolve([emptySwap, emptyRegSHO, emptySI]);
-        }, 7000)
-      ),
+    // Independent per-provider timeouts — so DTCC being slow doesn't block RegSHO/SI
+    const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
+      Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
+
+    const institutionalRace = Promise.all([
+      raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 4000, emptySwap),
+      raceTimeout(fetchRegSHOWithDate().catch(() => emptyRegSHO), 4000, emptyRegSHO),
+      raceTimeout(fetchShortInterestWithDate().catch(() => emptySI), 5000, emptySI),
     ]);
 
     const [vixQuote, diaQuote, institutionalData, ...indexResults] = await Promise.all([

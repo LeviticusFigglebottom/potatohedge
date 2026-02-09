@@ -37,8 +37,9 @@ function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T
   ]);
 }
 
-/** Overall budget for the entire fetchSwapData call (prevents serverless timeout) */
-const TOTAL_BUDGET_MS = 7_000;
+/** Overall budget for the entire fetchSwapData call (prevents serverless timeout).
+ * Kept short because DTCC S3 blocks cloud/serverless IPs — no point waiting long. */
+const TOTAL_BUDGET_MS = 3_000;
 
 /**
  * Inflate raw deflate data using the Web API DecompressionStream.
@@ -224,7 +225,7 @@ async function fetchSwapDataInner(): Promise<SwapResult> {
     if (Date.now() > deadline - 1000) break; // leave 1s margin
     const s3Date = formatS3Date(reportDate);
     const remaining = Math.max(deadline - Date.now(), 1000);
-    const perReqTimeout = Math.min(3000, remaining);
+    const perReqTimeout = Math.min(2000, remaining);
 
     const urls = [
       `https://kgc0418-tdw-data-0.s3.amazonaws.com/sec/eod/SEC_CUMULATIVE_EQUITY_${s3Date}.zip`,
@@ -277,89 +278,7 @@ async function fetchSwapDataInner(): Promise<SwapResult> {
     }
   }
 
-  // Fallback: try the original pddata.dtcc.com API endpoint
-  if (Date.now() < deadline - 1000) {
-    try {
-      const remaining = Math.max(deadline - Date.now(), 1000);
-      const url = 'https://pddata.dtcc.com/ppd/api/report/cumulative/sec/EQUITY';
-      const res = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': '*/*',
-        },
-        signal: AbortSignal.timeout(Math.min(3000, remaining)),
-      });
-
-      if (res.ok) {
-        const contentType = res.headers.get('content-type') || '';
-        if (!contentType.includes('html') && !contentType.includes('text/plain')) {
-          if (contentType.includes('json')) {
-            const json = await res.json();
-            if (Array.isArray(json) && json.length > 0) {
-              const today = new Date().toISOString().slice(0, 10);
-              const weekEnd = getWeekEnd(today);
-              const map = new Map<string, SwapData>();
-              for (const record of json) {
-                const underlier = (
-                  record['Underlier ID-Leg 1'] ||
-                  record['underlier_id_leg_1'] ||
-                  record['UNDERLIER_ID'] || ''
-                ).toUpperCase().trim();
-                const expDate = (
-                  record['Expiration Date'] ||
-                  record['expiration_date'] ||
-                  record['END_DATE'] || ''
-                ).trim().slice(0, 10);
-                const notional = Math.abs(parseFloat(
-                  record['Notional amount-Leg 1'] ||
-                  record['notional_amount_leg_1'] ||
-                  record['NOTIONAL_AMOUNT'] || '0'
-                ) || 0);
-
-                if (!underlier || !expDate || underlier.length > 6 || !/^[A-Z]+$/.test(underlier)) continue;
-
-                let entry = map.get(underlier);
-                if (!entry) {
-                  entry = { maturitiesToday: 0, notionalToday: 0, maturitiesWeek: 0, notionalWeek: 0, totalOpen: 0, totalNotional: 0 };
-                  map.set(underlier, entry);
-                }
-                entry.totalOpen++;
-                entry.totalNotional += notional;
-                if (expDate === today) { entry.maturitiesToday++; entry.notionalToday += notional; }
-                if (expDate >= today && expDate <= weekEnd) { entry.maturitiesWeek++; entry.notionalWeek += notional; }
-              }
-              if (map.size > 0) {
-                const result: SwapResult = { data: map, asOf: today };
-                swapCache = { result, timestamp: Date.now() };
-                console.log(`[DTCC] Parsed ${json.length} JSON records → ${map.size} tickers (pddata fallback)`);
-                return result;
-              }
-            }
-          } else {
-            const buffer = new Uint8Array(await res.arrayBuffer());
-            if (buffer.length > 100) {
-              let csvText: string;
-              if (buffer[0] === 0x50 && buffer[1] === 0x4b) {
-                csvText = await extractFirstFileFromZip(buffer);
-              } else {
-                csvText = new TextDecoder().decode(buffer);
-              }
-              const map = parseSwapCSV(csvText, today, weekEnd);
-              if (map.size > 0) {
-                const result: SwapResult = { data: map, asOf: today };
-                swapCache = { result, timestamp: Date.now() };
-                return result;
-              }
-            }
-          }
-        }
-      }
-    } catch {
-      // silent
-    }
-  }
-
-  console.log('[DTCC] No data found across any endpoint or date');
+  console.log('[DTCC] No data found from S3 endpoints');
   const emptyResult: SwapResult = { data: new Map(), asOf: '' };
   swapCache = { result: emptyResult, timestamp: Date.now() };
   return emptyResult;

@@ -425,32 +425,22 @@ export async function POST() {
       }
     }
 
-    // Phase 1b: VIX + DTCC/FINRA (parallel, with 8s hard budget for institutional data)
+    // Phase 1b: VIX + DTCC/FINRA — independent per-provider timeouts
     const emptySwap = {
       totalMaturitiesToday: 0, totalNotionalToday: 0,
       totalMaturitiesWeek: 0, totalNotionalWeek: 0,
       topMaturities: [] as { symbol: string; count: number; notional: number }[],
       asOf: '',
     };
-    const institutionalPromise = Promise.all([
-      getMarketSwapSummary().catch(() => emptySwap),
-      fetchRegSHOThreshold().catch(() => new Set<string>()),
-      fetchShortInterest().catch(() => new Map<string, ShortInterestData>()),
-    ]);
-    const instFallback: [typeof emptySwap, Set<string>, Map<string, ShortInterestData>] = [
-      emptySwap, new Set<string>(), new Map<string, ShortInterestData>(),
-    ];
-    const institutionalRace = Promise.race([
-      institutionalPromise,
-      new Promise<typeof instFallback>(resolve => setTimeout(() => resolve(instFallback), 8000)),
-    ]);
+    const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
+      Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 
-    const [vixQuote, instData] = await Promise.all([
+    const [vixQuote, swapSummary, regSHOSet, shortInterestMap] = await Promise.all([
       getQuote('VIX').catch(() => null),
-      institutionalRace,
+      raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 4000, emptySwap),
+      raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
+      raceTimeout(fetchShortInterest().catch(() => new Map<string, ShortInterestData>()), 5000, new Map<string, ShortInterestData>()),
     ]);
-
-    const [swapSummary, regSHOSet, shortInterestMap] = instData;
     const vixPrice = vixQuote?.last ?? 0;
     const vixChangePct = vixQuote?.changePct ?? 0;
     const regSHOList = Array.from(regSHOSet).filter(s => /^[A-Z]+$/.test(s)).sort();
