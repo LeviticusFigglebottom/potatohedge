@@ -471,6 +471,13 @@ export async function GET() {
     return NextResponse.json(briefing);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
-    return NextResponse.json({ error: message }, { status: 500 });
+    const stack = error instanceof Error ? error.stack : undefined;
+    console.error('[briefing] Unhandled error:', error);
+    return NextResponse.json({
+      error: message,
+      stack: stack?.split('\n').slice(0, 10),
+      errorType: error instanceof Error ? error.constructor.name : typeof error,
+      route: '/api/market/briefing',
+    }, { status: 500 });
   }
 }
