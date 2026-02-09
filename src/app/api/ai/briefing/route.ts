@@ -17,9 +17,9 @@ import {
 import { generateRecommendations, type RecommendationInput } from '@/lib/math/recommendations';
 import type { EquityBar } from '@/lib/providers/equityBars';
 import { getMarketSwapSummary } from '@/lib/providers/dtcc';
-import { fetchRegSHOThreshold, fetchShortInterest } from '@/lib/providers/finra';
+import { fetchRegSHOThreshold, fetchShortInterest, type ShortInterestData } from '@/lib/providers/finra';
 
-export const maxDuration = 120;
+export const maxDuration = 60;
 
 // Stocks to analyze for the briefing
 const INDICES = ['SPY', 'QQQ', 'IWM'];
@@ -46,6 +46,21 @@ interface StockScan {
   maxPain: number;
   topSignals: string[];
   warnings: string[];
+  // Enhanced: vanna/charm analysis
+  totalVanna: number;
+  totalCharm: number;
+  vannaRegime: 'bullish' | 'bearish' | 'neutral'; // vol drop direction
+  charmRegime: 'bullish' | 'bearish' | 'neutral'; // time decay direction
+  // Enhanced: options-derived institutional metrics
+  deepITMCallOI: number;  // likely synthetic longs
+  deepITMPutOI: number;   // likely protective puts / synthetic shorts
+  unusualVolumeStrikes: string[]; // strikes with vol >> OI
+  gammaSlope: number; // rate of GEX change around spot (steeper = more pinning)
+  totalGEX: number;
+  totalDEX: number;
+  atrPercent: number;
+  dailySigma: number;
+  skewBias: string;
 }
 
 function computeQuickCorrelationCtx(
@@ -100,11 +115,11 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
     const [quote, expirations, historyBars] = await Promise.all([
       getQuote(ticker),
       getExpirations(ticker),
-      fetchEquityBars(ticker, 400),
+      fetchEquityBars(ticker, 250),
     ]);
     const spotPrice = quote.last;
     if (!spotPrice || spotPrice <= 0) return null;
-    const nearExps = expirations.slice(0, 4);
+    const nearExps = expirations.slice(0, 3); // 3 expirations for briefing (balance speed vs accuracy)
     if (nearExps.length === 0) return null;
 
     const chains = await Promise.all(
@@ -122,12 +137,60 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
     const byStrike = new Map<number, typeof allExposures[0]>();
     for (const e of allExposures) {
       const ex = byStrike.get(e.strike);
-      if (ex) { ex.netGEX += e.netGEX; ex.netDEX += e.netDEX; ex.callGEX += e.callGEX; ex.putGEX += e.putGEX; }
+      if (ex) {
+        ex.netGEX += e.netGEX; ex.netDEX += e.netDEX;
+        ex.callGEX += e.callGEX; ex.putGEX += e.putGEX;
+        ex.netVanna += e.netVanna; ex.callVanna += e.callVanna; ex.putVanna += e.putVanna;
+        ex.netCharm += e.netCharm; ex.callCharm += e.callCharm; ex.putCharm += e.putCharm;
+      }
       else byStrike.set(e.strike, { ...e });
     }
     const agg = Array.from(byStrike.values()).sort((a, b) => a.strike - b.strike);
     const totalGEX = agg.reduce((s, e) => s + e.netGEX, 0);
     const totalDEX = agg.reduce((s, e) => s + e.netDEX, 0);
+    const totalVanna = agg.reduce((s, e) => s + e.netVanna, 0);
+    const totalCharm = agg.reduce((s, e) => s + e.netCharm, 0);
+
+    // Vanna regime: if net vanna > 0, a vol drop causes dealers to buy → bullish
+    // If net vanna < 0, a vol drop causes dealers to sell → bearish
+    const vannaThreshold = Math.abs(totalGEX) * 0.01 || 1;
+    const vannaRegime: 'bullish' | 'bearish' | 'neutral' =
+      totalVanna > vannaThreshold ? 'bullish' : totalVanna < -vannaThreshold ? 'bearish' : 'neutral';
+    const charmRegime: 'bullish' | 'bearish' | 'neutral' =
+      totalCharm > vannaThreshold ? 'bullish' : totalCharm < -vannaThreshold ? 'bearish' : 'neutral';
+
+    // Gamma slope: measure how rapidly GEX changes around spot (steeper = more pinning effect)
+    const nearSpot = agg.filter(e => Math.abs(e.strike - spotPrice) / spotPrice < 0.05);
+    let gammaSlope = 0;
+    if (nearSpot.length >= 2) {
+      const gexValues = nearSpot.map(e => e.netGEX);
+      const diffs = gexValues.slice(1).map((v, i) => Math.abs(v - gexValues[i]));
+      gammaSlope = diffs.reduce((s, d) => s + d, 0) / diffs.length;
+    }
+
+    // Deep ITM OI: proxy for institutional synthetic positions
+    const itmThreshold = 0.15; // 15% ITM
+    let deepITMCallOI = 0;
+    let deepITMPutOI = 0;
+    const unusualVolumeStrikes: string[] = [];
+    for (const chain of chains) {
+      for (const c of chain.calls) {
+        if (c.strike < spotPrice * (1 - itmThreshold) && c.openInterest > 100) {
+          deepITMCallOI += c.openInterest;
+        }
+        if (c.openInterest > 0 && c.volume > c.openInterest * 3 && c.volume > 500) {
+          unusualVolumeStrikes.push(`${c.strike}C(${c.volume}v/${c.openInterest}oi)`);
+        }
+      }
+      for (const p of chain.puts) {
+        if (p.strike > spotPrice * (1 + itmThreshold) && p.openInterest > 100) {
+          deepITMPutOI += p.openInterest;
+        }
+        if (p.openInterest > 0 && p.volume > p.openInterest * 3 && p.volume > 500) {
+          unusualVolumeStrikes.push(`${p.strike}P(${p.volume}v/${p.openInterest}oi)`);
+        }
+      }
+    }
     const gammaFlip = findGammaFlip(agg, spotPrice);
     const callWall = findCallWall(agg);
     const putWall = findPutWall(agg);
@@ -188,41 +251,74 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
       gammaFlip, callWall, putWall, maxPain: maxPainResult.strike,
       topSignals: rec.signals.filter(s => s.weight !== 0).sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight)).slice(0, 3).map(s => `[${s.direction}] ${s.name}: ${s.description}`),
       warnings: rec.warnings,
+      totalVanna, totalCharm, vannaRegime, charmRegime,
+      deepITMCallOI, deepITMPutOI,
+      unusualVolumeStrikes: unusualVolumeStrikes.slice(0, 5),
+      gammaSlope, totalGEX, totalDEX,
+      atrPercent: profile.atrPercent,
+      dailySigma: profile.dailySigma,
+      skewBias: skew.skewBias,
     };
   } catch {
     return null;
   }
 }
 
+function abbr(n: number): string {
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return `$${(n / 1e9).toFixed(1)}B`;
+  if (abs >= 1e6) return `$${(n / 1e6).toFixed(0)}M`;
+  if (abs >= 1e3) return `$${(n / 1e3).toFixed(0)}K`;
+  return `$${n.toFixed(0)}`;
+}
+
 function buildBriefingPrompt(
   stocks: StockScan[],
   vixPrice: number,
-  swapSummary: { totalMaturitiesToday: number; totalNotionalToday: number; topMaturities: { symbol: string; count: number; notional: number }[]; asOf: string },
+  vixChangePct: number,
+  swapSummary: { totalMaturitiesToday: number; totalNotionalToday: number; totalMaturitiesWeek: number; totalNotionalWeek: number; topMaturities: { symbol: string; count: number; notional: number }[]; asOf: string },
   regSHOList: string[],
+  shortInterestData: { symbol: string; daysToCover: number; shortInterest: number }[],
 ): string {
   const indices = stocks.filter(s => INDICES.includes(s.symbol));
   const sectors = stocks.filter(s => SECTOR_ETFS.includes(s.symbol));
   const mag7 = stocks.filter(s => MAG7.includes(s.symbol));
 
   const fmtStock = (s: StockScan) => {
+    const gexLabel = s.totalGEX >= 0 ? `+${abbr(s.totalGEX)}` : abbr(s.totalGEX);
+    const dexLabel = s.totalDEX >= 0 ? `+${abbr(s.totalDEX)}` : abbr(s.totalDEX);
     const lines = [
-      `${s.symbol}: $${s.price.toFixed(2)} (${s.changePct >= 0 ? '+' : ''}${s.changePct.toFixed(2)}%) | Bias: ${s.biasScore > 0 ? '+' : ''}${s.biasScore} ${s.bias} | Gamma: ${s.gammaRegime} | IV: ${s.volRegime} (rank ${s.ivRank}) | PCR: ${s.volumePCR.toFixed(2)}`,
+      `${s.symbol}: $${s.price.toFixed(2)} (${s.changePct >= 0 ? '+' : ''}${s.changePct.toFixed(2)}%) | Bias: ${s.biasScore > 0 ? '+' : ''}${s.biasScore} ${s.bias} | Gamma: ${s.gammaRegime} | IV: ${s.volRegime} (rank ${s.ivRank}, ${(s.currentIV * 100).toFixed(0)}% IV vs ${(s.hvCurrent * 100).toFixed(0)}% HV) | PCR: ${s.volumePCR.toFixed(2)} | Skew: ${s.skewBias}`,
+      `  GEX: ${gexLabel} | DEX: ${dexLabel} | Vanna: ${s.vannaRegime} | Charm: ${s.charmRegime} | ATR: ${s.atrPercent.toFixed(1)}% | Daily 1σ: ${(s.dailySigma * 100).toFixed(2)}%`,
       `  Levels: γFlip=${s.gammaFlip ? '$' + s.gammaFlip.toFixed(0) : 'N/A'} CW=${s.callWall ? '$' + s.callWall.toFixed(0) : 'N/A'} PW=${s.putWall ? '$' + s.putWall.toFixed(0) : 'N/A'} MaxPain=$${s.maxPain.toFixed(0)}`,
       `  Top signals: ${s.topSignals.join(' | ') || 'none'}`,
     ];
+    if (s.deepITMCallOI > 1000 || s.deepITMPutOI > 1000) {
+      lines.push(`  Institutional proxy: DeepITM Call OI=${s.deepITMCallOI.toLocaleString()} (synth longs) | DeepITM Put OI=${s.deepITMPutOI.toLocaleString()} (hedges/synth shorts)`);
+    }
+    if (s.unusualVolumeStrikes.length > 0) {
+      lines.push(`  Unusual volume: ${s.unusualVolumeStrikes.join(', ')}`);
+    }
     if (s.warnings.length > 0) lines.push(`  Warnings: ${s.warnings.join(', ')}`);
     return lines.join('\n');
   };
 
-  let prompt = `You are a senior market strategist at a quantitative options desk. Generate a comprehensive DAILY MARKET BRIEFING based on live data analyzed across ${stocks.length} securities.
+  let prompt = `You are a senior quantitative market strategist. Generate a comprehensive MORNING BRIEFING from live options flow and dealer positioning data across ${stocks.length} securities.
 
-Write a professional, insightful analysis that a trader would read before the market opens. Be specific with numbers. Identify non-obvious patterns — sector rotations, divergences, unusual positioning, and regime changes.
+Your analysis should be direct, opinionated, and actionable — like a trading desk morning note. Lead with the single most important headline. Use specific numbers. Identify the primary edge for today.
+
+CRITICAL: You have second-order Greeks (vanna, charm) in addition to gamma. Use them:
+- VANNA: sensitivity of delta to implied vol changes. "Bullish vanna" means a vol drop forces dealers to buy stock. "Bearish vanna" means a vol drop forces dealers to sell.
+- CHARM: delta decay over time. "Bullish charm" means time passing forces dealers to buy. Charm is often the dominant flow on quiet days.
+- When vanna and charm DIVERGE (one bullish, one bearish), that creates conflict in dealer hedging — discuss which dominates and why.
+- When vanna and charm ALIGN, that confirms the directional bias.
+- GAMMA SLOPE measures how rapidly dealer exposure changes near spot — higher slope = stronger pinning effect.
 
 ═══════════════════════════════════════════
 LIVE MARKET DATA — ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
 ═══════════════════════════════════════════
 
-VIX: ${vixPrice.toFixed(2)}
+VIX: ${vixPrice.toFixed(2)} (${vixChangePct >= 0 ? '+' : ''}${vixChangePct.toFixed(1)}%)
 
 ─── INDEX ANALYSIS ───
 ${indices.map(fmtStock).join('\n\n')}
@@ -233,49 +329,81 @@ ${sectors.map(fmtStock).join('\n\n')}
 ─── MAGNIFICENT 7 ───
 ${mag7.map(fmtStock).join('\n\n')}`;
 
-  if (swapSummary.totalMaturitiesToday > 0 || swapSummary.asOf) {
-    const dateNote = swapSummary.asOf ? ` (report date: ${swapSummary.asOf})` : '';
-    prompt += `\n\n─── DTCC SWAP MATURITIES${dateNote} ───`;
+  // DTCC swap data
+  if (swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0 || swapSummary.asOf) {
+    const dateNote = swapSummary.asOf ? ` (report: ${swapSummary.asOf})` : '';
+    prompt += `\n\n─── DTCC EQUITY SWAP MATURITIES${dateNote} ───`;
     if (swapSummary.totalMaturitiesToday > 0) {
-      prompt += `\nTotal today: ${swapSummary.totalMaturitiesToday.toLocaleString()} swaps ($${(swapSummary.totalNotionalToday / 1e6).toFixed(0)}M notional)`;
-      prompt += `\nTop: ${swapSummary.topMaturities.slice(0, 5).map(m => `${m.symbol}(${m.count},$${(m.notional / 1e6).toFixed(0)}M)`).join(', ')}`;
-    } else {
-      prompt += `\nNo swaps maturing today — report contains open positions only.`;
+      prompt += `\nToday: ${swapSummary.totalMaturitiesToday.toLocaleString()} swaps (${abbr(swapSummary.totalNotionalToday)} notional)`;
+    }
+    if (swapSummary.totalMaturitiesWeek > 0) {
+      prompt += `\nThis week: ${swapSummary.totalMaturitiesWeek.toLocaleString()} swaps (${abbr(swapSummary.totalNotionalWeek)} notional)`;
+    }
+    if (swapSummary.topMaturities.length > 0) {
+      prompt += `\nTop by notional: ${swapSummary.topMaturities.slice(0, 8).map(m => `${m.symbol}(${m.count} swaps, ${abbr(m.notional)})`).join(', ')}`;
+    }
+    if (swapSummary.totalMaturitiesToday === 0 && swapSummary.totalMaturitiesWeek === 0) {
+      prompt += `\nNo swaps maturing today/this week — data reflects open positions only.`;
     }
   }
 
+  // Reg SHO
   if (regSHOList.length > 0) {
-    prompt += `\n\n─── REG SHO THRESHOLD LIST ───
-${regSHOList.length} securities: ${regSHOList.slice(0, 20).join(', ')}${regSHOList.length > 20 ? ` +${regSHOList.length - 20} more` : ''}`;
+    prompt += `\n\n─── REG SHO THRESHOLD LIST (persistent FTDs) ───
+${regSHOList.length} securities: ${regSHOList.slice(0, 25).join(', ')}${regSHOList.length > 25 ? ` +${regSHOList.length - 25} more` : ''}`;
+  }
+
+  // Short Interest
+  if (shortInterestData.length > 0) {
+    prompt += `\n\n─── HIGH SHORT INTEREST (>3 days to cover) ───`;
+    for (const si of shortInterestData.slice(0, 10)) {
+      prompt += `\n${si.symbol}: ${si.daysToCover.toFixed(1)} DTC, ${(si.shortInterest / 1e6).toFixed(2)}M shares short`;
+    }
+  }
+
+  // Institutional proxy summary
+  const synthLongs = stocks.filter(s => s.deepITMCallOI > 5000).sort((a, b) => b.deepITMCallOI - a.deepITMCallOI);
+  const synthShorts = stocks.filter(s => s.deepITMPutOI > 5000).sort((a, b) => b.deepITMPutOI - a.deepITMPutOI);
+  if (synthLongs.length > 0 || synthShorts.length > 0) {
+    prompt += `\n\n─── OPTIONS-DERIVED INSTITUTIONAL POSITIONING ───`;
+    prompt += `\n(Deep ITM options with high OI indicate synthetic stock positions — likely institutional hedging or directional bets)`;
+    if (synthLongs.length > 0) {
+      prompt += `\nSynthetic longs (deep ITM calls): ${synthLongs.slice(0, 5).map(s => `${s.symbol}(${s.deepITMCallOI.toLocaleString()} contracts)`).join(', ')}`;
+    }
+    if (synthShorts.length > 0) {
+      prompt += `\nSynthetic shorts/hedges (deep ITM puts): ${synthShorts.slice(0, 5).map(s => `${s.symbol}(${s.deepITMPutOI.toLocaleString()} contracts)`).join(', ')}`;
+    }
+  }
+
+  // Unusual volume summary
+  const uva = stocks.filter(s => s.unusualVolumeStrikes.length > 0);
+  if (uva.length > 0) {
+    prompt += `\n\n─── UNUSUAL OPTIONS ACTIVITY ───`;
+    for (const s of uva.slice(0, 8)) {
+      prompt += `\n${s.symbol}: ${s.unusualVolumeStrikes.join(', ')}`;
+    }
   }
 
   prompt += `\n\n═══════════════════════════════════════════
-YOUR TASK — Write the daily briefing covering:
+YOUR TASK — Write the morning briefing. Start with one bold headline sentence that captures today's most important dynamic. Then cover:
 
-## MARKET REGIME & OUTLOOK
-Overall market read. What's the gamma regime across indices? Are dealers long or short gamma? What does VIX tell us? Is the market in risk-on or risk-off mode? Reference the actual SPY/QQQ/IWM gamma flip levels, call/put walls, and bias scores.
+## Morning Briefing — ${new Date().toISOString().slice(0, 10)}
 
-## SECTOR ROTATION ANALYSIS
-Compare all 11 sector ETFs. Which sectors are leading? Which are lagging? Identify rotation patterns (e.g., defensive→cyclical, tech→value). Flag any sectors with unusual gamma positioning, extreme IV ranks, or divergent PCR readings.
+**Lead with one bold opening paragraph** summarizing the most critical market dynamic. Reference specific numbers. State the directional lean clearly.
 
-## NOTABLE DIVERGENCES & IMBALANCES
-Cross-reference all data points to find non-obvious signals:
-- Gamma regime divergences between indices (e.g., SPY long gamma but QQQ short gamma)
-- Unusual PCR readings in specific sectors
-- Stocks above/below gamma flip with implications
-- IV rank extremes (very high or low) suggesting vol mispricing
-- Bias score extremes — strongest bull and bear cases
+Then analyze:
 
-## MAGNIFICENT 7 SPOTLIGHT
-Only mention Mag7 names if they have notable readings. Which are showing unusual positioning? Any major divergences from the index? Skip any that are unremarkable.
+1. **GAMMA + VANNA + CHARM REGIME** — What's the gamma regime for SPY/QQQ/IWM? Crucially, analyze the VANNA and CHARM readings: which direction do they push dealer hedging? Do they confirm or contradict the gamma signal? If vanna and charm diverge, explain which dominates in the current vol regime (VIX level). Reference gamma flip levels and what happens if breached.
 
-${swapSummary.totalMaturitiesToday > 0 ? '## INSTITUTIONAL FLOW\nInterpret the DTCC swap maturity data. What does the volume and concentration of maturing swaps suggest about dealer rebalancing today?\n\n' : ''}${regSHOList.length > 0 ? '## SHORT SQUEEZE WATCHLIST\nAny notable names on the Reg SHO threshold list? Cross-reference with high IV rank or unusual gamma positioning.\n\n' : ''}## KEY LEVELS TO WATCH
-The most important price levels for today based on gamma walls, max pain, and support/resistance implied by dealer positioning.
+2. **INDEX DIVERGENCES** — Are SPY, QQQ, IWM aligned or divergent? What does the split mean? Is this rotation or broad trend? Which index has the cleanest directional setup based on gamma+vanna+charm alignment?
 
-## TRADE THESIS SUMMARY
-2-3 highest-conviction observations from the data. What actionable edge does this data give us today?
+3. **MAGNIFICENT 7 BREAKDOWN** — For each Mag7 stock with notable positioning, state the directional lean and which Greek(s) drive it. Flag any that diverge from their index. Count how many are long vs short — does narrow leadership make QQQ vulnerable?
 
-Be concise but data-rich. Every claim should reference specific numbers from the analysis. Format with clear markdown headers.`;
+${swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0 ? '4. **INSTITUTIONAL FLOW** — Interpret swap maturities. Extreme clusters create forced dealer rebalancing. Mention the notional and which specific names have the largest maturities.\n\n' : ''}${regSHOList.length > 0 || shortInterestData.length > 0 ? '5. **SHORT INTEREST / REG SHO** — Notable names with persistent FTDs or high days-to-cover. Cross-reference with positioning data.\n\n' : ''}6. **WATCHLIST** — Name 3-5 specific stocks (from any scanned) with the highest-conviction setups. For each: state the direction, the dominant Greek signal, key level to watch, and what would invalidate the thesis. Include hard-to-borrow or unusual volume context where available.
+
+7. **KEY LEVELS** — For SPY specifically: gamma flip, call wall, put wall, max pain. What happens at each level.
+
+Be opinionated and direct. Use **bold** for key names, levels, and directional calls. Every claim must reference specific data. Do NOT hedge every statement — make clear calls.`;
 
   return prompt;
 }
@@ -297,27 +425,51 @@ export async function POST() {
       }
     }
 
-    // Phase 1b: VIX + DTCC/FINRA (parallel with last batch or after)
-    const [vixQuote, swapSummary, regSHOSet] = await Promise.all([
-      getQuote('VIX').catch(() => null),
-      getMarketSwapSummary().catch(() => ({
-        totalMaturitiesToday: 0, totalNotionalToday: 0,
-        totalMaturitiesWeek: 0, totalNotionalWeek: 0,
-        topMaturities: [] as { symbol: string; count: number; notional: number }[],
-        asOf: '',
-      })),
+    // Phase 1b: VIX + DTCC/FINRA (parallel, with 8s hard budget for institutional data)
+    const emptySwap = {
+      totalMaturitiesToday: 0, totalNotionalToday: 0,
+      totalMaturitiesWeek: 0, totalNotionalWeek: 0,
+      topMaturities: [] as { symbol: string; count: number; notional: number }[],
+      asOf: '',
+    };
+    const institutionalPromise = Promise.all([
+      getMarketSwapSummary().catch(() => emptySwap),
       fetchRegSHOThreshold().catch(() => new Set<string>()),
+      fetchShortInterest().catch(() => new Map<string, ShortInterestData>()),
+    ]);
+    const instFallback: [typeof emptySwap, Set<string>, Map<string, ShortInterestData>] = [
+      emptySwap, new Set<string>(), new Map<string, ShortInterestData>(),
+    ];
+    const institutionalRace = Promise.race([
+      institutionalPromise,
+      new Promise<typeof instFallback>(resolve => setTimeout(() => resolve(instFallback), 8000)),
     ]);
 
+    const [vixQuote, instData] = await Promise.all([
+      getQuote('VIX').catch(() => null),
+      institutionalRace,
+    ]);
+
+    const [swapSummary, regSHOSet, shortInterestMap] = instData;
     const vixPrice = vixQuote?.last ?? 0;
+    const vixChangePct = vixQuote?.changePct ?? 0;
     const regSHOList = Array.from(regSHOSet).filter(s => /^[A-Z]+$/.test(s)).sort();
+
+    // Build short interest highlights (>3 days to cover)
+    const shortInterestData: { symbol: string; daysToCover: number; shortInterest: number }[] = [];
+    for (const [sym, data] of shortInterestMap) {
+      if (data.daysToCover > 3) {
+        shortInterestData.push({ symbol: sym, daysToCover: data.daysToCover, shortInterest: data.shortInterest });
+      }
+    }
+    shortInterestData.sort((a, b) => b.daysToCover - a.daysToCover);
 
     if (results.length === 0) {
       return NextResponse.json({ error: 'Failed to scan any stocks' }, { status: 500 });
     }
 
     // Phase 2: Build prompt and call Claude
-    const prompt = buildBriefingPrompt(results, vixPrice, swapSummary, regSHOList);
+    const prompt = buildBriefingPrompt(results, vixPrice, vixChangePct, swapSummary, regSHOList, shortInterestData);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const body: Record<string, any> = {

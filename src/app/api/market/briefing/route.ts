@@ -43,6 +43,15 @@ export interface IndexAnalysis {
   topSignals: { name: string; direction: string; weight: number; description: string }[];
   atrPercent: number;
   dailySigma: number;
+  // Enhanced: vanna/charm and institutional proxy
+  totalVanna: number;
+  totalCharm: number;
+  totalGEX: number;
+  vannaRegime: 'bullish' | 'bearish' | 'neutral';
+  charmRegime: 'bullish' | 'bearish' | 'neutral';
+  deepITMCallOI: number;
+  deepITMPutOI: number;
+  unusualVolumeStrikes: string[];
 }
 
 export interface BriefingData {
@@ -67,6 +76,20 @@ export interface BriefingData {
   finraAvailable: boolean;
   narrative: string[];
   alerts: string[];
+  // Options-derived institutional positioning
+  vannaCharmAnalysis: {
+    symbol: string;
+    totalVanna: number;
+    totalCharm: number;
+    vannaRegime: 'bullish' | 'bearish' | 'neutral';
+    charmRegime: 'bullish' | 'bearish' | 'neutral';
+    totalGEX: number;
+  }[];
+  optionsDerivedPositioning: {
+    deepITMCallOI: { symbol: string; contracts: number }[];
+    deepITMPutOI: { symbol: string; contracts: number }[];
+    unusualVolume: { symbol: string; strikes: string[] }[];
+  };
 }
 
 interface EquityBar {
@@ -292,12 +315,39 @@ export async function GET() {
         const byStrike = new Map<number, typeof allExposures[0]>();
         for (const e of allExposures) {
           const ex = byStrike.get(e.strike);
-          if (ex) { ex.netGEX += e.netGEX; ex.netDEX += e.netDEX; ex.callGEX += e.callGEX; ex.putGEX += e.putGEX; }
+          if (ex) {
+            ex.netGEX += e.netGEX; ex.netDEX += e.netDEX;
+            ex.callGEX += e.callGEX; ex.putGEX += e.putGEX;
+            ex.netVanna += e.netVanna; ex.callVanna += e.callVanna; ex.putVanna += e.putVanna;
+            ex.netCharm += e.netCharm; ex.callCharm += e.callCharm; ex.putCharm += e.putCharm;
+          }
           else byStrike.set(e.strike, { ...e });
         }
         const agg = Array.from(byStrike.values()).sort((a, b) => a.strike - b.strike);
         const totalGEX = agg.reduce((s, e) => s + e.netGEX, 0);
         const totalDEX = agg.reduce((s, e) => s + e.netDEX, 0);
+        const totalVanna = agg.reduce((s, e) => s + e.netVanna, 0);
+        const totalCharm = agg.reduce((s, e) => s + e.netCharm, 0);
+
+        // Deep ITM OI computation for institutional proxy
+        const itmThreshold = 0.15;
+        let deepITMCallOI = 0;
+        let deepITMPutOI = 0;
+        const unusualVolumeStrikes: string[] = [];
+        for (const chain of chains) {
+          for (const c of chain.calls) {
+            if (c.strike < spotPrice * (1 - itmThreshold) && c.openInterest > 100) deepITMCallOI += c.openInterest;
+            if (c.openInterest > 0 && c.volume > c.openInterest * 3 && c.volume > 500) {
+              unusualVolumeStrikes.push(`${c.strike}C`);
+            }
+          }
+          for (const p of chain.puts) {
+            if (p.strike > spotPrice * (1 + itmThreshold) && p.openInterest > 100) deepITMPutOI += p.openInterest;
+            if (p.openInterest > 0 && p.volume > p.openInterest * 3 && p.volume > 500) {
+              unusualVolumeStrikes.push(`${p.strike}P`);
+            }
+          }
+        }
         const gammaFlip = findGammaFlip(agg, spotPrice);
         const callWall = findCallWall(agg);
         const putWall = findPutWall(agg);
@@ -358,6 +408,13 @@ export async function GET() {
 
         const rec = generateRecommendations(input);
 
+        // Vanna/Charm regime determination
+        const vannaThreshold = Math.abs(totalGEX) * 0.01 || 1;
+        const vannaRegime: 'bullish' | 'bearish' | 'neutral' =
+          totalVanna > vannaThreshold ? 'bullish' : totalVanna < -vannaThreshold ? 'bearish' : 'neutral';
+        const charmRegime: 'bullish' | 'bearish' | 'neutral' =
+          totalCharm > vannaThreshold ? 'bullish' : totalCharm < -vannaThreshold ? 'bearish' : 'neutral';
+
         return {
           symbol: ticker,
           price: spotPrice,
@@ -375,6 +432,9 @@ export async function GET() {
           topSignals: rec.signals.filter(s => s.weight !== 0).sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight)).slice(0, 5),
           atrPercent: profile.atrPercent,
           dailySigma: profile.dailySigma,
+          totalVanna, totalCharm, totalGEX, vannaRegime, charmRegime,
+          deepITMCallOI, deepITMPutOI,
+          unusualVolumeStrikes: unusualVolumeStrikes.slice(0, 5),
         };
       } catch (err) {
         console.error(`[briefing] Failed ${ticker}:`, err instanceof Error ? err.message : err);
@@ -449,6 +509,22 @@ export async function GET() {
       regSHOList.length,
     );
 
+    // Build vanna/charm analysis and institutional proxy from index data
+    const vannaCharmAnalysis = indices.map(r => ({
+      symbol: r.symbol,
+      totalVanna: r.totalVanna,
+      totalCharm: r.totalCharm,
+      vannaRegime: r.vannaRegime,
+      charmRegime: r.charmRegime,
+      totalGEX: r.totalGEX,
+    }));
+
+    const optionsDerivedPositioning = {
+      deepITMCallOI: indices.filter(r => r.deepITMCallOI > 500).map(r => ({ symbol: r.symbol, contracts: r.deepITMCallOI })),
+      deepITMPutOI: indices.filter(r => r.deepITMPutOI > 500).map(r => ({ symbol: r.symbol, contracts: r.deepITMPutOI })),
+      unusualVolume: indices.filter(r => r.unusualVolumeStrikes.length > 0).map(r => ({ symbol: r.symbol, strikes: r.unusualVolumeStrikes })),
+    };
+
     const briefing: BriefingData = {
       timestamp: Date.now(),
       indices,
@@ -460,6 +536,8 @@ export async function GET() {
       shortInterestAsOf: siResult.asOf,
       finraAvailable,
       narrative, alerts,
+      vannaCharmAnalysis,
+      optionsDerivedPositioning,
     };
 
     return NextResponse.json(briefing);
