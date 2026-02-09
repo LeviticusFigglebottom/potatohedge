@@ -14,13 +14,16 @@ function getBaseUrl(): string {
   return process.env.TRADIER_SANDBOX === 'true' ? SANDBOX_URL : BASE_URL;
 }
 
+/** Hard timeout for every Tradier API call to prevent serverless function hangs */
+const FETCH_TIMEOUT = 8000;
+
 // ─── Quote ─────────────────────────────────────────────────────────
 
 export async function getQuote(symbol: string): Promise<Quote> {
   const token = process.env.TRADIER_API_KEY!;
   const res = await fetch(
     `${getBaseUrl()}/markets/quotes?symbols=${encodeURIComponent(symbol)}&greeks=false`,
-    { headers: getHeaders(token), next: { revalidate: 5 } }
+    { headers: getHeaders(token), next: { revalidate: 5 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) }
   );
 
   if (!res.ok) throw new Error(`Tradier quote error: ${res.status}`);
@@ -87,7 +90,7 @@ export async function getHistory(
     url = `${getBaseUrl()}/markets/history?symbol=${encodeURIComponent(symbol)}&interval=${mapped.interval}&start=${startDate}&end=${endDate}`;
   }
 
-  const res = await fetch(url, { headers: getHeaders(token), next: { revalidate: 30 } });
+  const res = await fetch(url, { headers: getHeaders(token), next: { revalidate: 30 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
   if (!res.ok) throw new Error(`Tradier history error: ${res.status}`);
   const data = await res.json();
 
@@ -124,7 +127,7 @@ export async function getExpirations(symbol: string): Promise<OptionExpiration[]
   const token = process.env.TRADIER_API_KEY!;
   const res = await fetch(
     `${getBaseUrl()}/markets/options/expirations?symbol=${encodeURIComponent(symbol)}&includeAllRoots=true&strikes=true`,
-    { headers: getHeaders(token), next: { revalidate: 300 } }
+    { headers: getHeaders(token), next: { revalidate: 300 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) }
   );
 
   if (!res.ok) throw new Error(`Tradier expirations error: ${res.status}`);
@@ -154,7 +157,7 @@ export async function getOptionsChain(symbol: string, expiration: string): Promi
   // Fetch chain with Greeks
   const res = await fetch(
     `${getBaseUrl()}/markets/options/chains?symbol=${encodeURIComponent(symbol)}&expiration=${expiration}&greeks=true`,
-    { headers: getHeaders(token), next: { revalidate: 10 } }
+    { headers: getHeaders(token), next: { revalidate: 10 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) }
   );
 
   if (!res.ok) throw new Error(`Tradier chain error: ${res.status}`);

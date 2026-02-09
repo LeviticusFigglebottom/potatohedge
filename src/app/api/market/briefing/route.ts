@@ -21,7 +21,7 @@ import { fetchRegSHOWithDate, fetchShortInterestWithDate } from '@/lib/providers
 export const maxDuration = 30;
 
 const KEY_INDICES = ['SPY', 'QQQ', 'IWM'];
-const MAG7 = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA'];
+const MAG7 = ['AAPL', 'MSFT', 'NVDA', 'AMZN']; // Top 4 by weight (reduced from 7 for speed)
 
 /** Analysis result for a single index */
 export interface IndexAnalysis {
@@ -268,13 +268,13 @@ export async function GET() {
         const [quote, expirations, historyBars] = await Promise.all([
           getQuote(ticker),
           getExpirations(ticker),
-          fetchEquityBars(ticker, 400),
+          fetchEquityBars(ticker, 250),
         ]);
 
         const spotPrice = quote.last;
         if (!spotPrice || spotPrice <= 0) return null;
 
-        const nearExps = expirations.slice(0, 4);
+        const nearExps = expirations.slice(0, 2); // 2 expirations max for briefing (speed)
         if (nearExps.length === 0) return null;
 
         const chains = await Promise.all(

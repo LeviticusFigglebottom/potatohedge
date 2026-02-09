@@ -9,6 +9,9 @@
 
 const BASE = 'https://api.polygon.io';
 
+/** Hard timeout for every Polygon API call to prevent serverless function hangs */
+const FETCH_TIMEOUT = 8000;
+
 function apiKey(): string {
   return process.env.POLYGON_API_KEY || '';
 }
@@ -56,6 +59,7 @@ export async function getOptionsSnapshot(
   // First request
   const firstRes: Response = await fetch(firstUrl, {
     next: { revalidate: 15 },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT),
   });
   if (!firstRes.ok)
     throw new Error(`Polygon snapshot error: ${firstRes.status}`);
@@ -68,6 +72,7 @@ export async function getOptionsSnapshot(
     const pageUrl = `${cursor}&apiKey=${apiKey()}`;
     const pageRes: Response = await fetch(pageUrl, {
       next: { revalidate: 15 },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT),
     });
     if (!pageRes.ok) break;
     const pageData = await pageRes.json();
@@ -96,7 +101,7 @@ export async function getEquityHistory(
     `/v2/aggs/ticker/${ticker.toUpperCase()}/range/${multiplier}/${timespan}/${from}/${to}`,
     { adjusted: 'true', sort: 'asc', limit: '50000' }
   );
-  const res: Response = await fetch(u, { next: { revalidate: 60 } });
+  const res: Response = await fetch(u, { next: { revalidate: 60 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
   if (!res.ok) throw new Error(`Polygon history error: ${res.status}`);
   const data = await res.json();
   return data.results || [];
@@ -108,7 +113,7 @@ export async function getPreviousClose(
   ticker: string
 ): Promise<PolygonBar | null> {
   const u = buildUrl(`/v2/aggs/ticker/${ticker.toUpperCase()}/prev`);
-  const res: Response = await fetch(u, { next: { revalidate: 60 } });
+  const res: Response = await fetch(u, { next: { revalidate: 60 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
   if (!res.ok) return null;
   const data = await res.json();
   return data.results?.[0] || null;
