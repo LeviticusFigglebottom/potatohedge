@@ -230,15 +230,34 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
   },
 
   runDiagnostics: async () => {
-    const diag: { debug?: unknown; health?: unknown; ranAt?: string } = { ranAt: new Date().toISOString() };
+    const sym = get().symbol || 'SPY';
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const diag: Record<string, any> = { ranAt: new Date().toISOString() };
+
+    // Test 1: bare debug endpoint
     try {
-      const debugRes = await fetch('/api/debug');
-      diag.debug = debugRes.ok ? await debugRes.json() : { error: `${debugRes.status}: ${await debugRes.text().catch(() => 'Error')}` };
+      const r = await fetch('/api/debug');
+      diag.debug = r.ok ? await r.json() : { status: r.status, html: r.headers.get('content-type')?.includes('html') };
     } catch (e) { diag.debug = { error: (e as Error).message }; }
+
+    // Test 2: health endpoint (imports all modules)
     try {
-      const healthRes = await fetch('/api/health');
-      diag.health = healthRes.ok ? await healthRes.json() : { error: `${healthRes.status}: ${await healthRes.text().catch(() => 'Error')}` };
+      const r = await fetch('/api/health');
+      diag.health = r.ok ? await r.json() : { status: r.status, html: r.headers.get('content-type')?.includes('html') };
     } catch (e) { diag.health = { error: (e as Error).message }; }
+
+    // Test 3: stripped /recommendations (bare minimum — just returns JSON)
+    try {
+      const r = await fetch(`/api/market/recommendations?symbol=${sym}`);
+      diag.recsStripped = r.ok ? await r.json() : { status: r.status, html: r.headers.get('content-type')?.includes('html') };
+    } catch (e) { diag.recsStripped = { error: (e as Error).message }; }
+
+    // Test 4: new /recs endpoint (full computation at fresh path)
+    try {
+      const r = await fetch(`/api/market/recs?symbol=${sym}`);
+      diag.recsFull = r.ok ? await r.json() : { status: r.status, html: r.headers.get('content-type')?.includes('html') };
+    } catch (e) { diag.recsFull = { error: (e as Error).message }; }
+
     set({ diagnostics: diag });
   },
 
