@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import TickerSearch from '@/components/dashboard/TickerSearch';
 import QuoteHeader from '@/components/dashboard/QuoteHeader';
@@ -19,7 +19,29 @@ import ScreenerTab from '@/components/dashboard/ScreenerTab';
 import BriefingTab from '@/components/dashboard/BriefingTab';
 import InstitutionalTab from '@/components/dashboard/InstitutionalTab';
 import CorrelationPanel from '@/components/dashboard/CorrelationPanel';
-import { Activity, Zap } from 'lucide-react';
+import { Activity, Zap, AlertTriangle, X } from 'lucide-react';
+
+function ErrorBanner() {
+  const { error } = useDashboardStore();
+  const [dismissed, setDismissed] = useState(false);
+
+  useEffect(() => { setDismissed(false); }, [error]);
+
+  if (!error || dismissed) return null;
+
+  return (
+    <div className="bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-3 flex items-start gap-3">
+      <AlertTriangle className="w-4 h-4 text-red-400 mt-0.5 shrink-0" />
+      <div className="flex-1 min-w-0">
+        <div className="text-sm font-semibold text-red-400 mb-1">API Error</div>
+        <pre className="text-xs text-red-300/80 font-mono whitespace-pre-wrap break-all max-h-40 overflow-auto">{error}</pre>
+      </div>
+      <button onClick={() => setDismissed(true)} className="text-red-400/60 hover:text-red-400 shrink-0">
+        <X className="w-4 h-4" />
+      </button>
+    </div>
+  );
+}
 
 function OverviewTab() {
   return (
@@ -86,6 +108,7 @@ export default function DashboardPage() {
 
       {/* Main */}
       <main className="max-w-[1920px] mx-auto px-4 py-4 space-y-4">
+        <ErrorBanner />
         <QuoteHeader />
         <TabNav />
         <div className="min-h-[500px]">
