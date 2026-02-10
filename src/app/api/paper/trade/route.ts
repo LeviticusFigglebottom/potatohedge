@@ -3,6 +3,7 @@ import {
   placeSingleOrder,
   placeMultiLegOrder,
   buildOCCSymbol,
+  getOptionQuotes,
   type SingleLegOrder,
 } from '@/lib/providers/tradierPaper';
 
@@ -99,16 +100,53 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: 'Missing required fields: symbol, legs (array of 2+ legs)' }, { status: 400 });
       }
 
+      // Build OCC symbols for each leg
+      const builtLegs = legs.map((leg: { expiration: string; optionType: 'C' | 'P'; strike: number; side: string; quantity?: number }) => ({
+        optionSymbol: buildOCCSymbol(symbol, leg.expiration, leg.optionType, leg.strike),
+        side: leg.side as 'buy_to_open' | 'sell_to_open',
+        quantity: leg.quantity || 1,
+      }));
+
+      // Tradier requires 'price' for debit/credit types.
+      // If no netPrice provided, fetch live quotes and calculate mid-price.
+      let resolvedType = (orderType || 'market') as 'market' | 'debit' | 'credit' | 'even';
+      let resolvedPrice = netPrice as number | undefined;
+
+      if ((resolvedType === 'debit' || resolvedType === 'credit') && resolvedPrice == null) {
+        try {
+          const occSymbols = builtLegs.map((l: { optionSymbol: string }) => l.optionSymbol);
+          const quotes = await getOptionQuotes(occSymbols);
+
+          // Calculate net: sum of (mid * quantity * direction)
+          // buy legs are negative cost (we pay), sell legs are positive (we receive)
+          let netMid = 0;
+          for (const leg of builtLegs) {
+            const q = quotes.get(leg.optionSymbol);
+            if (!q || (q.bid === 0 && q.ask === 0)) continue;
+            const mid = (q.bid + q.ask) / 2;
+            const direction = leg.side.startsWith('sell') ? 1 : -1; // sell = receive, buy = pay
+            netMid += mid * leg.quantity * direction;
+          }
+
+          if (netMid !== 0) {
+            // For credit spreads net is positive (we receive), for debit it's negative (we pay)
+            resolvedPrice = Math.abs(parseFloat(netMid.toFixed(2)));
+          } else {
+            // Can't determine price — fall back to market
+            resolvedType = 'market';
+          }
+        } catch {
+          // Quote fetch failed — fall back to market type
+          resolvedType = 'market';
+        }
+      }
+
       const multilegOrder = {
         symbol,
-        type: (orderType || 'market') as 'market' | 'debit' | 'credit' | 'even',
-        price: netPrice,
+        type: resolvedType,
+        price: resolvedPrice,
         duration: (duration || 'day') as 'day' | 'gtc',
-        legs: legs.map((leg: { expiration: string; optionType: 'C' | 'P'; strike: number; side: string; quantity?: number }) => ({
-          optionSymbol: buildOCCSymbol(symbol, leg.expiration, leg.optionType, leg.strike),
-          side: leg.side as 'buy_to_open' | 'sell_to_open',
-          quantity: leg.quantity || 1,
-        })),
+        legs: builtLegs,
       };
 
       const result = await placeMultiLegOrder(multilegOrder);
