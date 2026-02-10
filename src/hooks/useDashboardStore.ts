@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import type { Quote, OHLCV, OptionsChain, OptionExpiration, Interval } from '@/types/market';
 import type { StrikeExposure } from '@/lib/math/blackScholes';
 import type { CorrelationResult } from '@/lib/math/correlations';
-import { saveMetricSnapshot, loadMetricHistory, type DailyMetricRecord } from '@/lib/metricHistory';
+import { saveMetricSnapshot, loadMetricHistory, loadMetricHistoryWithSync, type DailyMetricRecord } from '@/lib/metricHistory';
 
 // ─── Phase 2 Types ─────────────────────────────────────────
 
@@ -203,8 +203,13 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
   saveAndLoadMetricHistory: () => {
     const { symbol, multiGEX, snapshot } = get();
     if (!multiGEX || !snapshot) {
-      const existing = loadMetricHistory(symbol);
-      if (existing.length > 0) set({ metricHistory: existing });
+      // Try server sync first, fall back to localStorage
+      loadMetricHistoryWithSync(symbol).then(merged => {
+        if (merged.length > 0) set({ metricHistory: merged });
+      }).catch(() => {
+        const existing = loadMetricHistory(symbol);
+        if (existing.length > 0) set({ metricHistory: existing });
+      });
       return;
     }
     const today = new Date();
@@ -231,6 +236,11 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     };
     saveMetricSnapshot(symbol, record);
     set({ metricHistory: loadMetricHistory(symbol) });
+
+    // Async: merge with server data (updates state when ready)
+    loadMetricHistoryWithSync(symbol).then(merged => {
+      if (merged.length > 0) set({ metricHistory: merged });
+    }).catch(() => {});
   },
 
   runDiagnostics: async () => {

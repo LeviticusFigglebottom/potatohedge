@@ -8,6 +8,7 @@ import {
 } from '@/lib/providers/finra';
 import { getMarketIndicators, isFREDAvailable } from '@/lib/providers/fred';
 import { scanMarketFlow, type FlowResult } from '@/lib/providers/polygonFlow';
+import { saveDaily, type HistoryRecord } from '@/lib/persistence';
 
 export const maxDuration = 15;
 
@@ -70,6 +71,50 @@ export async function GET(_req: NextRequest) {
     if (flowResult.asOf) sources.push(flowResult.isDeveloper ? 'Polygon Flow (Developer)' : 'Polygon Flow');
     sources.push('Polygon SI/SV', 'FINRA Reg SHO', 'DTCC Swaps');
     if (isFREDAvailable() && (indicators.vix || indicators.skew)) sources.push('FRED');
+
+    // ── Fire-and-forget: persist daily flow snapshot ──
+    if (flowResult.asOf) {
+      const today = new Date().toISOString().slice(0, 10);
+      const flowRecord: HistoryRecord = {
+        date: today,
+        timestamp: Date.now(),
+        netPremium: flowResult.flow.netPremium,
+        netCallPremium: flowResult.flow.netCallPremium,
+        netPutPremium: flowResult.flow.netPutPremium,
+        totalCallVolume: flowResult.flow.totalCallVolume,
+        totalPutVolume: flowResult.flow.totalPutVolume,
+        putCallRatio: flowResult.flow.putCallRatio,
+        sentiment: flowResult.flow.sentiment,
+        contractsAnalyzed: flowResult.flow.contractsAnalyzed,
+        tickersScanned: flowResult.flow.tickersScanned,
+        sweepCount: flowResult.alerts.filter(a => a.tradeType === 'sweep').length,
+        blockCount: flowResult.alerts.filter(a => a.tradeType === 'block').length,
+        topAlertPremium: flowResult.alerts[0]?.premium ?? 0,
+        vixPrice: indicators.vix?.current ?? undefined,
+        skewValue: indicators.skew?.current ?? undefined,
+        perTicker: flowResult.perTickerFlow.slice(0, 10).map(tf => ({
+          ticker: tf.ticker,
+          netPremium: tf.netPremium,
+          callPremium: tf.callPremium,
+          putPremium: tf.putPremium,
+        })),
+      };
+      saveDaily('optix:flow:market', flowRecord).catch(() => {});
+
+      // Per-ticker flow
+      for (const tf of flowResult.perTickerFlow.slice(0, 10)) {
+        const tickerRecord: HistoryRecord = {
+          date: today,
+          timestamp: Date.now(),
+          netPremium: tf.netPremium,
+          callPremium: tf.callPremium,
+          putPremium: tf.putPremium,
+          callVolume: tf.callVolume,
+          putVolume: tf.putVolume,
+        };
+        saveDaily(`optix:flow:${tf.ticker}`, tickerRecord).catch(() => {});
+      }
+    }
 
     return NextResponse.json({
       timestamp: Date.now(),

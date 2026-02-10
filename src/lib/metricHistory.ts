@@ -1,9 +1,12 @@
 /**
- * localStorage-based daily metric tracking.
+ * Daily metric tracking with server persistence.
  *
- * Each time the dashboard loads fresh data, we save a snapshot of key metrics
- * for the current date. Over time this builds a backward-looking history
- * that the MetricExplorer can chart.
+ * Each time the dashboard loads fresh data, we save a snapshot of key metrics.
+ * Data is stored in:
+ * 1. localStorage (immediate, device-local)
+ * 2. Server (Upstash Redis / Vercel Blob) via /api/history endpoint
+ *
+ * On load, merges server history with localStorage for the most complete dataset.
  */
 
 export interface DailyMetricRecord {
@@ -33,6 +36,8 @@ const MAX_RECORDS = 365;
 function storageKey(symbol: string): string {
   return `${STORAGE_PREFIX}${symbol.toUpperCase()}`;
 }
+
+// ─── localStorage (device-local) ───────────────────────────
 
 export function loadMetricHistory(symbol: string): DailyMetricRecord[] {
   if (typeof window === 'undefined') return [];
@@ -68,6 +73,9 @@ export function saveMetricSnapshot(symbol: string, record: DailyMetricRecord): v
   } catch {
     // localStorage full or unavailable — silently fail
   }
+
+  // Fire-and-forget: sync to server
+  syncMetricToServer(symbol, record).catch(() => {});
 }
 
 export function clearMetricHistory(symbol: string): void {
@@ -76,6 +84,93 @@ export function clearMetricHistory(symbol: string): void {
     localStorage.removeItem(storageKey(symbol));
   } catch {
     // ignore
+  }
+}
+
+// ─── Server sync ───────────────────────────────────────────
+
+/** Push a single record to the server (merges with existing server data) */
+async function syncMetricToServer(symbol: string, record: DailyMetricRecord): Promise<void> {
+  await fetch('/api/history', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      type: 'metrics',
+      ticker: symbol.toUpperCase(),
+      records: [record],
+    }),
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+/**
+ * Load history from server and merge with localStorage.
+ * Returns the merged result (most complete dataset).
+ * Call this once on app load for the active ticker.
+ */
+export async function loadMetricHistoryWithSync(symbol: string): Promise<DailyMetricRecord[]> {
+  const local = loadMetricHistory(symbol);
+
+  try {
+    const res = await fetch(`/api/history?type=metrics&ticker=${symbol.toUpperCase()}&days=365`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return local;
+
+    const { records: server } = await res.json() as { records: DailyMetricRecord[] };
+    if (!server || server.length === 0) {
+      // No server data — push localStorage to server if we have some
+      if (local.length > 0) {
+        fetch('/api/history', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'metrics',
+            ticker: symbol.toUpperCase(),
+            records: local,
+          }),
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => {});
+      }
+      return local;
+    }
+
+    // Merge: server + local, dedup by date (most recent timestamp wins)
+    const byDate = new Map<string, DailyMetricRecord>();
+    for (const r of server) byDate.set(r.date, r);
+    for (const r of local) {
+      const existing = byDate.get(r.date);
+      if (!existing || r.timestamp > existing.timestamp) {
+        byDate.set(r.date, r);
+      }
+    }
+
+    const merged = Array.from(byDate.values());
+    merged.sort((a, b) => a.timestamp - b.timestamp);
+    const trimmed = merged.slice(-MAX_RECORDS);
+
+    // Update localStorage with merged data
+    try {
+      localStorage.setItem(storageKey(symbol), JSON.stringify(trimmed));
+    } catch { /* ignore */ }
+
+    // If local had records server didn't, sync back
+    if (local.length > server.length) {
+      fetch('/api/history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'metrics',
+          ticker: symbol.toUpperCase(),
+          records: trimmed,
+        }),
+        signal: AbortSignal.timeout(5000),
+      }).catch(() => {});
+    }
+
+    return trimmed;
+  } catch {
+    return local;
   }
 }
 

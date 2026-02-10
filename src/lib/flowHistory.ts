@@ -1,9 +1,10 @@
 /**
- * localStorage-based daily flow tracking.
+ * Daily flow tracking with server persistence.
  *
  * When the institutional tab loads, we save a snapshot of market-wide flow metrics.
- * Over time this builds a backward-looking history that the FlowHistoryChart can chart,
- * similar to how MetricExplorer tracks GEX/IV/PCR history.
+ * Data is stored in:
+ * 1. localStorage (immediate, device-local)
+ * 2. Server (Upstash Redis / Vercel Blob) — auto-saved by institutional route + client sync
  *
  * Two scopes:
  * 1. Market-wide: net premium, P/C ratio, sentiment (from all 10 watchlist tickers)
@@ -78,6 +79,14 @@ export function saveFlowSnapshot(record: DailyFlowRecord): void {
   } catch {
     // localStorage full — silently fail
   }
+
+  // Fire-and-forget: sync to server
+  fetch('/api/history', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'flow', records: [record] }),
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => {});
 }
 
 // ─── Per-Ticker Flow History ────────────────────────────────
@@ -120,6 +129,75 @@ export function saveTickerFlowSnapshot(ticker: string, record: TickerFlowRecord)
     localStorage.setItem(`${STORAGE_KEY_TICKER}${ticker.toUpperCase()}`, JSON.stringify(trimmed));
   } catch {
     // silently fail
+  }
+
+  // Fire-and-forget: sync per-ticker flow to server
+  fetch('/api/history', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'flow', ticker: ticker.toUpperCase(), records: [record] }),
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => {});
+}
+
+// ─── Server sync ───────────────────────────────────────────
+
+/**
+ * Load flow history from server and merge with localStorage.
+ * Call once on institutional tab mount.
+ */
+export async function loadFlowHistoryWithSync(): Promise<DailyFlowRecord[]> {
+  const local = loadFlowHistory();
+
+  try {
+    const res = await fetch('/api/history?type=flow&days=365', {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return local;
+
+    const { records: server } = await res.json() as { records: DailyFlowRecord[] };
+    if (!server || server.length === 0) {
+      if (local.length > 0) {
+        fetch('/api/history', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'flow', records: local }),
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => {});
+      }
+      return local;
+    }
+
+    // Merge: server + local, dedup by date
+    const byDate = new Map<string, DailyFlowRecord>();
+    for (const r of server) byDate.set(r.date, r);
+    for (const r of local) {
+      const existing = byDate.get(r.date);
+      if (!existing || r.timestamp > existing.timestamp) {
+        byDate.set(r.date, r);
+      }
+    }
+
+    const merged = Array.from(byDate.values());
+    merged.sort((a, b) => a.timestamp - b.timestamp);
+    const trimmed = merged.slice(-MAX_RECORDS);
+
+    try {
+      localStorage.setItem(STORAGE_KEY_MARKET, JSON.stringify(trimmed));
+    } catch { /* ignore */ }
+
+    if (local.length > server.length) {
+      fetch('/api/history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'flow', records: trimmed }),
+        signal: AbortSignal.timeout(5000),
+      }).catch(() => {});
+    }
+
+    return trimmed;
+  } catch {
+    return local;
   }
 }
 

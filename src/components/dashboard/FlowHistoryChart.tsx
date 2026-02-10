@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   loadFlowHistory,
+  loadFlowHistoryWithSync,
   loadTickerFlowHistory,
   FLOW_METRICS,
   type DailyFlowRecord,
@@ -45,7 +46,11 @@ function MarketFlowChart() {
   const [history, setHistory] = useState<DailyFlowRecord[]>([]);
 
   useEffect(() => {
+    // Load localStorage immediately, then merge with server
     setHistory(loadFlowHistory());
+    loadFlowHistoryWithSync().then(merged => {
+      if (merged.length > 0) setHistory(merged);
+    }).catch(() => {});
   }, []);
 
   const metric = FLOW_METRICS[metricIdx];
