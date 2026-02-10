@@ -364,13 +364,15 @@ export async function getGainLoss(limit: number = 50): Promise<GainLossEntry[]> 
 
 // ─── Option Quote (for current pricing) ────────────────────
 
-export async function getOptionQuote(occSymbol: string): Promise<{
+export interface OptionQuote {
   last: number;
   bid: number;
   ask: number;
   volume: number;
   open_interest: number;
-} | null> {
+}
+
+export async function getOptionQuote(occSymbol: string): Promise<OptionQuote | null> {
   const res = await fetch(
     `${SANDBOX_URL}/markets/quotes?symbols=${encodeURIComponent(occSymbol)}&greeks=false`,
     {
@@ -391,4 +393,60 @@ export async function getOptionQuote(occSymbol: string): Promise<{
     volume: quote.volume ?? 0,
     open_interest: quote.open_interest ?? 0,
   };
+}
+
+/**
+ * Batch-fetch quotes for multiple option symbols.
+ */
+export async function getOptionQuotes(occSymbols: string[]): Promise<Map<string, OptionQuote>> {
+  const result = new Map<string, OptionQuote>();
+  if (occSymbols.length === 0) return result;
+
+  const res = await fetch(
+    `${SANDBOX_URL}/markets/quotes?symbols=${occSymbols.map(s => encodeURIComponent(s)).join(',')}&greeks=false`,
+    {
+      headers: getHeaders(),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT),
+    }
+  );
+
+  if (!res.ok) return result;
+  const data = await res.json();
+  const quotes = data.quotes?.quote;
+  if (!quotes) return result;
+  const arr = Array.isArray(quotes) ? quotes : [quotes];
+  for (const q of arr) {
+    if (q.symbol) {
+      result.set(q.symbol, {
+        last: q.last ?? 0,
+        bid: q.bid ?? 0,
+        ask: q.ask ?? 0,
+        volume: q.volume ?? 0,
+        open_interest: q.open_interest ?? 0,
+      });
+    }
+  }
+  return result;
+}
+
+/**
+ * Close an open position by placing a sell_to_close (long) or buy_to_close (short) order.
+ */
+export async function closePosition(
+  underlying: string,
+  occSymbol: string,
+  quantity: number,
+  orderType: 'market' | 'limit' = 'market',
+  limitPrice?: number,
+): Promise<OrderResult> {
+  const side = quantity > 0 ? 'sell_to_close' : 'buy_to_close';
+  return placeSingleOrder({
+    symbol: underlying,
+    optionSymbol: occSymbol,
+    side,
+    quantity: Math.abs(quantity),
+    type: orderType,
+    price: limitPrice,
+    duration: 'gtc',
+  });
 }

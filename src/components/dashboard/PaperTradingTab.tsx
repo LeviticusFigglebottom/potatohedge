@@ -3,7 +3,8 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import {
   Wallet, RefreshCw, TrendingUp, TrendingDown, X, Clock,
-  CheckCircle2, XCircle, AlertTriangle, DollarSign, Plus,
+  CheckCircle2, AlertTriangle, DollarSign, Plus, Target, ShieldAlert,
+  Activity,
 } from 'lucide-react';
 
 interface ParsedOCC {
@@ -21,6 +22,12 @@ interface Position {
   date_acquired: string;
   parsed: ParsedOCC | null;
   costPerContract: number;
+  currentPrice: number;
+  currentValue: number;
+  unrealizedPL: number;
+  unrealizedPLPct: number;
+  bid: number;
+  ask: number;
 }
 
 interface HistoryEntry {
@@ -65,28 +72,41 @@ interface Order {
   create_date: string;
   class: string;
   parsed?: ParsedOCC | null;
+  leg?: Order[];
 }
 
-// Trade metadata stored in localStorage
-interface TradeNote {
-  orderId: number;
+// Trade rules stored in localStorage — keyed by OCC symbol
+interface TradeRule {
+  occSymbol: string;
   thesis: string;
-  targetPrice: number | null;
-  stopPrice: number | null;
+  targetPrice: number | null;  // option price target (take profit)
+  stopPrice: number | null;    // option price stop (cut loss)
+  costBasis: number;           // entry cost per contract
   createdAt: string;
+  autoExit: boolean;           // whether to auto-close when target/stop hit
+  exitTriggered?: 'target' | 'stop' | null;
+  exitOrderId?: number;
 }
 
-function loadNotes(): TradeNote[] {
+function loadRules(): TradeRule[] {
   if (typeof window === 'undefined') return [];
   try {
-    return JSON.parse(localStorage.getItem('optix-paper-notes') || '[]');
+    return JSON.parse(localStorage.getItem('optix-paper-rules') || '[]');
   } catch { return []; }
 }
 
-function saveNote(note: TradeNote) {
-  const notes = loadNotes().filter(n => n.orderId !== note.orderId);
-  notes.push(note);
-  localStorage.setItem('optix-paper-notes', JSON.stringify(notes));
+function saveRules(rules: TradeRule[]) {
+  localStorage.setItem('optix-paper-rules', JSON.stringify(rules));
+}
+
+function saveRule(rule: TradeRule) {
+  const rules = loadRules().filter(r => r.occSymbol !== rule.occSymbol);
+  rules.push(rule);
+  saveRules(rules);
+}
+
+function getRuleForSymbol(symbol: string): TradeRule | undefined {
+  return loadRules().find(r => r.occSymbol === symbol);
 }
 
 function fmtMoney(n: number): string {
@@ -96,6 +116,144 @@ function fmtMoney(n: number): string {
 function fmtOCC(parsed: ParsedOCC | null, fallback: string): string {
   if (!parsed) return fallback;
   return `${parsed.underlying} ${parsed.expDate} $${parsed.strike} ${parsed.type === 'C' ? 'Call' : 'Put'}`;
+}
+
+function PLBadge({ value, pct }: { value: number; pct: number }) {
+  const color = value >= 0 ? 'text-green-400' : 'text-red-400';
+  const bg = value >= 0 ? 'bg-green-500/10' : 'bg-red-500/10';
+  return (
+    <span className={`${color} ${bg} px-1.5 py-0.5 rounded text-xs font-mono`}>
+      {value >= 0 ? '+' : ''}{fmtMoney(value)} ({pct >= 0 ? '+' : ''}{pct.toFixed(1)}%)
+    </span>
+  );
+}
+
+// Progress bar for target/stop
+function ExitProgress({ current, entry, target, stop }: { current: number; entry: number; target: number | null; stop: number | null }) {
+  if (!target && !stop) return <span className="text-text-muted text-xs">No rules set</span>;
+
+  // Calculate progress toward target or stop
+  const targetPct = target && entry > 0 ? ((current - entry) / (target - entry)) * 100 : 0;
+  const stopPct = stop && entry > 0 ? ((entry - current) / (entry - stop)) * 100 : 0;
+
+  const isNearTarget = target && current >= target * 0.9;
+  const isNearStop = stop && current <= stop * 1.1;
+  const hitTarget = target && current >= target;
+  const hitStop = stop && current <= stop;
+
+  return (
+    <div className="flex flex-col gap-1 min-w-[120px]">
+      {target && (
+        <div className="flex items-center gap-1.5">
+          <Target className={`w-3 h-3 ${hitTarget ? 'text-green-400' : isNearTarget ? 'text-yellow-400' : 'text-text-muted'}`} />
+          <div className="flex-1 h-1.5 bg-bg-tertiary rounded-full overflow-hidden">
+            <div
+              className={`h-full rounded-full transition-all ${hitTarget ? 'bg-green-400' : 'bg-accent-cyan/60'}`}
+              style={{ width: `${Math.min(100, Math.max(0, targetPct))}%` }}
+            />
+          </div>
+          <span className="text-[10px] font-mono text-text-muted">{fmtMoney(target)}</span>
+        </div>
+      )}
+      {stop && (
+        <div className="flex items-center gap-1.5">
+          <ShieldAlert className={`w-3 h-3 ${hitStop ? 'text-red-400' : isNearStop ? 'text-yellow-400' : 'text-text-muted'}`} />
+          <div className="flex-1 h-1.5 bg-bg-tertiary rounded-full overflow-hidden">
+            <div
+              className={`h-full rounded-full transition-all ${hitStop ? 'bg-red-400' : 'bg-red-400/40'}`}
+              style={{ width: `${Math.min(100, Math.max(0, stopPct))}%` }}
+            />
+          </div>
+          <span className="text-[10px] font-mono text-text-muted">{fmtMoney(stop)}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Edit Rule Modal ─────────────────────────────────────────
+
+function EditRuleForm({ position, rule, onSave, onClose }: {
+  position: Position;
+  rule: TradeRule | undefined;
+  onSave: (rule: TradeRule) => void;
+  onClose: () => void;
+}) {
+  const [target, setTarget] = useState(rule?.targetPrice?.toString() || '');
+  const [stop, setStop] = useState(rule?.stopPrice?.toString() || '');
+  const [thesis, setThesis] = useState(rule?.thesis || '');
+  const [autoExit, setAutoExit] = useState(rule?.autoExit ?? true);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    onSave({
+      occSymbol: position.symbol,
+      thesis,
+      targetPrice: target ? parseFloat(target) : null,
+      stopPrice: stop ? parseFloat(stop) : null,
+      costBasis: position.costPerContract,
+      createdAt: rule?.createdAt || new Date().toISOString(),
+      autoExit,
+    });
+    onClose();
+  };
+
+  const inputClass = 'bg-bg-tertiary border border-border/30 rounded px-2 py-1.5 text-sm font-mono text-text-primary focus:border-accent-cyan/50 focus:outline-none w-full';
+
+  return (
+    <form onSubmit={handleSubmit} className="p-3 bg-bg-tertiary/50 border border-border/20 rounded-lg space-y-2 mt-2">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-semibold text-text-secondary">
+          Exit Rules — {fmtOCC(position.parsed, position.symbol)}
+        </span>
+        <button type="button" onClick={onClose} className="text-text-muted hover:text-text-primary">
+          <X className="w-3.5 h-3.5" />
+        </button>
+      </div>
+      <div className="text-xs text-text-muted font-mono">
+        Entry: {fmtMoney(position.costPerContract)} | Current: {fmtMoney(position.currentPrice)} | Bid/Ask: {fmtMoney(position.bid)}/{fmtMoney(position.ask)}
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <div>
+          <label className="text-[10px] text-text-muted font-mono mb-0.5 block">Take Profit ($)</label>
+          <input className={inputClass} type="number" step="0.01" placeholder="e.g. 5.00" value={target} onChange={e => setTarget(e.target.value)} />
+          {position.costPerContract > 0 && target && (
+            <span className="text-[10px] text-green-400/60 font-mono">
+              +{(((parseFloat(target) - position.costPerContract) / position.costPerContract) * 100).toFixed(0)}% return
+            </span>
+          )}
+        </div>
+        <div>
+          <label className="text-[10px] text-text-muted font-mono mb-0.5 block">Stop Loss ($)</label>
+          <input className={inputClass} type="number" step="0.01" placeholder="e.g. 1.50" value={stop} onChange={e => setStop(e.target.value)} />
+          {position.costPerContract > 0 && stop && (
+            <span className="text-[10px] text-red-400/60 font-mono">
+              {(((parseFloat(stop) - position.costPerContract) / position.costPerContract) * 100).toFixed(0)}% risk
+            </span>
+          )}
+        </div>
+      </div>
+      <div>
+        <label className="text-[10px] text-text-muted font-mono mb-0.5 block">Thesis / Notes</label>
+        <input className={inputClass} placeholder="Why this trade?" value={thesis} onChange={e => setThesis(e.target.value)} />
+      </div>
+      <div className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          id="autoExit"
+          checked={autoExit}
+          onChange={e => setAutoExit(e.target.checked)}
+          className="w-3.5 h-3.5 rounded border-border/30 accent-accent-cyan"
+        />
+        <label htmlFor="autoExit" className="text-xs text-text-muted font-mono">
+          Auto-close when target/stop hit (checks every 30s)
+        </label>
+      </div>
+      <button type="submit" className="w-full py-1.5 rounded-md bg-accent-cyan/20 text-accent-cyan border border-accent-cyan/30 hover:bg-accent-cyan/30 transition-all text-xs font-medium">
+        Save Exit Rules
+      </button>
+    </form>
+  );
 }
 
 // ─── Quick Trade Form ───────────────────────────────────────
@@ -129,6 +287,7 @@ function QuickTradeForm({ onSubmit, onClose }: {
       side: form.side,
       quantity: parseInt(form.quantity) || 1,
       orderType: form.orderType,
+      duration: 'gtc',
       limitPrice: form.limitPrice ? parseFloat(form.limitPrice) : undefined,
       thesis: form.thesis || undefined,
       targetPrice: form.targetPrice ? parseFloat(form.targetPrice) : undefined,
@@ -202,12 +361,12 @@ function QuickTradeForm({ onSubmit, onClose }: {
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div>
-          <label className={labelClass}>Target Price</label>
-          <input className={inputClass} type="number" step="0.01" placeholder="Optional" value={form.targetPrice} onChange={e => setForm(f => ({ ...f, targetPrice: e.target.value }))} />
+          <label className={labelClass}>Take Profit $</label>
+          <input className={inputClass} type="number" step="0.01" placeholder="Option price target" value={form.targetPrice} onChange={e => setForm(f => ({ ...f, targetPrice: e.target.value }))} />
         </div>
         <div>
-          <label className={labelClass}>Stop Price</label>
-          <input className={inputClass} type="number" step="0.01" placeholder="Optional" value={form.stopPrice} onChange={e => setForm(f => ({ ...f, stopPrice: e.target.value }))} />
+          <label className={labelClass}>Stop Loss $</label>
+          <input className={inputClass} type="number" step="0.01" placeholder="Option price stop" value={form.stopPrice} onChange={e => setForm(f => ({ ...f, stopPrice: e.target.value }))} />
         </div>
         <div>
           <label className={labelClass}>Thesis</label>
@@ -232,7 +391,72 @@ export default function PaperTradingTab() {
   const [showForm, setShowForm] = useState(false);
   const [tradeStatus, setTradeStatus] = useState<string | null>(null);
   const [notConfigured, setNotConfigured] = useState(false);
+  const [editingRule, setEditingRule] = useState<string | null>(null); // OCC symbol being edited
+  const [monitorLog, setMonitorLog] = useState<string[]>([]);
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const monitoringRef = useRef(false);
+
+  // Auto-exit monitor: check positions against rules
+  const checkAutoExits = useCallback(async (positions: Position[]) => {
+    if (monitoringRef.current) return; // prevent overlapping checks
+    monitoringRef.current = true;
+    try {
+      const rules = loadRules();
+      for (const pos of positions) {
+        const rule = rules.find(r => r.occSymbol === pos.symbol);
+        if (!rule || !rule.autoExit || rule.exitTriggered) continue;
+        if (pos.currentPrice <= 0) continue;
+
+        // Check take profit
+        if (rule.targetPrice && pos.currentPrice >= rule.targetPrice && pos.quantity > 0) {
+          setMonitorLog(prev => [...prev.slice(-9),
+            `${new Date().toLocaleTimeString()} — TARGET HIT: ${fmtOCC(pos.parsed, pos.symbol)} at ${fmtMoney(pos.currentPrice)} >= ${fmtMoney(rule.targetPrice!)}`
+          ]);
+          try {
+            const res = await fetch('/api/paper/close', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ symbol: pos.symbol, quantity: pos.quantity }),
+            });
+            const data = await res.json();
+            if (res.ok) {
+              rule.exitTriggered = 'target';
+              rule.exitOrderId = data.orderId;
+              saveRule(rule);
+              setMonitorLog(prev => [...prev.slice(-9),
+                `${new Date().toLocaleTimeString()} — Auto-closed at target: Order #${data.orderId}`
+              ]);
+            }
+          } catch { /* will retry next cycle */ }
+        }
+
+        // Check stop loss
+        if (rule.stopPrice && pos.currentPrice <= rule.stopPrice && pos.quantity > 0) {
+          setMonitorLog(prev => [...prev.slice(-9),
+            `${new Date().toLocaleTimeString()} — STOP HIT: ${fmtOCC(pos.parsed, pos.symbol)} at ${fmtMoney(pos.currentPrice)} <= ${fmtMoney(rule.stopPrice!)}`
+          ]);
+          try {
+            const res = await fetch('/api/paper/close', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ symbol: pos.symbol, quantity: pos.quantity }),
+            });
+            const data = await res.json();
+            if (res.ok) {
+              rule.exitTriggered = 'stop';
+              rule.exitOrderId = data.orderId;
+              saveRule(rule);
+              setMonitorLog(prev => [...prev.slice(-9),
+                `${new Date().toLocaleTimeString()} — Auto-closed at stop: Order #${data.orderId}`
+              ]);
+            }
+          } catch { /* will retry next cycle */ }
+        }
+      }
+    } finally {
+      monitoringRef.current = false;
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -251,15 +475,21 @@ export default function PaperTradingTab() {
       if (!accRes.ok) throw new Error((await accRes.json()).error || 'Account fetch failed');
       if (!ordRes.ok) throw new Error((await ordRes.json()).error || 'Orders fetch failed');
 
-      setAccount(await accRes.json());
+      const accData = await accRes.json();
+      setAccount(accData);
       const ordData = await ordRes.json();
       setOrders(ordData.orders || []);
+
+      // Run auto-exit monitor on each refresh
+      if (accData.positions?.length > 0) {
+        checkAutoExits(accData.positions);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [checkAutoExits]);
 
   // Auto-refresh every 30s
   useEffect(() => {
@@ -280,14 +510,16 @@ export default function PaperTradingTab() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Trade failed');
 
-      // Save metadata
-      if (data.orderId) {
-        saveNote({
-          orderId: data.orderId,
+      // Save exit rules if target/stop were specified
+      if (data.occSymbol && (trade.targetPrice || trade.stopPrice)) {
+        saveRule({
+          occSymbol: data.occSymbol,
           thesis: (trade.thesis as string) || '',
           targetPrice: (trade.targetPrice as number) || null,
           stopPrice: (trade.stopPrice as number) || null,
+          costBasis: 0, // will be filled after fill
           createdAt: new Date().toISOString(),
+          autoExit: true,
         });
       }
 
@@ -309,8 +541,21 @@ export default function PaperTradingTab() {
     }
   };
 
-  const notes = loadNotes();
-  const getNoteForOrder = (orderId: number) => notes.find(n => n.orderId === orderId);
+  const handleManualClose = async (position: Position) => {
+    try {
+      const res = await fetch('/api/paper/close', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: position.symbol, quantity: position.quantity }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Close failed');
+      setTradeStatus(`Closing order placed: #${data.orderId}`);
+      setTimeout(refresh, 1000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Close failed');
+    }
+  };
 
   if (notConfigured) {
     return (
@@ -338,6 +583,7 @@ export default function PaperTradingTab() {
   const history = account?.history || [];
   const openOrders = orders.filter(o => o.status === 'pending' || o.status === 'open' || o.status === 'partially_filled');
   const recentFills = orders.filter(o => o.status === 'filled').slice(0, 10);
+  const rulesWithTargets = loadRules().filter(r => r.autoExit && !r.exitTriggered && (r.targetPrice || r.stopPrice));
 
   return (
     <div className="space-y-4 animate-fade-in">
@@ -350,6 +596,12 @@ export default function PaperTradingTab() {
             <span className="text-xs text-text-muted font-mono px-1.5 py-0.5 bg-yellow-500/10 text-yellow-400 rounded">
               SANDBOX
             </span>
+            {rulesWithTargets.length > 0 && (
+              <span className="text-xs font-mono px-1.5 py-0.5 bg-accent-cyan/10 text-accent-cyan rounded flex items-center gap-1">
+                <Activity className="w-3 h-3" />
+                Monitoring {rulesWithTargets.length} position{rulesWithTargets.length !== 1 ? 's' : ''}
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <button onClick={() => setShowForm(!showForm)} className="px-3 py-1.5 rounded-md text-xs font-medium bg-accent-cyan/20 text-accent-cyan border border-accent-cyan/30 hover:bg-accent-cyan/30 transition-all flex items-center gap-1.5">
@@ -410,6 +662,26 @@ export default function PaperTradingTab() {
       {/* Quick Trade Form */}
       {showForm && <QuickTradeForm onSubmit={handleTrade} onClose={() => setShowForm(false)} />}
 
+      {/* Monitor Log */}
+      {monitorLog.length > 0 && (
+        <div className="panel">
+          <div className="panel-header">
+            <span className="panel-title flex items-center gap-2">
+              <Activity className="w-4 h-4 text-accent-cyan" />
+              Monitor Activity
+            </span>
+            <button onClick={() => setMonitorLog([])} className="text-xs text-text-muted hover:text-text-primary font-mono">Clear</button>
+          </div>
+          <div className="px-4 pb-3 space-y-0.5">
+            {monitorLog.map((msg, i) => (
+              <div key={i} className={`text-xs font-mono ${msg.includes('TARGET') ? 'text-green-400' : msg.includes('STOP') ? 'text-red-400' : 'text-text-muted'}`}>
+                {msg}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Open Positions */}
       <div className="panel">
         <div className="panel-header">
@@ -427,31 +699,70 @@ export default function PaperTradingTab() {
                 <tr className="border-b border-border/30">
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Contract</th>
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Qty</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Cost Basis</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Per Contract</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Opened</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Notes</th>
+                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Entry</th>
+                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Current</th>
+                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">P&L</th>
+                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Target / Stop</th>
+                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted"></th>
                 </tr>
               </thead>
               <tbody>
                 {positions.map(p => {
-                  const note = notes.find(n => {
-                    // Match note to position via order history
-                    return false; // Will be enhanced when we add order ID tracking
-                  });
+                  const rule = getRuleForSymbol(p.symbol);
                   return (
                     <tr key={p.id} className="border-b border-border/10 hover:bg-bg-hover/50">
                       <td className="px-3 py-2">
                         <div className="font-mono text-text-primary font-semibold">{fmtOCC(p.parsed, p.symbol)}</div>
+                        {rule?.thesis && <div className="text-[10px] text-text-muted truncate max-w-[200px]">{rule.thesis}</div>}
                       </td>
                       <td className={`px-3 py-2 font-mono ${p.quantity > 0 ? 'text-green-400' : 'text-red-400'}`}>
                         {p.quantity > 0 ? '+' : ''}{p.quantity}
                       </td>
-                      <td className="px-3 py-2 font-mono text-text-secondary">{fmtMoney(p.cost_basis)}</td>
-                      <td className="px-3 py-2 font-mono text-text-muted">{fmtMoney(p.costPerContract)}</td>
-                      <td className="px-3 py-2 font-mono text-text-muted text-xs">{p.date_acquired?.split('T')[0]}</td>
-                      <td className="px-3 py-2 text-xs text-text-muted max-w-[200px] truncate">
-                        {note?.thesis || '—'}
+                      <td className="px-3 py-2 font-mono text-text-secondary">{fmtMoney(p.costPerContract)}</td>
+                      <td className="px-3 py-2 font-mono text-text-primary">
+                        {p.currentPrice > 0 ? fmtMoney(p.currentPrice) : '—'}
+                        <div className="text-[10px] text-text-muted">{p.bid > 0 ? `${fmtMoney(p.bid)}/${fmtMoney(p.ask)}` : ''}</div>
+                      </td>
+                      <td className="px-3 py-2">
+                        {p.currentPrice > 0 ? (
+                          <PLBadge value={p.unrealizedPL} pct={p.unrealizedPLPct} />
+                        ) : (
+                          <span className="text-text-muted text-xs">—</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2">
+                        <ExitProgress
+                          current={p.currentPrice}
+                          entry={p.costPerContract}
+                          target={rule?.targetPrice || null}
+                          stop={rule?.stopPrice || null}
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => setEditingRule(editingRule === p.symbol ? null : p.symbol)}
+                            className="text-xs font-mono text-accent-cyan hover:text-accent-cyan/80 px-1.5 py-0.5"
+                            title="Set exit rules"
+                          >
+                            <Target className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => handleManualClose(p)}
+                            className="text-xs text-red-400 hover:text-red-300 font-mono px-1.5 py-0.5"
+                            title="Close position"
+                          >
+                            Close
+                          </button>
+                        </div>
+                        {editingRule === p.symbol && (
+                          <EditRuleForm
+                            position={p}
+                            rule={rule}
+                            onSave={saveRule}
+                            onClose={() => setEditingRule(null)}
+                          />
+                        )}
                       </td>
                     </tr>
                   );
@@ -480,26 +791,45 @@ export default function PaperTradingTab() {
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Qty</th>
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Type</th>
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Price</th>
+                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Duration</th>
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Status</th>
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted"></th>
                 </tr>
               </thead>
               <tbody>
-                {openOrders.map(o => (
-                  <tr key={o.id} className="border-b border-border/10 hover:bg-bg-hover/50">
-                    <td className="px-3 py-2 font-mono text-text-primary">{fmtOCC(o.parsed || null, o.option_symbol || o.symbol)}</td>
-                    <td className="px-3 py-2 font-mono text-text-secondary text-xs">{o.side?.replace(/_/g, ' ')}</td>
-                    <td className="px-3 py-2 font-mono text-text-secondary">{o.quantity}</td>
-                    <td className="px-3 py-2 font-mono text-text-muted text-xs">{o.type}</td>
-                    <td className="px-3 py-2 font-mono text-text-muted">{o.price ? fmtMoney(o.price) : 'MKT'}</td>
-                    <td className="px-3 py-2">
-                      <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-yellow-500/10 text-yellow-400">{o.status}</span>
-                    </td>
-                    <td className="px-3 py-2">
-                      <button onClick={() => handleCancel(o.id)} className="text-xs text-red-400 hover:text-red-300 font-mono">Cancel</button>
-                    </td>
-                  </tr>
-                ))}
+                {openOrders.map(o => {
+                  // For multileg orders, show legs
+                  const isMultileg = o.class === 'multileg' && o.leg && o.leg.length > 0;
+                  return (
+                    <tr key={o.id} className="border-b border-border/10 hover:bg-bg-hover/50">
+                      <td className="px-3 py-2">
+                        {isMultileg ? (
+                          <div className="space-y-0.5">
+                            <div className="font-mono text-text-primary text-xs font-semibold">{o.symbol} Spread</div>
+                            {o.leg!.map((leg, i) => (
+                              <div key={i} className="font-mono text-text-muted text-[10px]">
+                                {leg.side?.replace(/_/g, ' ')} {fmtOCC(leg.parsed || null, leg.option_symbol || '')}
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="font-mono text-text-primary">{fmtOCC(o.parsed || null, o.option_symbol || o.symbol)}</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 font-mono text-text-secondary text-xs">{isMultileg ? 'multileg' : o.side?.replace(/_/g, ' ')}</td>
+                      <td className="px-3 py-2 font-mono text-text-secondary">{o.quantity}</td>
+                      <td className="px-3 py-2 font-mono text-text-muted text-xs">{o.type}</td>
+                      <td className="px-3 py-2 font-mono text-text-muted">{o.price ? fmtMoney(o.price) : 'MKT'}</td>
+                      <td className="px-3 py-2 font-mono text-text-muted text-xs">{o.duration || 'day'}</td>
+                      <td className="px-3 py-2">
+                        <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-yellow-500/10 text-yellow-400">{o.status}</span>
+                      </td>
+                      <td className="px-3 py-2">
+                        <button onClick={() => handleCancel(o.id)} className="text-xs text-red-400 hover:text-red-300 font-mono">Cancel</button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -524,23 +854,18 @@ export default function PaperTradingTab() {
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Qty</th>
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Fill Price</th>
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Date</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Thesis</th>
                 </tr>
               </thead>
               <tbody>
-                {recentFills.map(o => {
-                  const note = getNoteForOrder(o.id);
-                  return (
-                    <tr key={o.id} className="border-b border-border/10 hover:bg-bg-hover/50">
-                      <td className="px-3 py-2 font-mono text-text-primary">{fmtOCC(o.parsed || null, o.option_symbol || o.symbol)}</td>
-                      <td className="px-3 py-2 font-mono text-text-secondary text-xs">{o.side?.replace(/_/g, ' ')}</td>
-                      <td className="px-3 py-2 font-mono text-text-secondary">{o.exec_quantity || o.quantity}</td>
-                      <td className="px-3 py-2 font-mono text-text-secondary">{o.avg_fill_price ? fmtMoney(o.avg_fill_price) : '—'}</td>
-                      <td className="px-3 py-2 font-mono text-text-muted text-xs">{o.create_date?.split('T')[0]}</td>
-                      <td className="px-3 py-2 text-xs text-text-muted max-w-[200px] truncate">{note?.thesis || '—'}</td>
-                    </tr>
-                  );
-                })}
+                {recentFills.map(o => (
+                  <tr key={o.id} className="border-b border-border/10 hover:bg-bg-hover/50">
+                    <td className="px-3 py-2 font-mono text-text-primary">{fmtOCC(o.parsed || null, o.option_symbol || o.symbol)}</td>
+                    <td className="px-3 py-2 font-mono text-text-secondary text-xs">{o.side?.replace(/_/g, ' ')}</td>
+                    <td className="px-3 py-2 font-mono text-text-secondary">{o.exec_quantity || o.quantity}</td>
+                    <td className="px-3 py-2 font-mono text-text-secondary">{o.avg_fill_price ? fmtMoney(o.avg_fill_price) : '—'}</td>
+                    <td className="px-3 py-2 font-mono text-text-muted text-xs">{o.create_date?.split('T')[0]}</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>

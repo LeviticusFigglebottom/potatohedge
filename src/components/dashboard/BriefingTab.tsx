@@ -108,21 +108,39 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
   const handlePaperTrade = async (idea: TradeIdea, idx: number) => {
     setPaperStatus(s => ({ ...s, [idx]: 'placing...' }));
     try {
-      // Parse strike from the strategy/strikes field
-      const strikeMatch = idea.strikes.match(/\$?([\d.]+)/);
-      const strike = strikeMatch ? parseFloat(strikeMatch[1]) : idea.spot;
-      const isCall = /call|bull/i.test(idea.strategy) || idea.direction === 'bullish';
-      const isPut = /put|bear/i.test(idea.strategy) || idea.direction === 'bearish';
-      const optionType = isPut ? 'P' : 'C';
+      // Extract all dollar amounts from the strikes text
+      const allStrikes = [...idea.strikes.matchAll(/\$(\d+(?:\.\d+)?)/g)].map(m => parseFloat(m[1]));
+      const stratLow = idea.strategy.toLowerCase();
+      const strikesLow = idea.strikes.toLowerCase();
 
-      // Detect if it's a spread
-      const spreadMatch = idea.strikes.match(/\$?([\d.]+)\s*\/\s*\$?([\d.]+)/);
+      // Determine strategy type from the strategy name
+      const isIronCondor = stratLow.includes('iron condor');
+      const isBullPut = stratLow.includes('bull put') || (stratLow.includes('put') && stratLow.includes('credit') && idea.direction === 'bullish');
+      const isBearCall = stratLow.includes('bear call') || (stratLow.includes('call') && stratLow.includes('credit') && idea.direction === 'bearish');
+      const isBullCall = stratLow.includes('bull call') || stratLow.includes('call debit') || (stratLow.includes('call') && stratLow.includes('debit'));
+      const isBearPut = stratLow.includes('bear put') || stratLow.includes('put debit') || (stratLow.includes('put') && stratLow.includes('debit'));
+      const isStraddle = stratLow.includes('straddle');
+      const isStrangle = stratLow.includes('strangle');
 
-      if (spreadMatch) {
-        // Multileg spread
-        const strike1 = parseFloat(spreadMatch[1]);
-        const strike2 = parseFloat(spreadMatch[2]);
-        const isDebit = idea.strategy.toLowerCase().includes('debit') || idea.strategy.toLowerCase().includes('buy');
+      // Parse strikes based on "sell $X" / "buy $Y" keywords in the strikes text
+      const sellStrikes = [...idea.strikes.matchAll(/sell\s+\$(\d+(?:\.\d+)?)/gi)].map(m => parseFloat(m[1]));
+      const buyStrikes = [...idea.strikes.matchAll(/buy\s+\$(\d+(?:\.\d+)?)/gi)].map(m => parseFloat(m[1]));
+
+      const exp = idea.nearestExp;
+      const thesis = `${idea.strategy} — ${idea.reasoning[0] || ''}`;
+
+      if (isIronCondor && allStrikes.length >= 2) {
+        // Iron condor: sell call + sell put, buy wings
+        // strikes text: "Sell $700C / $680P. Wings ~$5 beyond."
+        const sellCallMatch = strikesLow.match(/sell\s+\$(\d+(?:\.\d+)?)c/i) || strikesLow.match(/\$(\d+(?:\.\d+)?)c/i);
+        const sellPutMatch = strikesLow.match(/sell\s+\$(\d+(?:\.\d+)?)p/i) || strikesLow.match(/\$(\d+(?:\.\d+)?)p/i);
+        const wingsMatch = strikesLow.match(/wings?\s+~?\$(\d+(?:\.\d+)?)/i);
+        const wingWidth = wingsMatch ? parseFloat(wingsMatch[1]) : 5;
+
+        let sellCall = sellCallMatch ? parseFloat(sellCallMatch[1]) : allStrikes[0];
+        let sellPut = sellPutMatch ? parseFloat(sellPutMatch[1]) : allStrikes[1] || allStrikes[0] - 20;
+        // Ensure call is above put
+        if (sellCall < sellPut) [sellCall, sellPut] = [sellPut, sellCall];
 
         const res = await fetch('/api/paper/trade', {
           method: 'POST',
@@ -130,37 +148,147 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
           body: JSON.stringify({
             type: 'spread',
             symbol: idea.ticker,
-            orderType: isDebit ? 'debit' : 'credit',
-            duration: 'day',
+            orderType: 'credit',
+            duration: 'gtc',
             legs: [
-              { expiration: idea.nearestExp, optionType, strike: strike1, side: 'buy_to_open', quantity: 1 },
-              { expiration: idea.nearestExp, optionType, strike: strike2, side: 'sell_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'C', strike: sellCall, side: 'sell_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'C', strike: sellCall + wingWidth, side: 'buy_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'P', strike: sellPut, side: 'sell_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'P', strike: sellPut - wingWidth, side: 'buy_to_open', quantity: 1 },
             ],
-            thesis: `${idea.strategy} — ${idea.reasoning[0] || ''}`,
+            thesis,
           }),
         });
-
         const data = await res.json();
         if (!res.ok) throw new Error(data.error);
-        setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId}` }));
+        setPaperStatus(s => ({ ...s, [idx]: `Placed IC #${data.orderId}` }));
+
+      } else if ((isBullPut || isBearCall || isBullCall || isBearPut) && (sellStrikes.length > 0 || buyStrikes.length > 0 || allStrikes.length >= 2)) {
+        // Vertical spread: 2 legs
+        let leg1Strike: number, leg2Strike: number;
+        let leg1Side: string, leg2Side: string;
+        let optType: 'C' | 'P';
+        let orderType: string;
+
+        if (isBullPut) {
+          // Bull put spread (credit): sell higher put, buy lower put
+          optType = 'P';
+          orderType = 'credit';
+          leg1Strike = sellStrikes[0] || Math.max(...allStrikes);
+          leg2Strike = buyStrikes[0] || Math.min(...allStrikes);
+          leg1Side = 'sell_to_open';
+          leg2Side = 'buy_to_open';
+        } else if (isBearCall) {
+          // Bear call spread (credit): sell lower call, buy higher call
+          optType = 'C';
+          orderType = 'credit';
+          leg1Strike = sellStrikes[0] || Math.min(...allStrikes);
+          leg2Strike = buyStrikes[0] || Math.max(...allStrikes);
+          leg1Side = 'sell_to_open';
+          leg2Side = 'buy_to_open';
+        } else if (isBullCall) {
+          // Bull call spread (debit): buy lower call, sell higher call
+          optType = 'C';
+          orderType = 'debit';
+          leg1Strike = buyStrikes[0] || Math.min(...allStrikes);
+          leg2Strike = sellStrikes[0] || Math.max(...allStrikes);
+          leg1Side = 'buy_to_open';
+          leg2Side = 'sell_to_open';
+        } else {
+          // Bear put spread (debit): buy higher put, sell lower put
+          optType = 'P';
+          orderType = 'debit';
+          leg1Strike = buyStrikes[0] || Math.max(...allStrikes);
+          leg2Strike = sellStrikes[0] || Math.min(...allStrikes);
+          leg1Side = 'buy_to_open';
+          leg2Side = 'sell_to_open';
+        }
+
+        const res = await fetch('/api/paper/trade', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'spread',
+            symbol: idea.ticker,
+            orderType,
+            duration: 'gtc',
+            legs: [
+              { expiration: exp, optionType: optType, strike: leg1Strike, side: leg1Side, quantity: 1 },
+              { expiration: exp, optionType: optType, strike: leg2Strike, side: leg2Side, quantity: 1 },
+            ],
+            thesis,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error);
+        setPaperStatus(s => ({ ...s, [idx]: `Placed spread #${data.orderId}` }));
+
+      } else if (isStraddle && allStrikes.length >= 1) {
+        // Long straddle: buy call + buy put at same strike
+        const strike = allStrikes[0];
+        const res = await fetch('/api/paper/trade', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'spread',
+            symbol: idea.ticker,
+            orderType: 'debit',
+            duration: 'gtc',
+            legs: [
+              { expiration: exp, optionType: 'C', strike, side: 'buy_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'P', strike, side: 'buy_to_open', quantity: 1 },
+            ],
+            thesis,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error);
+        setPaperStatus(s => ({ ...s, [idx]: `Placed straddle #${data.orderId}` }));
+
+      } else if (isStrangle && allStrikes.length >= 2) {
+        // Long strangle: buy OTM put + buy OTM call
+        const putStrike = Math.min(...allStrikes);
+        const callStrike = Math.max(...allStrikes);
+        const res = await fetch('/api/paper/trade', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'spread',
+            symbol: idea.ticker,
+            orderType: 'debit',
+            duration: 'gtc',
+            legs: [
+              { expiration: exp, optionType: 'P', strike: putStrike, side: 'buy_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'C', strike: callStrike, side: 'buy_to_open', quantity: 1 },
+            ],
+            thesis,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error);
+        setPaperStatus(s => ({ ...s, [idx]: `Placed strangle #${data.orderId}` }));
+
       } else {
-        // Single leg
+        // Fallback: single leg (directional call or put)
+        const strike = allStrikes[0] || Math.round(idea.spot);
+        const optionType: 'C' | 'P' = /put|bear/i.test(idea.strategy) || idea.direction === 'bearish' ? 'P' : 'C';
+
         const res = await fetch('/api/paper/trade', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             type: 'single',
             symbol: idea.ticker,
-            expiration: idea.nearestExp,
-            optionType: isCall ? 'C' : optionType,
+            expiration: exp,
+            optionType,
             strike,
             side: 'buy_to_open',
             quantity: 1,
             orderType: 'market',
-            thesis: `${idea.strategy} — ${idea.reasoning[0] || ''}`,
+            duration: 'gtc',
+            thesis,
           }),
         });
-
         const data = await res.json();
         if (!res.ok) throw new Error(data.error);
         setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId}` }));
