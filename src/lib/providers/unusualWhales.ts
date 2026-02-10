@@ -34,10 +34,7 @@ async function uwFetch<T>(path: string): Promise<T | null> {
     signal: AbortSignal.timeout(FETCH_TIMEOUT),
   });
 
-  if (!res.ok) {
-    console.log(`[UW] ${path}: ${res.status}`);
-    return null;
-  }
+  if (!res.ok) return null;
 
   return res.json();
 }
@@ -123,11 +120,9 @@ export async function getMarketTide(): Promise<MarketTide | null> {
       sentiment: net > 0 ? 'bullish' : net < 0 ? 'bearish' : 'neutral',
     };
 
-    console.log(`[UW] Market Tide: ${tide.sentiment} (net: $${(net / 1e6).toFixed(0)}M)`);
     tideCache = { data: tide, timestamp: Date.now() };
     return tide;
-  } catch (err) {
-    console.log('[UW] Market Tide error:', err instanceof Error ? err.message : String(err));
+  } catch {
     return null;
   }
 }
@@ -160,11 +155,9 @@ export async function getFlowAlerts(limit: number = 50): Promise<FlowAlert[]> {
     // Sort by premium descending (biggest trades first)
     alerts.sort((a: FlowAlert, b: FlowAlert) => b.premium - a.premium);
 
-    console.log(`[UW] Flow Alerts: ${alerts.length} trades`);
     flowCache = { data: alerts, timestamp: Date.now() };
     return alerts;
-  } catch (err) {
-    console.log('[UW] Flow error:', err instanceof Error ? err.message : String(err));
+  } catch {
     return [];
   }
 }
@@ -193,11 +186,9 @@ export async function getDarkPoolRecent(limit: number = 50): Promise<DarkPoolPri
     // Sort by notional descending
     prints.sort((a: DarkPoolPrint, b: DarkPoolPrint) => b.notional - a.notional);
 
-    console.log(`[UW] Dark Pool: ${prints.length} prints`);
     darkPoolCache = { data: prints, timestamp: Date.now() };
     return prints;
-  } catch (err) {
-    console.log('[UW] Dark Pool error:', err instanceof Error ? err.message : String(err));
+  } catch {
     return [];
   }
 }
@@ -224,11 +215,9 @@ export async function getCongressTrades(limit: number = 30): Promise<CongressTra
       chamber: d.chamber ?? d.office ?? '',
     })).filter((t: CongressTrade) => t.politician && t.ticker);
 
-    console.log(`[UW] Congress: ${trades.length} trades`);
     congressCache = { data: trades, timestamp: Date.now() };
     return trades;
-  } catch (err) {
-    console.log('[UW] Congress error:', err instanceof Error ? err.message : String(err));
+  } catch {
     return [];
   }
 }

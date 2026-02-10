@@ -127,10 +127,7 @@ function parseSwapCSV(csv: string, today: string, weekEnd: string): Map<string, 
     c.includes('action') && c.includes('type')
   );
 
-  if (underlierIdx === -1 || expirationIdx === -1) {
-    console.log('[DTCC] Could not find required columns. Header:', cols.slice(0, 15).join(', '));
-    return map;
-  }
+  if (underlierIdx === -1 || expirationIdx === -1) return map;
 
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
@@ -232,10 +229,7 @@ async function fetchSwapDataInner(): Promise<SwapResult> {
           signal: AbortSignal.timeout(Math.min(2500, remaining)),
         });
 
-        if (!res.ok) {
-          console.log(`[DTCC] Proxy returned ${res.status} for ${reportDate}`);
-          continue;
-        }
+        if (!res.ok) continue;
 
         const buffer = new Uint8Array(await res.arrayBuffer());
         if (buffer.length < 100) continue;
@@ -253,14 +247,12 @@ async function fetchSwapDataInner(): Promise<SwapResult> {
         if (map.size > 0) {
           const result: SwapResult = { data: map, asOf: reportDate };
           swapCache = { result, timestamp: Date.now() };
-          console.log(`[DTCC] Proxy: ${csvText.split('\n').length} rows → ${map.size} tickers (${reportDate})`);
           return result;
         }
-      } catch (err) {
-        console.log(`[DTCC] Proxy error for ${reportDate}:`, err instanceof Error ? err.message : String(err));
+      } catch {
+        // Proxy failed — try next date
       }
     }
-    console.log('[DTCC] Proxy returned no data, trying S3 direct...');
   }
 
   // ── Fallback: Direct S3 (blocked from most cloud IPs) ──
@@ -314,13 +306,11 @@ async function fetchSwapDataInner(): Promise<SwapResult> {
       if (map.size > 0) {
         const result: SwapResult = { data: map, asOf: reportDate };
         swapCache = { result, timestamp: Date.now() };
-        console.log(`[DTCC] S3 direct: ${r.value.split('\n').length} rows → ${map.size} tickers (${reportDate})`);
         return result;
       }
     }
   }
 
-  console.log('[DTCC] No data found from proxy or S3');
   const emptyResult: SwapResult = { data: new Map(), asOf: '' };
   swapCache = { result: emptyResult, timestamp: Date.now() };
   return emptyResult;

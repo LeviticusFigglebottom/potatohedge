@@ -128,12 +128,10 @@ async function fetchRegSHOThresholdInner(): Promise<Set<string>> {
 
       const contentType = res.headers.get('content-type') || '';
       if (!res.ok || !contentType.includes('json')) {
-        console.log(`[FINRA] Reg SHO API: ${res.status} (${contentType}) for ${tradeDate}`);
         if (tradeDate === recentDays[0] && Date.now() < deadline - 1000) {
           const archiveTickers = await fetchRegSHOFromArchive(tradeDate);
           if (archiveTickers.size > 0) {
             regSHOCache = { result: { tickers: archiveTickers, asOf: tradeDate }, timestamp: Date.now() };
-            console.log(`[FINRA] Reg SHO from archive: ${archiveTickers.size} securities (${tradeDate})`);
             return archiveTickers;
           }
         }
@@ -148,16 +146,14 @@ async function fetchRegSHOThresholdInner(): Promise<Set<string>> {
         }
         if (tickers.size > 0) {
           regSHOCache = { result: { tickers, asOf: tradeDate }, timestamp: Date.now() };
-          console.log(`[FINRA] Reg SHO threshold list: ${tickers.size} securities (${tradeDate})`);
           return tickers;
         }
       }
-    } catch (err) {
-      console.log(`[FINRA] Reg SHO error for ${tradeDate}:`, err instanceof Error ? err.message : String(err));
+    } catch {
+      // Try next date
     }
   }
 
-  console.log('[FINRA] No Reg SHO data found');
   const emptyResult: RegSHOResult = { tickers: new Set(), asOf: '' };
   regSHOCache = { result: emptyResult, timestamp: Date.now() };
   return new Set();
@@ -242,14 +238,13 @@ async function fetchShortSaleVolumeInner(): Promise<Map<string, ShortVolumeData>
         });
       }
       if (map.size > 0) {
-        console.log(`[SV] Polygon: ${map.size} securities (${asOf})`);
         const result: ShortVolumeResult = { data: map, asOf };
         shortVolumeCache = { result, timestamp: Date.now() };
         return map;
       }
     }
-  } catch (err) {
-    console.log('[SV] Polygon failed, falling back to FINRA regShoDaily:', err instanceof Error ? err.message : String(err));
+  } catch {
+    // Polygon failed — fall back to FINRA regShoDaily
   }
 
   // ── Fallback: FINRA regShoDaily (OTC only, no auth) ──
@@ -304,12 +299,9 @@ async function fetchShortSaleVolumeInner(): Promise<Map<string, ShortVolumeData>
         });
       }
 
-      if (map.size > 0) {
-        console.log(`[SV] FINRA fallback: ${map.size} OTC securities (${tradeDate})`);
-        break;
-      }
-    } catch (err) {
-      console.log(`[SV] FINRA regShoDaily error for ${tradeDate}:`, err instanceof Error ? err.message : String(err));
+      if (map.size > 0) break;
+    } catch {
+      // Try next date
     }
   }
 
@@ -368,14 +360,13 @@ async function fetchShortInterestInner(): Promise<Map<string, ShortInterestData>
         });
       }
       if (map.size > 0) {
-        console.log(`[SI] Polygon: ${map.size} securities (settlement: ${settlementDate})`);
         const result: ShortInterestResult = { data: map, asOf: settlementDate };
         shortInterestCache = { result, timestamp: Date.now() };
         return map;
       }
     }
-  } catch (err) {
-    console.log('[SI] Polygon failed, falling back to FINRA CDN:', err instanceof Error ? err.message : String(err));
+  } catch {
+    // Polygon failed — fall back to FINRA CDN
   }
 
   // ── Fallback: FINRA CDN biweekly CSV (OTC only) ──
@@ -429,7 +420,6 @@ async function fetchShortInterestInner(): Promise<Map<string, ShortInterestData>
 
       if (map.size > 0) {
         asOf = settleDate;
-        console.log(`[SI] FINRA CDN fallback: ${map.size} OTC securities (settlement: ${settleDate})`);
         break;
       }
     } catch {

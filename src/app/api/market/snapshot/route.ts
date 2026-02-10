@@ -3,7 +3,6 @@ import { getOptionsSnapshot } from '@/lib/providers/polygon';
 import { fetchEquityBars } from '@/lib/providers/equityBars';
 import { getOptionsChain, getExpirations, getQuote } from '@/lib/providers/tradier';
 import { getVIXHistory } from '@/lib/providers/fred';
-import { getNextEarnings, buildEarningsContext } from '@/lib/providers/earnings';
 import {
   computeIVRankPercentile,
   computeHistoricalVolatility,
@@ -28,14 +27,12 @@ export async function GET(request: NextRequest) {
     // 3. Polygon options snapshot (for term structure + skew surface)
     // 4. VIX real-time quote (for market vol context)
     // 5. VIX history from FRED (for time-series overlay)
-    // 6. Earnings dates (FMP if key set, otherwise null)
-    const [expirations, historyBars, polygonSnapshot, vixQuote, vixHistory, earningsEvent] = await Promise.all([
+    const [expirations, historyBars, polygonSnapshot, vixQuote, vixHistory] = await Promise.all([
       getExpirations(ticker).catch(() => []),
       fetchEquityBars(ticker, 400),
       getOptionsSnapshot(ticker).catch(() => []),
       getQuote('VIX').catch(() => null),
       getVIXHistory(400).catch(() => []),
-      getNextEarnings(ticker).catch(() => null),
     ]);
 
     // Fetch nearest 3 Tradier chains for ATM IV across expirations
@@ -294,15 +291,6 @@ export async function GET(request: NextRequest) {
       vixTimeSeries.sort((a, b) => a.time - b.time);
     }
 
-    // ── Earnings context ──
-    const earningsContext = buildEarningsContext(
-      earningsEvent,
-      termStructure.map(t => ({ dte: t.dte, atmIV: t.atmIV })),
-      ivMetrics.ivRank,
-      currentIV,
-      hv20,
-    );
-
     return NextResponse.json({
       symbol: ticker,
       spotPrice,
@@ -313,7 +301,6 @@ export async function GET(request: NextRequest) {
       ivTimeSeries: ivTimeSeries.slice(-252),
       vix: vixData,
       vixTimeSeries: vixTimeSeries.slice(-252),
-      earnings: earningsContext,
       snapshotCount: polygonSnapshot.length,
       tradierChainsUsed: tradierChains.length,
       timestamp: Date.now(),

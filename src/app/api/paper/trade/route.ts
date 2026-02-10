@@ -123,10 +123,9 @@ export async function POST(request: NextRequest) {
           duration: (duration || 'gtc') as 'day' | 'gtc',
           legs: builtLegs,
         });
-      } catch (multilegErr) {
+      } catch {
         // Multileg failed — decompose into individual single-leg market orders.
         // This is the most reliable fallback for sandbox after-hours or edge cases.
-        console.warn('[paper/trade] Multileg failed, decomposing into single legs:', multilegErr);
         const legResults: { id: number; status: string }[] = [];
         for (const leg of builtLegs) {
           const legResult = await placeSingleOrder({

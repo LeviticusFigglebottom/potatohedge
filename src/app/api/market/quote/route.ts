@@ -14,8 +14,7 @@ export async function GET(request: NextRequest) {
   try {
     const quote = await getQuote(ticker);
     return NextResponse.json(quote);
-  } catch (tradierErr) {
-    console.warn(`[quote] Tradier failed for ${ticker}:`, tradierErr instanceof Error ? tradierErr.message : tradierErr);
+  } catch {
 
     // Fallback: build a basic quote from Polygon previous close
     try {
@@ -43,7 +42,6 @@ export async function GET(request: NextRequest) {
       }
     } catch { /* Polygon also failed */ }
 
-    const message = tradierErr instanceof Error ? tradierErr.message : 'Unknown error';
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ error: 'Quote unavailable' }, { status: 500 });
   }
 }

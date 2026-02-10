@@ -93,9 +93,7 @@ export default function ScreenerTab() {
         setLastScanTime(`${new Date().toLocaleString()} (partial: ${accumulated.length} stocks)`);
       }
     } catch (err) {
-      if ((err as Error).name !== 'AbortError') {
-        console.error('Screener error:', err);
-      }
+      if ((err as Error).name === 'AbortError') { /* expected */ }
     } finally {
       setScanning(false);
     }

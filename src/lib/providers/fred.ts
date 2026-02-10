@@ -136,8 +136,5 @@ export async function getMarketIndicators(): Promise<{
 
   indicatorCache = { data, timestamp: Date.now() };
 
-  if (data.vix) console.log(`[FRED] VIX: ${data.vix.current} (${data.vix.date})`);
-  if (data.skew) console.log(`[FRED] SKEW: ${data.skew.current} (${data.skew.date})`);
-
   return data;
 }

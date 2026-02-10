@@ -91,10 +91,7 @@ async function fetchSnapshotPage(ticker: string): Promise<PolygonOptionSnapshot[
     signal: AbortSignal.timeout(FETCH_TIMEOUT),
   });
 
-  if (!res.ok) {
-    console.log(`[Flow] Snapshot ${ticker}: ${res.status}`);
-    return [];
-  }
+  if (!res.ok) return [];
   const data = await res.json();
   return data.results || [];
 }
@@ -124,7 +121,6 @@ async function fetchTrades(optionsTicker: string): Promise<PolygonTrade[] | null
 
     if (res.status === 403 || res.status === 401) {
       developerPlan = false;
-      console.log('[Flow] Trades endpoint not available (Starter plan). Snapshot-only mode.');
       return null;
     }
 
@@ -350,11 +346,5 @@ export async function scanMarketFlow(): Promise<FlowResult> {
   };
 
   flowCache = { result: flowResult, timestamp: Date.now() };
-  console.log(
-    `[Flow] ${tickersScanned}/${WATCHLIST.length} tickers, ${contractsAnalyzed} contracts. ` +
-    `Net: $${(netPremium / 1e6).toFixed(1)}M ${flowResult.flow.sentiment}` +
-    `${developerPlan ? ' [Developer]' : ''}`
-  );
-
   return flowResult;
 }

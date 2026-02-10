@@ -341,10 +341,7 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
       signal: AbortSignal.timeout(3000),
     });
     const setCookie = cookieRes.headers.get('set-cookie');
-    if (!setCookie) {
-      console.log('[Yahoo] No cookie returned from fc.yahoo.com');
-      return null;
-    }
+    if (!setCookie) return null;
     // Extract cookie key=value pairs (may have multiple cookies separated by commas)
     const cookieParts = setCookie.split(/,(?=\s*\w+=)/).map(c => c.split(';')[0].trim());
     const cookie = cookieParts.join('; ');
@@ -354,15 +351,9 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
       headers: { 'Cookie': cookie, 'User-Agent': UA },
       signal: AbortSignal.timeout(3000),
     });
-    if (!crumbRes.ok) {
-      console.log(`[Yahoo] Crumb fetch failed: ${crumbRes.status}`);
-      return null;
-    }
+    if (!crumbRes.ok) return null;
     const crumb = await crumbRes.text();
-    if (!crumb || crumb.length > 50) {
-      console.log('[Yahoo] Invalid crumb:', crumb?.slice(0, 20));
-      return null;
-    }
+    if (!crumb || crumb.length > 50) return null;
 
     // Step 3: Fetch financial data with cookie + crumb
     const modules = [
@@ -382,10 +373,7 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
       signal: AbortSignal.timeout(5000),
     });
 
-    if (!res.ok) {
-      console.log(`[Yahoo] quoteSummary failed: ${res.status}`);
-      return null;
-    }
+    if (!res.ok) return null;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const json: any = await res.json();
@@ -473,8 +461,7 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
     };
 
     return data;
-  } catch (err) {
-    console.log('[Yahoo] Fetch error:', err instanceof Error ? err.message : String(err));
+  } catch {
     return null;
   }
 }

@@ -44,11 +44,6 @@ export interface SnapshotData {
   ivTimeSeries?: { time: number; hv20: number; ivProxy: number; ivRank: number }[];
   vix?: { price: number; change: number; changePct: number } | null;
   vixTimeSeries?: { time: number; vix: number }[];
-  earnings?: {
-    nextEarnings: { symbol: string; date: string; time: string; confirmed: boolean; source: string; daysUntil: number } | null;
-    hasImminent: boolean;
-    ivSignals: { termStructureBackwardation: boolean; frontMonthIVPremium: number; ivRankElevated: boolean };
-  } | null;
   snapshotCount: number;
 }
 

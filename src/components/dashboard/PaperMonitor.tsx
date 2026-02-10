@@ -107,7 +107,6 @@ export default function PaperMonitor() {
         }
 
         if (triggered) {
-          console.log(`[PaperMonitor] ${triggered.toUpperCase()} HIT: ${rule.strategy || 'Trade'} on ${rule.underlying || '?'} — closing ${matched.length} position(s)`);
           let firstOrderId: number | undefined;
           for (const pos of matched) {
             try {
