@@ -19,6 +19,7 @@ import ScreenerTab from '@/components/dashboard/ScreenerTab';
 import BriefingTab from '@/components/dashboard/BriefingTab';
 import InstitutionalTab from '@/components/dashboard/InstitutionalTab';
 import PaperTradingTab from '@/components/dashboard/PaperTradingTab';
+import PaperMonitor from '@/components/dashboard/PaperMonitor';
 import CorrelationPanel from '@/components/dashboard/CorrelationPanel';
 import { Activity, Zap, AlertTriangle, X } from 'lucide-react';
 
@@ -140,6 +141,9 @@ export default function DashboardPage() {
           {activeTab === 'chain' && <ChainTab />}
         </div>
       </main>
+
+      {/* Background paper trading monitor — checks exit rules every 60s during market hours */}
+      <PaperMonitor />
 
       {/* Footer */}
       <footer className="border-t border-border mt-8">
