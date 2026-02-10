@@ -610,13 +610,41 @@ export async function POST() {
       .map((b: { text: string }) => b.text)
       .join('\n') || 'No response generated.';
 
+    // Build structured trade ideas for the UI (for paper trading buttons)
+    const tradeIdeas = results
+      .flatMap(s => s.trades.map(t => ({
+        ticker: s.symbol,
+        spot: s.price,
+        bias: s.bias,
+        biasScore: s.biasScore,
+        strategy: t.strategy,
+        direction: t.direction,
+        confidence: t.confidence,
+        score: t.score,
+        strikes: t.strikes,
+        expiration: t.expiration,
+        entry: t.entry,
+        risk: t.risk,
+        reasoning: t.reasoning,
+        tags: t.tags,
+        nearestExp: s.nearestExp,
+        nearestDTE: s.nearestDTE,
+        ivRank: s.ivRank,
+        currentIV: s.currentIV,
+        gammaFlip: s.gammaFlip,
+        callWall: s.callWall,
+        putWall: s.putWall,
+      })))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 15);
+
     return NextResponse.json({
       analysis: text,
       stocksScanned: results.length,
       timestamp: Date.now(),
-      // Include compact data for the UI
       indices: results.filter(r => INDICES.includes(r.symbol)),
       vix: vixPrice,
+      tradeIdeas,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error ?? 'Unknown error');

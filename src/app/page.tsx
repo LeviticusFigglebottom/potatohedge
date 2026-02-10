@@ -18,6 +18,7 @@ import AnalyticsTab from '@/components/dashboard/AnalyticsTab';
 import ScreenerTab from '@/components/dashboard/ScreenerTab';
 import BriefingTab from '@/components/dashboard/BriefingTab';
 import InstitutionalTab from '@/components/dashboard/InstitutionalTab';
+import PaperTradingTab from '@/components/dashboard/PaperTradingTab';
 import CorrelationPanel from '@/components/dashboard/CorrelationPanel';
 import { Activity, Zap, AlertTriangle, X } from 'lucide-react';
 
@@ -135,6 +136,7 @@ export default function DashboardPage() {
           {activeTab === 'screener' && <ScreenerTab />}
           {activeTab === 'institutional' && <InstitutionalTab />}
           {activeTab === 'briefing' && <BriefingTab />}
+          {activeTab === 'paper' && <PaperTradingTab />}
           {activeTab === 'chain' && <ChainTab />}
         </div>
       </main>

@@ -1,9 +1,35 @@
 'use client';
 
 import { useState, useCallback } from 'react';
+import { useDashboardStore } from '@/hooks/useDashboardStore';
 import {
   Newspaper, Loader2, AlertTriangle, TrendingUp, TrendingDown, Minus,
+  Wallet, ChevronDown, ChevronUp, CheckCircle2,
 } from 'lucide-react';
+
+interface TradeIdea {
+  ticker: string;
+  spot: number;
+  bias: string;
+  biasScore: number;
+  strategy: string;
+  direction: string;
+  confidence: string;
+  score: number;
+  strikes: string;
+  expiration: string;
+  entry: string;
+  risk: string;
+  reasoning: string[];
+  tags: string[];
+  nearestExp: string;
+  nearestDTE: number;
+  ivRank: number;
+  currentIV: number;
+  gammaFlip: number | null;
+  callWall: number | null;
+  putWall: number | null;
+}
 
 interface BriefingResponse {
   analysis: string;
@@ -20,6 +46,7 @@ interface BriefingResponse {
     ivRank: number;
   }[];
   vix: number;
+  tradeIdeas?: TradeIdea[];
 }
 
 function ChangeChip({ pct }: { pct: number }) {
@@ -71,6 +98,174 @@ function RenderMarkdown({ text }: { text: string }) {
   }
 
   return <>{elements}</>;
+}
+
+function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
+  const { setActiveTab } = useDashboardStore();
+  const [expanded, setExpanded] = useState<number | null>(null);
+  const [paperStatus, setPaperStatus] = useState<Record<number, string>>({});
+
+  const handlePaperTrade = async (idea: TradeIdea, idx: number) => {
+    setPaperStatus(s => ({ ...s, [idx]: 'placing...' }));
+    try {
+      // Parse strike from the strategy/strikes field
+      const strikeMatch = idea.strikes.match(/\$?([\d.]+)/);
+      const strike = strikeMatch ? parseFloat(strikeMatch[1]) : idea.spot;
+      const isCall = /call|bull/i.test(idea.strategy) || idea.direction === 'bullish';
+      const isPut = /put|bear/i.test(idea.strategy) || idea.direction === 'bearish';
+      const optionType = isPut ? 'P' : 'C';
+
+      // Detect if it's a spread
+      const spreadMatch = idea.strikes.match(/\$?([\d.]+)\s*\/\s*\$?([\d.]+)/);
+
+      if (spreadMatch) {
+        // Multileg spread
+        const strike1 = parseFloat(spreadMatch[1]);
+        const strike2 = parseFloat(spreadMatch[2]);
+        const isDebit = idea.strategy.toLowerCase().includes('debit') || idea.strategy.toLowerCase().includes('buy');
+
+        const res = await fetch('/api/paper/trade', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'spread',
+            symbol: idea.ticker,
+            orderType: isDebit ? 'debit' : 'credit',
+            duration: 'day',
+            legs: [
+              { expiration: idea.nearestExp, optionType, strike: strike1, side: 'buy_to_open', quantity: 1 },
+              { expiration: idea.nearestExp, optionType, strike: strike2, side: 'sell_to_open', quantity: 1 },
+            ],
+            thesis: `${idea.strategy} — ${idea.reasoning[0] || ''}`,
+          }),
+        });
+
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error);
+        setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId}` }));
+      } else {
+        // Single leg
+        const res = await fetch('/api/paper/trade', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'single',
+            symbol: idea.ticker,
+            expiration: idea.nearestExp,
+            optionType: isCall ? 'C' : optionType,
+            strike,
+            side: 'buy_to_open',
+            quantity: 1,
+            orderType: 'market',
+            thesis: `${idea.strategy} — ${idea.reasoning[0] || ''}`,
+          }),
+        });
+
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error);
+        setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId}` }));
+      }
+    } catch (err) {
+      setPaperStatus(s => ({ ...s, [idx]: `Error: ${err instanceof Error ? err.message : 'Failed'}` }));
+    }
+  };
+
+  if (ideas.length === 0) return null;
+
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <span className="panel-title flex items-center gap-2">
+          <Wallet className="w-4 h-4 text-accent-cyan" />
+          Algorithm Trade Ideas ({ideas.length})
+        </span>
+        <button
+          onClick={() => setActiveTab('paper')}
+          className="text-xs font-mono text-text-muted hover:text-accent-cyan transition-colors"
+        >
+          Paper Trades →
+        </button>
+      </div>
+      <div className="divide-y divide-border/10">
+        {ideas.map((idea, idx) => {
+          const isExp = expanded === idx;
+          const status = paperStatus[idx];
+          const dirColor = idea.direction === 'bullish' ? 'text-green-400' : idea.direction === 'bearish' ? 'text-red-400' : 'text-text-muted';
+          const confBg = idea.confidence === 'high' ? 'bg-accent-cyan/15 text-accent-cyan' :
+            idea.confidence === 'medium' ? 'bg-yellow-500/15 text-yellow-400' :
+            'bg-bg-tertiary text-text-muted';
+
+          return (
+            <div key={idx} className="px-4 py-3">
+              <div className="flex items-center justify-between cursor-pointer" onClick={() => setExpanded(isExp ? null : idx)}>
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="font-mono font-semibold text-text-primary">{idea.ticker}</span>
+                  <span className={`text-xs font-mono ${dirColor}`}>{idea.direction}</span>
+                  <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${confBg}`}>{idea.confidence}</span>
+                  <span className="text-xs text-text-muted font-mono truncate hidden sm:inline">{idea.strategy}</span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="text-xs font-mono text-text-muted">Score: {idea.score}</span>
+                  {isExp ? <ChevronUp className="w-3.5 h-3.5 text-text-muted" /> : <ChevronDown className="w-3.5 h-3.5 text-text-muted" />}
+                </div>
+              </div>
+
+              {isExp && (
+                <div className="mt-3 space-y-2">
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
+                    <div><span className="text-text-muted">Strategy:</span> <span className="text-text-primary">{idea.strategy}</span></div>
+                    <div><span className="text-text-muted">Strikes:</span> <span className="text-text-primary">{idea.strikes}</span></div>
+                    <div><span className="text-text-muted">Exp:</span> <span className="text-text-primary">{idea.expiration} ({idea.nearestDTE}d)</span></div>
+                    <div><span className="text-text-muted">Spot:</span> <span className="text-text-primary">${idea.spot.toFixed(2)}</span></div>
+                  </div>
+                  <div className="text-xs font-mono text-text-muted">
+                    <span className="text-text-muted">Entry:</span> {idea.entry}
+                  </div>
+                  <div className="text-xs font-mono text-text-muted">
+                    <span className="text-text-muted">Risk:</span> {idea.risk}
+                  </div>
+                  <div className="text-xs font-mono text-text-muted">
+                    <span className="text-text-muted">Key Levels:</span>{' '}
+                    γFlip={idea.gammaFlip ? `$${idea.gammaFlip.toFixed(0)}` : 'N/A'}{' '}
+                    CW={idea.callWall ? `$${idea.callWall.toFixed(0)}` : 'N/A'}{' '}
+                    PW={idea.putWall ? `$${idea.putWall.toFixed(0)}` : 'N/A'}
+                  </div>
+                  {idea.reasoning.length > 0 && (
+                    <div className="text-xs text-text-muted space-y-0.5">
+                      {idea.reasoning.map((r, ri) => (
+                        <div key={ri} className="flex items-start gap-1.5">
+                          <span className="text-accent-cyan shrink-0">{'>'}</span>
+                          <span>{r}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex items-center gap-2 pt-1">
+                    {status?.startsWith('Placed') ? (
+                      <span className="text-xs font-mono text-green-400 flex items-center gap-1">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> {status}
+                      </span>
+                    ) : status?.startsWith('Error') ? (
+                      <span className="text-xs font-mono text-red-400">{status}</span>
+                    ) : (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handlePaperTrade(idea, idx); }}
+                        disabled={status === 'placing...'}
+                        className="px-3 py-1.5 rounded-md text-xs font-mono bg-accent-cyan/15 text-accent-cyan border border-accent-cyan/25 hover:bg-accent-cyan/25 transition-all flex items-center gap-1.5 disabled:opacity-50"
+                      >
+                        <Wallet className="w-3.5 h-3.5" />
+                        {status === 'placing...' ? 'Placing...' : 'Paper Trade'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 export default function BriefingTab() {
@@ -234,6 +429,10 @@ export default function BriefingTab() {
               <RenderMarkdown text={data.analysis} />
             </div>
           </div>
+
+          {data.tradeIdeas && data.tradeIdeas.length > 0 && (
+            <TradeIdeasPanel ideas={data.tradeIdeas} />
+          )}
 
           <div className="text-center text-[10px] text-text-muted/40 font-mono py-2">
             Generated by Claude Sonnet &bull; {data.stocksScanned} securities analyzed &bull;

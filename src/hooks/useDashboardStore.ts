@@ -45,7 +45,7 @@ export interface SnapshotData {
   snapshotCount: number;
 }
 
-export type TabId = 'overview' | 'chain' | 'dealer' | 'volatility' | 'analytics' | 'screener' | 'institutional' | 'briefing';
+export type TabId = 'overview' | 'chain' | 'dealer' | 'volatility' | 'analytics' | 'screener' | 'institutional' | 'briefing' | 'paper';
 
 export interface RecommendationData {
   symbol: string;

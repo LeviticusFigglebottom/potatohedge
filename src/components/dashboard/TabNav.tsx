@@ -1,7 +1,7 @@
 'use client';
 
 import { useDashboardStore, type TabId } from '@/hooks/useDashboardStore';
-import { LayoutDashboard, TableProperties, Shield, Activity, LineChart, Radar, Building2, Newspaper } from 'lucide-react';
+import { LayoutDashboard, TableProperties, Shield, Activity, LineChart, Radar, Building2, Newspaper, Wallet } from 'lucide-react';
 
 const TABS: { id: TabId; label: string; icon: React.ElementType }[] = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
@@ -11,6 +11,7 @@ const TABS: { id: TabId; label: string; icon: React.ElementType }[] = [
   { id: 'screener', label: 'Screener', icon: Radar },
   { id: 'institutional', label: 'Institutional', icon: Building2 },
   { id: 'briefing', label: 'AI Briefing', icon: Newspaper },
+  { id: 'paper', label: 'Paper Trades', icon: Wallet },
   { id: 'chain', label: 'Options Chain', icon: TableProperties },
 ];
 
