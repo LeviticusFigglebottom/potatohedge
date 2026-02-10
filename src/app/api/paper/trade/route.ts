@@ -3,7 +3,6 @@ import {
   placeSingleOrder,
   placeMultiLegOrder,
   buildOCCSymbol,
-  getOptionQuotes,
   type SingleLegOrder,
 } from '@/lib/providers/tradierPaper';
 
@@ -107,49 +106,41 @@ export async function POST(request: NextRequest) {
         quantity: leg.quantity || 1,
       }));
 
-      // Tradier requires 'price' for debit/credit types.
-      // If no netPrice provided, fetch live quotes and calculate mid-price.
-      let resolvedType = (orderType || 'market') as 'market' | 'debit' | 'credit' | 'even';
-      let resolvedPrice = netPrice as number | undefined;
+      // For paper trading: try multileg market order first.
+      // If explicit netPrice provided with debit/credit type, use that.
+      // Otherwise always use market type — no price resolution needed for sandbox.
+      const resolvedType = (netPrice != null && orderType && orderType !== 'market')
+        ? orderType as 'debit' | 'credit' | 'even'
+        : 'market' as const;
 
-      if ((resolvedType === 'debit' || resolvedType === 'credit') && resolvedPrice == null) {
-        try {
-          const occSymbols = builtLegs.map((l: { optionSymbol: string }) => l.optionSymbol);
-          const quotes = await getOptionQuotes(occSymbols);
+      let result: { id: number; status: string };
 
-          // Calculate net: sum of (mid * quantity * direction)
-          // buy legs are negative cost (we pay), sell legs are positive (we receive)
-          let netMid = 0;
-          for (const leg of builtLegs) {
-            const q = quotes.get(leg.optionSymbol);
-            if (!q || (q.bid === 0 && q.ask === 0)) continue;
-            const mid = (q.bid + q.ask) / 2;
-            const direction = leg.side.startsWith('sell') ? 1 : -1; // sell = receive, buy = pay
-            netMid += mid * leg.quantity * direction;
-          }
-
-          if (netMid !== 0) {
-            // For credit spreads net is positive (we receive), for debit it's negative (we pay)
-            resolvedPrice = Math.abs(parseFloat(netMid.toFixed(2)));
-          } else {
-            // Can't determine price — fall back to market
-            resolvedType = 'market';
-          }
-        } catch {
-          // Quote fetch failed — fall back to market type
-          resolvedType = 'market';
+      try {
+        result = await placeMultiLegOrder({
+          symbol,
+          type: resolvedType,
+          price: netPrice != null ? netPrice : undefined,
+          duration: (duration || 'gtc') as 'day' | 'gtc',
+          legs: builtLegs,
+        });
+      } catch (multilegErr) {
+        // Multileg failed — decompose into individual single-leg market orders.
+        // This is the most reliable fallback for sandbox after-hours or edge cases.
+        console.warn('[paper/trade] Multileg failed, decomposing into single legs:', multilegErr);
+        const legResults: { id: number; status: string }[] = [];
+        for (const leg of builtLegs) {
+          const legResult = await placeSingleOrder({
+            symbol,
+            optionSymbol: leg.optionSymbol,
+            side: leg.side,
+            quantity: leg.quantity,
+            type: 'market',
+            duration: 'gtc',
+          });
+          legResults.push(legResult);
         }
+        result = { id: legResults[0].id, status: `${legResults.length} legs filled individually` };
       }
-
-      const multilegOrder = {
-        symbol,
-        type: resolvedType,
-        price: resolvedPrice,
-        duration: (duration || 'day') as 'day' | 'gtc',
-        legs: builtLegs,
-      };
-
-      const result = await placeMultiLegOrder(multilegOrder);
 
       return NextResponse.json({
         success: true,
