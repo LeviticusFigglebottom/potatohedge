@@ -11,7 +11,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { loadHistory, saveHistoryBulk, getPersistenceStatus } from '@/lib/persistence';
+import { loadHistory, saveHistoryBulk, getPersistenceStatus, testConnection } from '@/lib/persistence';
 
 function historyKey(type: string, ticker?: string): string {
   if (type === 'metrics' && ticker) return `optix:metrics:${ticker.toUpperCase()}`;
@@ -24,9 +24,24 @@ export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
   const type = params.get('type');
 
-  // Status check — tells client what's available
+  // Status check — tells client what's available + connectivity test
   if (type === 'status') {
-    return NextResponse.json(getPersistenceStatus());
+    const status = getPersistenceStatus();
+    const ticker = params.get('ticker');
+    // If ticker provided, also return record counts
+    if (ticker) {
+      const [metricsData, flowData] = await Promise.all([
+        loadHistory(historyKey('metrics', ticker), 365).catch(() => []),
+        loadHistory('optix:flow:market', 365).catch(() => []),
+      ]);
+      return NextResponse.json({
+        ...status,
+        metricsRecords: metricsData.length,
+        flowRecords: flowData.length,
+        connected: await testConnection(),
+      });
+    }
+    return NextResponse.json({ ...status, connected: await testConnection() });
   }
 
   if (!type || (type !== 'metrics' && type !== 'flow')) {

@@ -201,9 +201,11 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
   },
 
   saveAndLoadMetricHistory: () => {
-    const { symbol, multiGEX, snapshot } = get();
-    if (!multiGEX || !snapshot) {
-      // Try server sync first, fall back to localStorage
+    const { symbol, quote, multiGEX, snapshot } = get();
+
+    // Need at least some data to save a meaningful record
+    if (!multiGEX && !snapshot && !quote) {
+      // No data at all — just try to load existing history
       loadMetricHistoryWithSync(symbol).then(merged => {
         if (merged.length > 0) set({ metricHistory: merged });
       }).catch(() => {
@@ -212,27 +214,29 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
       });
       return;
     }
+
+    // Save whatever data we have (partial is better than nothing)
     const today = new Date();
     const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
     const record: DailyMetricRecord = {
       date,
       timestamp: Date.now(),
-      spotPrice: multiGEX.spotPrice,
-      volumePCR: multiGEX.volume?.volumePCR ?? 0,
-      oiPCR: multiGEX.volume?.oiPCR ?? 0,
-      totalCallVol: multiGEX.volume?.totalCallVol ?? 0,
-      totalPutVol: multiGEX.volume?.totalPutVol ?? 0,
-      totalGEX: multiGEX.aggregated?.totalGEX ?? 0,
-      totalDEX: multiGEX.aggregated?.totalDEX ?? 0,
-      totalVanna: multiGEX.aggregated?.totalVanna ?? 0,
-      totalCharm: multiGEX.aggregated?.totalCharm ?? 0,
-      ivRank: snapshot.iv?.ivRank ?? 0,
-      currentIV: snapshot.iv?.currentIV ?? 0,
-      hvCurrent: snapshot.iv?.hvCurrent ?? 0,
-      gammaFlip: multiGEX.aggregated?.gammaFlip ?? null,
-      callWall: multiGEX.aggregated?.callWall ?? null,
-      putWall: multiGEX.aggregated?.putWall ?? null,
-      maxPain: multiGEX.maxPain?.strike ?? 0,
+      spotPrice: multiGEX?.spotPrice ?? quote?.last ?? 0,
+      volumePCR: multiGEX?.volume?.volumePCR ?? 0,
+      oiPCR: multiGEX?.volume?.oiPCR ?? 0,
+      totalCallVol: multiGEX?.volume?.totalCallVol ?? 0,
+      totalPutVol: multiGEX?.volume?.totalPutVol ?? 0,
+      totalGEX: multiGEX?.aggregated?.totalGEX ?? 0,
+      totalDEX: multiGEX?.aggregated?.totalDEX ?? 0,
+      totalVanna: multiGEX?.aggregated?.totalVanna ?? 0,
+      totalCharm: multiGEX?.aggregated?.totalCharm ?? 0,
+      ivRank: snapshot?.iv?.ivRank ?? 0,
+      currentIV: snapshot?.iv?.currentIV ?? 0,
+      hvCurrent: snapshot?.iv?.hvCurrent ?? 0,
+      gammaFlip: multiGEX?.aggregated?.gammaFlip ?? null,
+      callWall: multiGEX?.aggregated?.callWall ?? null,
+      putWall: multiGEX?.aggregated?.putWall ?? null,
+      maxPain: multiGEX?.maxPain?.strike ?? 0,
     };
     saveMetricSnapshot(symbol, record);
     set({ metricHistory: loadMetricHistory(symbol) });

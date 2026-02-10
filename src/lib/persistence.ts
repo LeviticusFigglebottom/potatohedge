@@ -199,3 +199,27 @@ export function getPersistenceStatus(): { redis: boolean; blob: boolean } {
     blob: isBlobAvailable(),
   };
 }
+
+/**
+ * Test actual connectivity to the configured backend.
+ * Returns true if we can successfully read/write.
+ */
+export async function testConnection(): Promise<boolean> {
+  try {
+    const redis = await getRedis();
+    if (redis) {
+      await redis.ping();
+      return true;
+    }
+  } catch { /* fall through */ }
+
+  if (isBlobAvailable()) {
+    try {
+      const { list } = await import('@vercel/blob');
+      await list({ prefix: 'optix-history/', limit: 1 });
+      return true;
+    } catch { /* fall through */ }
+  }
+
+  return false;
+}
