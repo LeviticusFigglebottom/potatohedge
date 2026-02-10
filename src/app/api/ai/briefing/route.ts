@@ -14,7 +14,7 @@ import {
   computeSkew,
   computeStockProfile,
 } from '@/lib/math/analytics';
-import { generateRecommendations, type RecommendationInput } from '@/lib/math/recommendations';
+import { generateRecommendations, type RecommendationInput, type TradeIdea } from '@/lib/math/recommendations';
 import type { EquityBar } from '@/lib/providers/equityBars';
 import { getMarketSwapSummary } from '@/lib/providers/dtcc';
 import { fetchRegSHOThreshold, fetchShortInterest, fetchShortSaleVolume, type ShortInterestData, type ShortVolumeData } from '@/lib/providers/finra';
@@ -62,6 +62,10 @@ interface StockScan {
   atrPercent: number;
   dailySigma: number;
   skewBias: string;
+  // Generated trade ideas from recommendation engine
+  trades: TradeIdea[];
+  nearestExp: string;
+  nearestDTE: number;
 }
 
 function computeQuickCorrelationCtx(
@@ -259,6 +263,9 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
       atrPercent: profile.atrPercent,
       dailySigma: profile.dailySigma,
       skewBias: skew.skewBias,
+      trades: rec.trades.slice(0, 3), // top 3 trade ideas per stock
+      nearestExp: nearExps[0]?.date || '',
+      nearestDTE: nearExps[0]?.dte || 0,
     };
   } catch {
     return null;
@@ -429,6 +436,25 @@ ${regSHOList.length} securities: ${regSHOList.slice(0, 25).join(', ')}${regSHOLi
     }
   }
 
+  // Algorithm-generated trade ideas from the recommendation engine
+  const allTrades = stocks
+    .flatMap(s => s.trades.map(t => ({ ...t, ticker: s.symbol, spot: s.price, bias: s.bias, biasScore: s.biasScore, nearestExp: s.nearestExp, nearestDTE: s.nearestDTE, ivRank: s.ivRank, currentIV: s.currentIV, gammaFlip: s.gammaFlip, callWall: s.callWall, putWall: s.putWall })))
+    .sort((a, b) => b.score - a.score);
+
+  if (allTrades.length > 0) {
+    prompt += `\n\n─── ALGORITHM TRADE IDEAS (top ${Math.min(20, allTrades.length)} by conviction score) ───`;
+    prompt += `\n(These are quantitative setups from the scoring engine. Use them as starting points — apply your judgment to select the best 3-5 and refine entry/exit.)`;
+    for (const t of allTrades.slice(0, 20)) {
+      prompt += `\n\n${t.ticker} ($${t.spot.toFixed(2)}) — Score: ${t.biasScore > 0 ? '+' : ''}${t.biasScore} ${t.bias} | IV Rank: ${t.ivRank}`;
+      prompt += `\n  Strategy: ${t.strategy} (${t.direction}, ${t.confidence} confidence, algo score: ${t.score})`;
+      prompt += `\n  Strikes: ${t.strikes} | Exp: ${t.expiration}`;
+      prompt += `\n  Entry: ${t.entry}`;
+      prompt += `\n  Risk: ${t.risk}`;
+      prompt += `\n  Key levels: γFlip=${t.gammaFlip ? '$' + t.gammaFlip.toFixed(0) : 'N/A'} CW=${t.callWall ? '$' + t.callWall.toFixed(0) : 'N/A'} PW=${t.putWall ? '$' + t.putWall.toFixed(0) : 'N/A'}`;
+      prompt += `\n  Reasoning: ${t.reasoning.join(' | ')}`;
+    }
+  }
+
   prompt += `\n\n═══════════════════════════════════════════
 YOUR TASK — Write the morning briefing. Start with one bold headline sentence that captures today's most important dynamic. Then cover:
 
@@ -444,9 +470,24 @@ Then analyze:
 
 3. **MAGNIFICENT 7 BREAKDOWN** — For each Mag7 stock with notable positioning, state the directional lean and which Greek(s) drive it. Flag any that diverge from their index. Count how many are long vs short — does narrow leadership make QQQ vulnerable?
 
-${flowData.flow.tickersScanned > 0 ? '4. **OPTIONS FLOW ANALYSIS** — Analyze the real-time options premium flow. What does the net premium tell us? Which tickers have the most aggressive institutional positioning? Are sweeps/blocks confirming or diverging from dealer gamma positioning? Cross-reference flow direction with GEX regime for each ticker.\n\n' : ''}${swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0 ? '5. **SWAP MATURITIES** — Interpret swap maturities. Extreme clusters create forced dealer rebalancing. Cross-reference with flow alerts: are institutions positioning ahead of maturity unwinds?\n\n' : ''}${regSHOList.length > 0 || shortInterestData.length > 0 ? '6. **SHORT INTEREST / REG SHO** — Notable names with persistent FTDs or high days-to-cover. Cross-reference with options flow: are shorts being squeezed (bullish flow + high SI)?\n\n' : ''}7. **WATCHLIST** — Name 3-5 specific stocks (from any scanned) with the highest-conviction setups. For each: state the direction, the dominant Greek signal, key level to watch, and what would invalidate the thesis. Include flow context (sweeps, blocks, unusual volume) alongside dealer positioning.
+${flowData.flow.tickersScanned > 0 ? '4. **OPTIONS FLOW ANALYSIS** — Analyze the real-time options premium flow. What does the net premium tell us? Which tickers have the most aggressive institutional positioning? Are sweeps/blocks confirming or diverging from dealer gamma positioning? Cross-reference flow direction with GEX regime for each ticker.\n\n' : ''}${swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0 ? '5. **SWAP MATURITIES** — Interpret swap maturities. Extreme clusters create forced dealer rebalancing. Cross-reference with flow alerts: are institutions positioning ahead of maturity unwinds?\n\n' : ''}${regSHOList.length > 0 || shortInterestData.length > 0 ? '6. **SHORT INTEREST / REG SHO** — Notable names with persistent FTDs or high days-to-cover. Cross-reference with options flow: are shorts being squeezed (bullish flow + high SI)?\n\n' : ''}7. **KEY LEVELS** — For SPY specifically: gamma flip, call wall, put wall, max pain. What happens at each level.
 
-7. **KEY LEVELS** — For SPY specifically: gamma flip, call wall, put wall, max pain. What happens at each level.
+8. **OPTIONS TRADE IDEAS** — This is critical. Using all available data (dealer Greeks, flow, IV regime, key levels, algorithm trade ideas above), present **3-5 specific, actionable short-term options plays**. For EACH trade, provide ALL of these fields in a structured format:
+
+| Field | Required Detail |
+|-------|----------------|
+| **Ticker** | Stock symbol |
+| **Direction** | Bullish / Bearish / Neutral |
+| **Strategy** | e.g., "Buy 605C weeklies", "Bear put spread 590/580", "Sell iron condor 595/600/610/615" |
+| **Strike(s)** | Exact strike price(s) |
+| **Expiration** | Specific date and DTE |
+| **Entry** | Price target or condition for entry |
+| **Target** | Profit target price/level |
+| **Stop/Max Loss** | Where to cut the trade |
+| **Thesis** | 2-3 sentences: what Greek/flow/level drives this, what catalyst or positioning supports it |
+| **Invalidation** | What specific level or event kills the trade |
+
+Prioritize trades where multiple signals converge: gamma positioning + flow direction + key level proximity + IV regime. Prefer defined-risk strategies (spreads) over naked options. Reference the algorithm trade ideas data above but apply your own judgment — you may modify strikes, expirations, or strategies based on the full market context.
 
 Be opinionated and direct. Use **bold** for key names, levels, and directional calls. Every claim must reference specific data. Do NOT hedge every statement — make clear calls.`;
 

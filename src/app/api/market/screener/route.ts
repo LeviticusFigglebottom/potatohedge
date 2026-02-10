@@ -47,7 +47,7 @@ export interface ScreenerResult {
   regSHO: boolean;
 }
 
-const CONCURRENCY = 6; // higher concurrency to scan more stocks within timeout
+const CONCURRENCY = 8; // maximize stocks scanned within 60s Hobby timeout
 
 async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -139,14 +139,14 @@ async function analyzeStock(
     const [quote, expirations, historyBars] = await Promise.all([
       getQuote(ticker),
       getExpirations(ticker).catch(() => []),
-      fetchEquityBars(ticker, 400), // match recommendations: full 252-day IV rank window
+      fetchEquityBars(ticker, 250), // match recommendations route exactly
     ]);
 
     const spotPrice = quote.last;
     if (!spotPrice || spotPrice <= 0) return null;
 
-    // Match recommendations route: 4 nearest expirations
-    const nearExps = expirations.slice(0, 4);
+    // Match recommendations route exactly: 3 nearest expirations
+    const nearExps = expirations.slice(0, 3);
     if (nearExps.length === 0) return null;
 
     const chains = await Promise.all(
@@ -376,7 +376,7 @@ export async function GET(request: NextRequest) {
 
         // Small delay between batches to avoid rate limit spikes
         if (i + CONCURRENCY < symbols.length) {
-          await sleep(200);
+          await sleep(100);
         }
       }
 
