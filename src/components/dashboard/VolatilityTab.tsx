@@ -40,8 +40,11 @@ function VIXPanel() {
     // Convert back to VIX points for charting
     const data = vixSeries;
     const vixValues = data.map(d => d.vix * 100);
-    const minV = Math.min(...vixValues) * 0.9;
-    const maxV = Math.max(...vixValues) * 1.1;
+    const sortedVix = [...vixValues].sort((a, b) => a - b);
+    const vp2 = sortedVix[Math.floor(sortedVix.length * 0.02)] ?? sortedVix[0];
+    const vp98 = sortedVix[Math.floor(sortedVix.length * 0.98)] ?? sortedVix[sortedVix.length - 1];
+    const minV = Math.min(vp2 * 0.9, 10);
+    const maxV = Math.max(vp98 * 1.1, 30);
     const minTime = data[0].time;
     const maxTime = data[data.length - 1].time;
 
@@ -481,7 +484,8 @@ function IVvsVIXChart() {
     const minTime = data[0].time;
     const maxTime = data[data.length - 1].time;
 
-    // Collect all values for Y scale
+    // Collect all values for Y scale — use percentile-based scaling
+    // to prevent outlier spikes from compressing normal data
     const allVals = data.flatMap(d => [d.hv20, d.ivProxy]);
     if (vixSeries?.length) {
       for (const v of vixSeries) {
@@ -490,11 +494,17 @@ function IVvsVIXChart() {
     }
     if (snapshot?.iv?.currentIV) allVals.push(snapshot.iv.currentIV);
 
-    const minV = Math.min(...allVals) * 0.85;
-    const maxV = Math.max(...allVals) * 1.1;
+    const sorted = [...allVals].sort((a, b) => a - b);
+    const p2 = sorted[Math.floor(sorted.length * 0.02)] ?? 0;
+    const p98 = sorted[Math.floor(sorted.length * 0.98)] ?? sorted[sorted.length - 1];
+    const minV = p2 * 0.85;
+    const maxV = p98 * 1.15;
 
     const toX = (t: number) => pad.left + ((t - minTime) / (maxTime - minTime)) * cw;
-    const toY = (v: number) => pad.top + ch - ((v - minV) / (maxV - minV)) * ch;
+    const toY = (v: number) => {
+      const clamped = Math.max(minV, Math.min(maxV, v));
+      return pad.top + ch - ((clamped - minV) / (maxV - minV)) * ch;
+    };
 
     // Grid lines
     ctx.strokeStyle = '#1a1a2515';
