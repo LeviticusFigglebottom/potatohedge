@@ -4,28 +4,42 @@ import { useEffect, useRef, useCallback } from 'react';
 
 /**
  * Background monitor for paper trading positions.
- * Runs at the app level (page.tsx) so it checks positions regardless of active tab.
- * Polls every 60s, checks positions against stored exit rules, auto-closes when hit.
- * Only active during US market hours and only when there are active rules.
+ * Runs at the app level (page.tsx) — checks positions regardless of active tab.
+ * Polls every 60s during market hours, checks grouped spread P&L against exit rules.
+ * Supports both new grouped rules (spreads) and legacy single-symbol rules.
  */
 
 interface TradeRule {
-  occSymbol: string;
+  id: string;
+  occSymbols: string[];
+  underlying: string;
+  strategy: string;
   thesis: string;
-  targetPrice: number | null;
-  stopPrice: number | null;
-  costBasis: number;
-  createdAt: string;
+  profitTargetPct: number;
+  stopLossPct: number;
   autoExit: boolean;
+  createdAt: string;
   exitTriggered?: 'target' | 'stop' | null;
   exitOrderId?: number;
+  // Legacy single-position fields
+  occSymbol?: string;
+  targetPrice?: number | null;
+  stopPrice?: number | null;
+  costBasis?: number;
+}
+
+interface Position {
+  symbol: string;
+  quantity: number;
+  cost_basis: number;
+  currentPrice: number;
+  unrealizedPL: number;
 }
 
 function loadRules(): TradeRule[] {
   if (typeof window === 'undefined') return [];
-  try {
-    return JSON.parse(localStorage.getItem('optix-paper-rules') || '[]');
-  } catch { return []; }
+  try { return JSON.parse(localStorage.getItem('optix-paper-rules') || '[]'); }
+  catch { return []; }
 }
 
 function saveRules(rules: TradeRule[]) {
@@ -36,12 +50,9 @@ function isMarketHours(): boolean {
   const now = new Date();
   const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
   const day = et.getDay();
-  if (day === 0 || day === 6) return false; // weekend
-  const hours = et.getHours();
-  const mins = et.getMinutes();
-  const time = hours * 60 + mins;
-  // Pre-market 8:00 to after-hours 18:00 ET (wider window for options)
-  return time >= 480 && time <= 1080;
+  if (day === 0 || day === 6) return false;
+  const time = et.getHours() * 60 + et.getMinutes();
+  return time >= 480 && time <= 1080; // 8AM-6PM ET
 }
 
 export default function PaperMonitor() {
@@ -49,15 +60,11 @@ export default function PaperMonitor() {
   const runningRef = useRef(false);
 
   const checkPositions = useCallback(async () => {
-    // Don't overlap checks
     if (runningRef.current) return;
 
-    // Only check if there are active rules
     const rules = loadRules();
-    const activeRules = rules.filter(r => r.autoExit && !r.exitTriggered && (r.targetPrice || r.stopPrice));
+    const activeRules = rules.filter(r => r.autoExit && !r.exitTriggered);
     if (activeRules.length === 0) return;
-
-    // Only check during market hours (options have no live quotes outside)
     if (!isMarketHours()) return;
 
     runningRef.current = true;
@@ -65,60 +72,75 @@ export default function PaperMonitor() {
       const res = await fetch('/api/paper/account');
       if (!res.ok || res.status === 501) return;
       const data = await res.json();
-      const positions = data.positions || [];
+      const positions: Position[] = data.positions || [];
 
-      for (const pos of positions) {
-        const rule = activeRules.find(r => r.occSymbol === pos.symbol);
-        if (!rule) continue;
-        const currentPrice = pos.currentPrice ?? 0;
-        if (currentPrice <= 0) continue;
+      for (const rule of activeRules) {
+        // Collect OCC symbols for this rule (new grouped or legacy single)
+        const ruleSymbols = rule.occSymbols?.length
+          ? rule.occSymbols
+          : rule.occSymbol ? [rule.occSymbol] : [];
+        if (ruleSymbols.length === 0) continue;
+
+        // Find matching positions
+        const matched = positions.filter(p => ruleSymbols.includes(p.symbol));
+        if (matched.length === 0) continue;
 
         let triggered: 'target' | 'stop' | null = null;
 
-        // Check take profit (long positions: current >= target)
-        if (rule.targetPrice && currentPrice >= rule.targetPrice && pos.quantity > 0) {
-          triggered = 'target';
+        // Grouped percentage-based P&L (spreads, condors, straddles)
+        if (rule.profitTargetPct || rule.stopLossPct) {
+          const totalCost = matched.reduce((s, p) => s + Math.abs(p.cost_basis), 0);
+          const totalPL = matched.reduce((s, p) => s + p.unrealizedPL, 0);
+          const plPct = totalCost > 0 ? (totalPL / totalCost) * 100 : 0;
+
+          if (rule.profitTargetPct && plPct >= rule.profitTargetPct) triggered = 'target';
+          if (rule.stopLossPct && plPct <= -rule.stopLossPct) triggered = 'stop';
         }
-        // Check stop loss (long positions: current <= stop)
-        if (rule.stopPrice && currentPrice <= rule.stopPrice && pos.quantity > 0) {
-          triggered = 'stop';
+
+        // Legacy: absolute price targets
+        if (!triggered && (rule.targetPrice || rule.stopPrice)) {
+          for (const pos of matched) {
+            if (pos.currentPrice <= 0 || pos.quantity <= 0) continue;
+            if (rule.targetPrice && pos.currentPrice >= rule.targetPrice) triggered = 'target';
+            if (rule.stopPrice && pos.currentPrice <= rule.stopPrice) triggered = 'stop';
+          }
         }
 
         if (triggered) {
-          try {
-            const closeRes = await fetch('/api/paper/close', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ symbol: pos.symbol, quantity: pos.quantity }),
-            });
-            const closeData = await closeRes.json();
-            if (closeRes.ok) {
-              // Update the rule
-              const allRules = loadRules();
-              const idx = allRules.findIndex(r => r.occSymbol === pos.symbol);
-              if (idx >= 0) {
-                allRules[idx].exitTriggered = triggered;
-                allRules[idx].exitOrderId = closeData.orderId;
-                saveRules(allRules);
-              }
-              console.log(`[PaperMonitor] Auto-closed ${pos.symbol}: ${triggered} hit at $${currentPrice.toFixed(2)}, order #${closeData.orderId}`);
-            }
-          } catch {
-            // Will retry next cycle
+          console.log(`[PaperMonitor] ${triggered.toUpperCase()} HIT: ${rule.strategy || 'Trade'} on ${rule.underlying || '?'} — closing ${matched.length} position(s)`);
+          let firstOrderId: number | undefined;
+          for (const pos of matched) {
+            try {
+              const closeRes = await fetch('/api/paper/close', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ symbol: pos.symbol, quantity: pos.quantity }),
+              });
+              const closeData = await closeRes.json();
+              if (closeRes.ok && !firstOrderId) firstOrderId = closeData.orderId;
+            } catch { /* retry next cycle */ }
+          }
+          // Mark rule as triggered
+          const allRules = loadRules();
+          const idx = allRules.findIndex(r =>
+            r.id === rule.id || (rule.occSymbol && r.occSymbol === rule.occSymbol)
+          );
+          if (idx >= 0) {
+            allRules[idx].exitTriggered = triggered;
+            allRules[idx].exitOrderId = firstOrderId;
+            saveRules(allRules);
           }
         }
       }
     } catch {
-      // Silent fail — background monitor shouldn't disrupt the app
+      // Silent fail
     } finally {
       runningRef.current = false;
     }
   }, []);
 
   useEffect(() => {
-    // Initial check after 5s delay (let the app settle)
     const startDelay = setTimeout(checkPositions, 5000);
-    // Then check every 60s
     intervalRef.current = setInterval(checkPositions, 60000);
     return () => {
       clearTimeout(startDelay);
@@ -126,6 +148,5 @@ export default function PaperMonitor() {
     };
   }, [checkPositions]);
 
-  // Renders nothing — pure background logic
   return null;
 }

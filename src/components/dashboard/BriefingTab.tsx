@@ -7,6 +7,48 @@ import {
   Wallet, ChevronDown, ChevronUp, CheckCircle2,
 } from 'lucide-react';
 
+// ─── Trade rule storage (shared with PaperTradingTab + PaperMonitor) ───
+interface TradeRule {
+  id: string;
+  occSymbols: string[];
+  underlying: string;
+  strategy: string;
+  thesis: string;
+  profitTargetPct: number;
+  stopLossPct: number;
+  autoExit: boolean;
+  createdAt: string;
+  exitTriggered?: 'target' | 'stop' | null;
+  exitOrderId?: number;
+  // Legacy single-position fields (kept for backward compat)
+  occSymbol?: string;
+  targetPrice?: number | null;
+  stopPrice?: number | null;
+  costBasis?: number;
+}
+
+function loadRules(): TradeRule[] {
+  if (typeof window === 'undefined') return [];
+  try { return JSON.parse(localStorage.getItem('optix-paper-rules') || '[]'); }
+  catch { return []; }
+}
+
+function saveGroupRule(rule: TradeRule) {
+  const rules = loadRules().filter(r => r.id !== rule.id);
+  rules.push(rule);
+  localStorage.setItem('optix-paper-rules', JSON.stringify(rules));
+}
+
+function buildOCC(symbol: string, expiration: string, type: 'C' | 'P', strike: number): string {
+  const d = new Date(expiration + 'T12:00:00');
+  const yy = String(d.getFullYear()).slice(-2);
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const t = type === 'C' ? 'C' : 'P';
+  const s = String(Math.round(strike * 1000)).padStart(8, '0');
+  return `${symbol.toUpperCase()}${yy}${mm}${dd}${t}${s}`;
+}
+
 interface TradeIdea {
   ticker: string;
   spot: number;
@@ -22,6 +64,8 @@ interface TradeIdea {
   risk: string;
   reasoning: string[];
   tags: string[];
+  profitTargetPct: number;
+  stopLossPct: number;
   nearestExp: string;
   nearestDTE: number;
   ivRank: number;
@@ -161,7 +205,19 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error);
-        setPaperStatus(s => ({ ...s, [idx]: `Placed IC #${data.orderId}` }));
+        saveGroupRule({
+          id: `ic-${idea.ticker}-${exp}-${Date.now()}`,
+          occSymbols: [
+            buildOCC(idea.ticker, exp, 'C', sellCall),
+            buildOCC(idea.ticker, exp, 'C', sellCall + wingWidth),
+            buildOCC(idea.ticker, exp, 'P', sellPut),
+            buildOCC(idea.ticker, exp, 'P', sellPut - wingWidth),
+          ],
+          underlying: idea.ticker, strategy: idea.strategy, thesis,
+          profitTargetPct: idea.profitTargetPct, stopLossPct: idea.stopLossPct,
+          autoExit: true, createdAt: new Date().toISOString(),
+        });
+        setPaperStatus(s => ({ ...s, [idx]: `Placed IC #${data.orderId} (TP: +${idea.profitTargetPct}% / SL: -${idea.stopLossPct}%)` }));
 
       } else if ((isBullPut || isBearCall || isBullCall || isBearPut) && (sellStrikes.length > 0 || buyStrikes.length > 0 || allStrikes.length >= 2)) {
         // Vertical spread: 2 legs
@@ -221,7 +277,14 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error);
-        setPaperStatus(s => ({ ...s, [idx]: `Placed spread #${data.orderId}` }));
+        saveGroupRule({
+          id: `spread-${idea.ticker}-${exp}-${Date.now()}`,
+          occSymbols: [buildOCC(idea.ticker, exp, optType, leg1Strike), buildOCC(idea.ticker, exp, optType, leg2Strike)],
+          underlying: idea.ticker, strategy: idea.strategy, thesis,
+          profitTargetPct: idea.profitTargetPct, stopLossPct: idea.stopLossPct,
+          autoExit: true, createdAt: new Date().toISOString(),
+        });
+        setPaperStatus(s => ({ ...s, [idx]: `Placed spread #${data.orderId} (TP: +${idea.profitTargetPct}% / SL: -${idea.stopLossPct}%)` }));
 
       } else if (isStraddle && allStrikes.length >= 1) {
         // Long straddle: buy call + buy put at same strike
@@ -243,7 +306,14 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error);
-        setPaperStatus(s => ({ ...s, [idx]: `Placed straddle #${data.orderId}` }));
+        saveGroupRule({
+          id: `straddle-${idea.ticker}-${exp}-${Date.now()}`,
+          occSymbols: [buildOCC(idea.ticker, exp, 'C', strike), buildOCC(idea.ticker, exp, 'P', strike)],
+          underlying: idea.ticker, strategy: idea.strategy, thesis,
+          profitTargetPct: idea.profitTargetPct, stopLossPct: idea.stopLossPct,
+          autoExit: true, createdAt: new Date().toISOString(),
+        });
+        setPaperStatus(s => ({ ...s, [idx]: `Placed straddle #${data.orderId} (TP: +${idea.profitTargetPct}% / SL: -${idea.stopLossPct}%)` }));
 
       } else if (isStrangle && allStrikes.length >= 2) {
         // Long strangle: buy OTM put + buy OTM call
@@ -266,7 +336,14 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error);
-        setPaperStatus(s => ({ ...s, [idx]: `Placed strangle #${data.orderId}` }));
+        saveGroupRule({
+          id: `strangle-${idea.ticker}-${exp}-${Date.now()}`,
+          occSymbols: [buildOCC(idea.ticker, exp, 'P', putStrike), buildOCC(idea.ticker, exp, 'C', callStrike)],
+          underlying: idea.ticker, strategy: idea.strategy, thesis,
+          profitTargetPct: idea.profitTargetPct, stopLossPct: idea.stopLossPct,
+          autoExit: true, createdAt: new Date().toISOString(),
+        });
+        setPaperStatus(s => ({ ...s, [idx]: `Placed strangle #${data.orderId} (TP: +${idea.profitTargetPct}% / SL: -${idea.stopLossPct}%)` }));
 
       } else {
         // Fallback: single leg (directional call or put)
@@ -291,7 +368,14 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error);
-        setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId}` }));
+        saveGroupRule({
+          id: `single-${idea.ticker}-${exp}-${Date.now()}`,
+          occSymbols: [buildOCC(idea.ticker, exp, optionType, strike)],
+          underlying: idea.ticker, strategy: idea.strategy, thesis,
+          profitTargetPct: idea.profitTargetPct || 75, stopLossPct: idea.stopLossPct || 50,
+          autoExit: true, createdAt: new Date().toISOString(),
+        });
+        setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId} (TP: +${idea.profitTargetPct || 75}% / SL: -${idea.stopLossPct || 50}%)` }));
       }
     } catch (err) {
       setPaperStatus(s => ({ ...s, [idx]: `Error: ${err instanceof Error ? err.message : 'Failed'}` }));

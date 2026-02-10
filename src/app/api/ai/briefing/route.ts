@@ -627,6 +627,8 @@ export async function POST() {
         risk: t.risk,
         reasoning: t.reasoning,
         tags: t.tags,
+        profitTargetPct: t.profitTargetPct,
+        stopLossPct: t.stopLossPct,
         nearestExp: s.nearestExp,
         nearestDTE: s.nearestDTE,
         ivRank: s.ivRank,

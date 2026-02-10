@@ -33,6 +33,8 @@ export interface TradeIdea {
   risk: string;
   reasoning: string[];
   tags: string[];
+  profitTargetPct: number;  // take profit at +X% of cost (e.g. 50 = +50%)
+  stopLossPct: number;      // stop loss at -X% of cost (e.g. 50 = -50%)
 }
 
 export interface RecommendationOutput {
@@ -573,6 +575,8 @@ function generateTrades(
           putWall ? `Put Wall at $${putWall.toFixed(0)} provides dealer-driven support` : '',
         ].filter(Boolean),
         tags: ['premium-selling', 'defined-risk', 'theta-positive'],
+        profitTargetPct: 50,
+        stopLossPct: 100,
       });
     }
 
@@ -594,6 +598,8 @@ function generateTrades(
           callWall ? `Call Wall at $${callWall.toFixed(0)} caps upside via dealer hedging` : '',
         ].filter(Boolean),
         tags: ['premium-selling', 'defined-risk', 'theta-positive'],
+        profitTargetPct: 50,
+        stopLossPct: 100,
       });
     }
 
@@ -616,6 +622,8 @@ function generateTrades(
           `Max Pain at $${maxPain} — gravitational pull strengthens into expiration`,
         ].filter(Boolean),
         tags: ['premium-selling', 'range-bound', 'theta-positive', 'highest-conviction'],
+        profitTargetPct: 50,
+        stopLossPct: 100,
       });
     }
   }
@@ -641,6 +649,8 @@ function generateTrades(
           gammaRegime === 'short' ? 'Short gamma — dealer hedging amplifies moves in your favor' : '',
         ].filter(Boolean),
         tags: ['premium-buying', 'defined-risk', 'directional'],
+        profitTargetPct: 75,
+        stopLossPct: 50,
       });
     }
 
@@ -663,6 +673,8 @@ function generateTrades(
           gammaRegime === 'short' ? 'Short gamma amplifies the move' : '',
         ].filter(Boolean),
         tags: ['premium-buying', 'defined-risk', 'directional'],
+        profitTargetPct: 75,
+        stopLossPct: 50,
       });
     }
 
@@ -685,6 +697,8 @@ function generateTrades(
           `Stock averages ${atrPercent.toFixed(1)}% daily moves (${input.avgDailyRangePct.toFixed(1)}% avg range) — sufficient movement potential`,
         ].filter(Boolean),
         tags: ['premium-buying', 'volatility-long', 'non-directional'],
+        profitTargetPct: 50,
+        stopLossPct: 40,
       });
     }
   }
@@ -708,6 +722,8 @@ function generateTrades(
           ...signals.filter(s => s.direction === 'bullish').map(s => s.description).slice(0, 2),
         ],
         tags: ['defined-risk', 'directional'],
+        profitTargetPct: 75,
+        stopLossPct: 50,
       });
     }
 
@@ -728,6 +744,8 @@ function generateTrades(
           ...signals.filter(s => s.direction === 'bearish').map(s => s.description).slice(0, 2),
         ],
         tags: ['defined-risk', 'directional'],
+        profitTargetPct: 75,
+        stopLossPct: 50,
       });
     }
   }
@@ -752,6 +770,8 @@ function generateTrades(
           'Dealer hedging reverses — whipsaw expected',
         ],
         tags: ['event-driven', 'volatility-long', 'short-duration'],
+        profitTargetPct: 40,
+        stopLossPct: 30,
       });
     }
   }
@@ -779,6 +799,8 @@ function generateTrades(
           mpDistATR < 1.5 ? 'Distance achievable within normal daily range' : 'Requires above-average move — lower confidence',
         ],
         tags: ['expiration-play', 'mean-reversion', 'short-duration'],
+        profitTargetPct: 50,
+        stopLossPct: 40,
       });
     }
   }
