@@ -73,6 +73,43 @@ function toIndicator(obs: FREDObservation[]): MarketIndicator | null {
 }
 
 /**
+ * Fetch VIX historical time series. Cached for 1 hour.
+ * Returns daily VIX close values for up to `count` recent observations.
+ */
+let vixHistoryCache: { data: { date: string; value: number }[]; timestamp: number } | null = null;
+
+export async function getVIXHistory(count: number = 252): Promise<{ date: string; value: number }[]> {
+  if (vixHistoryCache && Date.now() - vixHistoryCache.timestamp < CACHE_TTL) {
+    return vixHistoryCache.data.slice(0, count);
+  }
+
+  if (!apiKey()) return [];
+
+  const url = new URL(FRED_BASE);
+  url.searchParams.set('series_id', 'VIXCLS');
+  url.searchParams.set('api_key', apiKey());
+  url.searchParams.set('file_type', 'json');
+  url.searchParams.set('sort_order', 'desc');
+  url.searchParams.set('limit', String(Math.min(count, 500)));
+
+  try {
+    const res = await fetch(url.toString(), {
+      signal: AbortSignal.timeout(FETCH_TIMEOUT),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const observations: FREDObservation[] = (data.observations || []).filter(
+      (o: FREDObservation) => o.value !== '.'
+    );
+    const result = observations.map(o => ({ date: o.date, value: parseFloat(o.value) }));
+    vixHistoryCache = { data: result, timestamp: Date.now() };
+    return result.slice(0, count);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Fetch VIX and SKEW indicators. Cached for 1 hour.
  */
 export async function getMarketIndicators(): Promise<{

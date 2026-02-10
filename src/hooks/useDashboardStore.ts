@@ -42,6 +42,13 @@ export interface SnapshotData {
   skewSurface: { expiration: string; dte: number; points: { strike: number; iv: number; type: string; delta: number }[] }[];
   historicalVol: { hv20: number; hv60: number };
   ivTimeSeries?: { time: number; hv20: number; ivProxy: number; ivRank: number }[];
+  vix?: { price: number; change: number; changePct: number } | null;
+  vixTimeSeries?: { time: number; vix: number }[];
+  earnings?: {
+    nextEarnings: { symbol: string; date: string; time: string; confirmed: boolean; source: string; daysUntil: number } | null;
+    hasImminent: boolean;
+    ivSignals: { termStructureBackwardation: boolean; frontMonthIVPremium: number; ivRankElevated: boolean };
+  } | null;
   snapshotCount: number;
 }
 

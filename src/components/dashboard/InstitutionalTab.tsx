@@ -6,6 +6,8 @@ import {
   Building2, RefreshCw, Loader2, ArrowRightLeft, ShieldAlert, AlertTriangle, Clock,
   Zap, ChevronDown, ChevronUp, Waves, TrendingUp, TrendingDown, Info,
 } from 'lucide-react';
+import { saveFlowSnapshot, saveTickerFlowSnapshot, type DailyFlowRecord } from '@/lib/flowHistory';
+import FlowHistoryPanel from './FlowHistoryChart';
 
 // ─── Types ──────────────────────────────────────────────────
 
@@ -197,7 +199,50 @@ export default function InstitutionalTab() {
     try {
       const res = await fetch('/api/market/institutional');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setData(await res.json());
+      const json = await res.json();
+      setData(json);
+
+      // Save daily flow snapshot for historical tracking
+      if (json.marketFlow && json.marketFlow.tickersScanned > 0) {
+        const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+        const alerts: FlowAlert[] = json.flowAlerts || [];
+        const record: DailyFlowRecord = {
+          date: today,
+          timestamp: Date.now(),
+          netPremium: json.marketFlow.netPremium,
+          netCallPremium: json.marketFlow.netCallPremium,
+          netPutPremium: json.marketFlow.netPutPremium,
+          totalCallVolume: json.marketFlow.totalCallVolume,
+          totalPutVolume: json.marketFlow.totalPutVolume,
+          putCallRatio: json.marketFlow.putCallRatio,
+          sentiment: json.marketFlow.sentiment,
+          contractsAnalyzed: json.marketFlow.contractsAnalyzed,
+          tickersScanned: json.marketFlow.tickersScanned,
+          perTicker: (json.perTickerFlow || []).slice(0, 10).map((t: TickerFlow) => ({
+            ticker: t.ticker, netPremium: t.netPremium,
+            callPremium: t.callPremium, putPremium: t.putPremium,
+          })),
+          sweepCount: alerts.filter((a: FlowAlert) => a.tradeType === 'sweep').length,
+          blockCount: alerts.filter((a: FlowAlert) => a.tradeType === 'block').length,
+          topAlertPremium: alerts.length > 0 ? alerts[0].premium : 0,
+          vixPrice: json.vix?.current,
+          skewValue: json.skew?.current,
+        };
+        saveFlowSnapshot(record);
+
+        // Save per-ticker flow
+        for (const tf of (json.perTickerFlow || []) as TickerFlow[]) {
+          saveTickerFlowSnapshot(tf.ticker, {
+            date: today,
+            timestamp: Date.now(),
+            netPremium: tf.netPremium,
+            callPremium: tf.callPremium,
+            putPremium: tf.putPremium,
+            callVolume: tf.callVolume,
+            putVolume: tf.putVolume,
+          });
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load');
     } finally {
@@ -608,6 +653,18 @@ export default function InstitutionalTab() {
           </div>
         </Section>
       )}
+
+      {/* ═══════════════════════════════════════════════════════
+          FLOW HISTORY — Historical time series of premium flow
+          ═══════════════════════════════════════════════════════ */}
+      <Section
+        title="Flow History"
+        icon={<TrendingUp className="w-3.5 h-3.5 text-cyan-400" />}
+        badge={<span className="text-[10px] text-text-muted/50 font-mono">auto-recorded daily</span>}
+        defaultOpen={false}
+      >
+        <FlowHistoryPanel />
+      </Section>
 
       {/* Footer */}
       <div className="text-center text-[10px] text-text-muted/40 font-mono py-2 space-y-0.5">

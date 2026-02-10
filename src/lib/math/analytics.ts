@@ -61,7 +61,7 @@ export function computeHistoricalVolatility(closes: number[], window: number = 2
   return Math.sqrt(variance * 252); // Annualized
 }
 
-export function interpretIV(ctx: IVContext): string {
+export function interpretIV(ctx: IVContext, vixPrice?: number): string {
   const parts: string[] = [];
 
   // IV Rank context
@@ -87,6 +87,19 @@ export function interpretIV(ctx: IVContext): string {
     parts.push(`IV is ${((ctx.currentIV / ctx.iv30dMA - 1) * 100).toFixed(0)}% above 30-day MA — rising volatility regime.`);
   } else if (ctx.currentIV < ctx.iv30dMA * 0.85) {
     parts.push(`IV is ${((1 - ctx.currentIV / ctx.iv30dMA) * 100).toFixed(0)}% below 30-day MA — falling volatility.`);
+  }
+
+  // VIX context — compare stock IV to market fear gauge
+  if (vixPrice && vixPrice > 0) {
+    const ivPct = ctx.currentIV * 100;
+    const spread = ivPct - vixPrice;
+    if (spread > 10) {
+      parts.push(`Stock IV (${ivPct.toFixed(0)}%) is ${spread.toFixed(0)}pp above VIX (${vixPrice.toFixed(1)}) — significantly more volatile than the broad market.`);
+    } else if (spread > 5) {
+      parts.push(`Stock IV trades at a ${spread.toFixed(0)}pp premium to VIX (${vixPrice.toFixed(1)}) — modestly elevated vs market.`);
+    } else if (spread < -5) {
+      parts.push(`Stock IV (${ivPct.toFixed(0)}%) is ${Math.abs(spread).toFixed(0)}pp below VIX (${vixPrice.toFixed(1)}) — unusually calm relative to market.`);
+    }
   }
 
   return parts.join(' ');

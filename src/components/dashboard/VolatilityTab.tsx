@@ -2,8 +2,67 @@
 
 import { useEffect, useRef } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
-import { formatNumber } from '@/lib/utils/format';
-import { Thermometer, TrendingUp, Activity, BarChart3, ChevronRight, Brain } from 'lucide-react';
+import { Thermometer, Brain, TrendingUp, TrendingDown } from 'lucide-react';
+
+// ─── VIX Context Card ─────────────────────────────────────
+
+function VIXCard() {
+  const { snapshot } = useDashboardStore();
+  const vix = snapshot?.vix;
+  if (!vix) return null;
+
+  const color = vix.price > 25 ? 'text-red-400' : vix.price > 18 ? 'text-amber-400' : 'text-green-400';
+  const bg = vix.price > 25 ? 'border-red-500/20' : vix.price > 18 ? 'border-amber-500/20' : 'border-green-500/20';
+  const label = vix.price > 35 ? 'Extreme Fear' : vix.price > 25 ? 'Elevated Fear' : vix.price > 18 ? 'Moderate' : vix.price > 13 ? 'Low Vol' : 'Complacency';
+
+  // IV vs VIX spread
+  const iv = snapshot?.iv;
+  const ivPct = iv ? iv.currentIV * 100 : 0;
+  const spread = ivPct > 0 ? ivPct - vix.price : 0;
+
+  return (
+    <div className={`panel p-4 border ${bg}`}>
+      <div className="flex items-center gap-2 mb-3">
+        <Thermometer className="w-3.5 h-3.5 text-accent-purple" />
+        <span className="panel-title">Market VIX</span>
+        <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${
+          vix.price > 25 ? 'bg-red-500/10 text-red-400' :
+          vix.price > 18 ? 'bg-amber-500/10 text-amber-400' :
+          'bg-green-500/10 text-green-400'
+        }`}>{label}</span>
+      </div>
+
+      <div className="flex items-end justify-between mb-3">
+        <div className={`text-3xl font-mono font-bold ${color}`}>{vix.price.toFixed(2)}</div>
+        <div className={`text-sm font-mono font-medium flex items-center gap-1 ${
+          vix.changePct >= 0 ? 'text-red-400' : 'text-green-400'
+        }`}>
+          {vix.changePct >= 0 ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
+          {vix.changePct >= 0 ? '+' : ''}{vix.changePct.toFixed(2)}%
+        </div>
+      </div>
+
+      {ivPct > 0 && (
+        <div className="border-t border-border/30 pt-2">
+          <div className="flex justify-between items-center">
+            <span className="text-[10px] font-mono text-text-muted">IV vs VIX Spread</span>
+            <span className={`text-xs font-mono font-semibold ${
+              spread > 5 ? 'text-red-400' : spread < -5 ? 'text-green-400' : 'text-text-primary'
+            }`}>
+              {spread > 0 ? '+' : ''}{spread.toFixed(1)}pp
+            </span>
+          </div>
+          <div className="text-[9px] font-mono text-text-muted/60 mt-0.5">
+            {spread > 10 ? 'Stock significantly more volatile than market' :
+             spread > 5 ? 'Stock IV at premium to market' :
+             spread < -5 ? 'Stock IV at discount — calm relative to market' :
+             'Stock IV tracking near market levels'}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 // ─── IV Rank Gauge ─────────────────────────────────────────
 
@@ -100,6 +159,7 @@ function IVStats() {
   const { snapshot } = useDashboardStore();
   const iv = snapshot?.iv;
   const hv = snapshot?.historicalVol;
+  const vix = snapshot?.vix;
   if (!iv) return null;
 
   const stats = [
@@ -112,6 +172,15 @@ function IVStats() {
     { label: 'IV/HV Ratio', value: iv.ivHvRatio.toFixed(2), color: iv.ivHvRatio > 1.3 ? 'text-accent-red' : iv.ivHvRatio < 0.8 ? 'text-accent-green' : 'text-text-primary' },
   ];
 
+  // Add VIX as reference
+  if (vix) {
+    stats.push({
+      label: 'Market VIX',
+      value: vix.price.toFixed(1),
+      color: vix.price > 25 ? 'text-red-400' : vix.price > 18 ? 'text-amber-400' : 'text-green-400',
+    });
+  }
+
   return (
     <div className="panel">
       <div className="panel-header"><span className="panel-title">IV Statistics</span></div>
@@ -122,6 +191,216 @@ function IVStats() {
             <span className={`text-sm font-mono font-medium ${s.color}`}>{s.value}</span>
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── IV vs VIX History Chart ──────────────────────────────
+
+function IVvsVIXChart() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const { snapshot } = useDashboardStore();
+
+  useEffect(() => {
+    if (!canvasRef.current || !containerRef.current) return;
+    const ivSeries = snapshot?.ivTimeSeries;
+    const vixSeries = snapshot?.vixTimeSeries;
+    if (!ivSeries?.length) return;
+
+    const canvas = canvasRef.current;
+    const container = containerRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const rect = container.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    canvas.style.width = `${rect.width}px`;
+    canvas.style.height = `${rect.height}px`;
+    ctx.scale(dpr, dpr);
+
+    const w = rect.width, h = rect.height;
+    const pad = { top: 25, right: 60, bottom: 35, left: 55 };
+    const cw = w - pad.left - pad.right;
+    const ch = h - pad.top - pad.bottom;
+
+    ctx.fillStyle = '#12121a';
+    ctx.fillRect(0, 0, w, h);
+
+    // Build VIX lookup by date (rounded to day)
+    const vixByDay = new Map<string, number>();
+    if (vixSeries?.length) {
+      for (const v of vixSeries) {
+        const d = new Date(v.time * 1000);
+        const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+        vixByDay.set(key, v.vix);
+      }
+    }
+
+    const data = ivSeries;
+    if (data.length < 5) return;
+
+    const minTime = data[0].time;
+    const maxTime = data[data.length - 1].time;
+
+    // Collect all values for Y scale
+    const allVals = data.flatMap(d => [d.hv20, d.ivProxy]);
+    // Include VIX values in scale
+    if (vixSeries?.length) {
+      for (const v of vixSeries) {
+        if (v.time >= minTime && v.time <= maxTime) allVals.push(v.vix);
+      }
+    }
+    if (snapshot?.iv?.currentIV) allVals.push(snapshot.iv.currentIV);
+
+    const minV = Math.min(...allVals) * 0.85;
+    const maxV = Math.max(...allVals) * 1.1;
+
+    const toX = (t: number) => pad.left + ((t - minTime) / (maxTime - minTime)) * cw;
+    const toY = (v: number) => pad.top + ch - ((v - minV) / (maxV - minV)) * ch;
+
+    // Grid lines
+    ctx.strokeStyle = '#1a1a2515';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 5; i++) {
+      const y = pad.top + (ch / 5) * i;
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(w - pad.right, y); ctx.stroke();
+    }
+
+    // HV20 area fill
+    ctx.beginPath();
+    ctx.moveTo(toX(data[0].time), toY(data[0].hv20));
+    for (let i = 1; i < data.length; i++) {
+      ctx.lineTo(toX(data[i].time), toY(data[i].hv20));
+    }
+    ctx.lineTo(toX(data[data.length - 1].time), pad.top + ch);
+    ctx.lineTo(toX(data[0].time), pad.top + ch);
+    ctx.closePath();
+    ctx.fillStyle = '#00d4ff08';
+    ctx.fill();
+
+    // HV20 line
+    ctx.beginPath();
+    ctx.moveTo(toX(data[0].time), toY(data[0].hv20));
+    for (let i = 1; i < data.length; i++) {
+      ctx.lineTo(toX(data[i].time), toY(data[i].hv20));
+    }
+    ctx.strokeStyle = '#00d4ff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // IV Proxy line
+    ctx.beginPath();
+    ctx.moveTo(toX(data[0].time), toY(data[0].ivProxy));
+    for (let i = 1; i < data.length; i++) {
+      ctx.lineTo(toX(data[i].time), toY(data[i].ivProxy));
+    }
+    ctx.strokeStyle = '#b388ff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // VIX history line (if available)
+    if (vixSeries?.length) {
+      const vixInRange = vixSeries.filter(v => v.time >= minTime && v.time <= maxTime);
+      if (vixInRange.length >= 2) {
+        ctx.beginPath();
+        ctx.moveTo(toX(vixInRange[0].time), toY(vixInRange[0].vix));
+        for (let i = 1; i < vixInRange.length; i++) {
+          ctx.lineTo(toX(vixInRange[i].time), toY(vixInRange[i].vix));
+        }
+        ctx.strokeStyle = '#ff3d57';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 3]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    // Current IV horizontal line
+    if (snapshot?.iv?.currentIV) {
+      const cy = toY(snapshot.iv.currentIV);
+      ctx.strokeStyle = '#ffaa0060';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(pad.left, cy); ctx.lineTo(w - pad.right, cy); ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.fillStyle = '#ffaa00';
+      ctx.font = '9px "JetBrains Mono"';
+      ctx.textAlign = 'left';
+      ctx.fillText(`IV ${(snapshot.iv.currentIV * 100).toFixed(0)}%`, w - pad.right + 4, cy + 3);
+    }
+
+    // Y axis labels
+    ctx.fillStyle = '#555570';
+    ctx.font = '9px "JetBrains Mono"';
+    ctx.textAlign = 'right';
+    for (let i = 0; i <= 5; i++) {
+      const val = minV + ((maxV - minV) / 5) * (5 - i);
+      ctx.fillText(`${(val * 100).toFixed(0)}%`, pad.left - 5, pad.top + (ch / 5) * i + 3);
+    }
+
+    // X axis labels
+    ctx.textAlign = 'center';
+    const labelCount = Math.min(6, data.length);
+    for (let i = 0; i < labelCount; i++) {
+      const idx = Math.floor((i / (labelCount - 1)) * (data.length - 1));
+      const d = new Date(data[idx].time * 1000);
+      ctx.fillText(`${d.getMonth() + 1}/${d.getDate()}`, toX(data[idx].time), h - pad.bottom + 14);
+    }
+
+    // Legend
+    const legendY = 12;
+    ctx.font = '9px "JetBrains Mono"';
+    ctx.textAlign = 'left';
+    let lx = pad.left;
+    // HV20
+    ctx.fillStyle = '#00d4ff';
+    ctx.fillRect(lx, legendY - 4, 12, 2);
+    ctx.fillText('HV 20d', lx + 16, legendY);
+    lx += 80;
+    // IV Proxy
+    ctx.fillStyle = '#b388ff';
+    ctx.fillRect(lx, legendY - 4, 12, 2);
+    ctx.fillText('IV Proxy', lx + 16, legendY);
+    lx += 85;
+    // Current IV
+    ctx.fillStyle = '#ffaa00';
+    ctx.fillRect(lx, legendY - 4, 12, 2);
+    ctx.fillText('Current IV', lx + 16, legendY);
+    // VIX
+    if (vixSeries?.length) {
+      lx += 95;
+      ctx.fillStyle = '#ff3d57';
+      ctx.setLineDash([3, 2]);
+      ctx.strokeStyle = '#ff3d57';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(lx, legendY - 3); ctx.lineTo(lx + 12, legendY - 3); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillText('VIX', lx + 16, legendY);
+    }
+
+  }, [snapshot]);
+
+  if (!snapshot?.ivTimeSeries?.length) {
+    return (
+      <div className="panel p-8 flex items-center justify-center">
+        <span className="text-sm font-mono text-text-muted">IV history requires snapshot data</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="panel flex flex-col">
+      <div className="panel-header">
+        <span className="panel-title">IV / HV / VIX History</span>
+        <span className="badge badge-purple">{snapshot.ivTimeSeries.length}d</span>
+      </div>
+      <div ref={containerRef} className="flex-1 min-h-[280px]">
+        <canvas ref={canvasRef} className="w-full h-full" />
       </div>
     </div>
   );
@@ -162,8 +441,12 @@ function TermStructureChart() {
 
     const minDTE = 0;
     const maxDTE = Math.max(...data.map(d => d.dte));
-    const minIV = Math.min(...data.map(d => d.atmIV)) * 0.9;
-    const maxIV = Math.max(...data.map(d => d.atmIV)) * 1.1;
+    // Include VIX in Y scale if available
+    const vixDecimal = snapshot.vix ? snapshot.vix.price / 100 : 0;
+    const ivValues = data.map(d => d.atmIV);
+    if (vixDecimal > 0) ivValues.push(vixDecimal);
+    const minIV = Math.min(...ivValues) * 0.9;
+    const maxIV = Math.max(...ivValues) * 1.1;
 
     const toX = (dte: number) => pad.left + ((dte - minDTE) / (maxDTE - minDTE)) * cw;
     const toY = (iv: number) => pad.top + ch - ((iv - minIV) / (maxIV - minIV)) * ch;
@@ -174,6 +457,20 @@ function TermStructureChart() {
     for (let i = 0; i <= 4; i++) {
       const y = pad.top + (ch / 4) * i;
       ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(w - pad.right, y); ctx.stroke();
+    }
+
+    // VIX horizontal reference line
+    if (vixDecimal > 0 && vixDecimal >= minIV && vixDecimal <= maxIV) {
+      const vy = toY(vixDecimal);
+      ctx.strokeStyle = '#ff3d5740';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(pad.left, vy); ctx.lineTo(w - pad.right, vy); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#ff3d57';
+      ctx.font = '8px "JetBrains Mono"';
+      ctx.textAlign = 'left';
+      ctx.fillText(`VIX ${snapshot.vix!.price.toFixed(0)}`, w - pad.right + 4, vy + 3);
     }
 
     // Line
@@ -276,20 +573,14 @@ function SkewChart() {
     ctx.fillRect(0, 0, w, h);
 
     const spot = snapshot.spotPrice;
-    // Use nearest 3 expirations for skew curves
     const exps = snapshot.skewSurface.slice(0, 3);
     if (exps.length === 0) return;
 
-    // Global ranges
     const allPoints = exps.flatMap(e => e.points);
-    const minStrike = Math.min(...allPoints.map(p => p.strike));
-    const maxStrike = Math.max(...allPoints.map(p => p.strike));
     const minIV = Math.min(...allPoints.map(p => p.iv)) * 0.9;
     const maxIV = Math.max(...allPoints.map(p => p.iv)) * 1.1;
 
-    // Focus near ATM
     const focusMin = spot * 0.9, focusMax = spot * 1.1;
-
     const toX = (strike: number) => pad.left + ((strike - focusMin) / (focusMax - focusMin)) * cw;
     const toY = (iv: number) => pad.top + ch - ((iv - minIV) / (maxIV - minIV)) * ch;
 
@@ -317,7 +608,6 @@ function SkewChart() {
     ctx.beginPath(); ctx.moveTo(sx, pad.top); ctx.lineTo(sx, h - pad.bottom); ctx.stroke();
     ctx.setLineDash([]);
 
-    // Spot label
     ctx.fillStyle = '#8888a0';
     ctx.font = '9px "JetBrains Mono"';
     ctx.textAlign = 'center';
@@ -347,6 +637,78 @@ function SkewChart() {
       </div>
       <div ref={containerRef} className="flex-1 min-h-[200px]">
         <canvas ref={canvasRef} className="w-full h-full" />
+      </div>
+    </div>
+  );
+}
+
+// ─── Earnings Alert ───────────────────────────────────────
+
+function EarningsAlert() {
+  const { snapshot } = useDashboardStore();
+  const earnings = snapshot?.earnings;
+  if (!earnings) return null;
+
+  const { nextEarnings, hasImminent, ivSignals } = earnings;
+
+  // Only show if there's something to report
+  if (!hasImminent && !nextEarnings && !ivSignals.termStructureBackwardation) return null;
+
+  return (
+    <div className={`panel border ${hasImminent ? 'border-amber-500/30 bg-amber-500/5' : 'border-border'}`}>
+      <div className="panel-header">
+        <span className="panel-title flex items-center gap-2">
+          <span className={hasImminent ? 'text-amber-400' : 'text-text-muted'}>
+            {hasImminent ? '!' : 'i'}
+          </span>
+          Earnings Context
+        </span>
+        {hasImminent && <span className="badge badge-amber">Imminent</span>}
+      </div>
+      <div className="px-4 py-3 space-y-2">
+        {nextEarnings && (
+          <div className="flex justify-between items-center">
+            <span className="text-xs font-mono text-text-muted">Next Earnings</span>
+            <div className="text-right">
+              <span className={`text-sm font-mono font-semibold ${nextEarnings.daysUntil <= 3 ? 'text-red-400' : nextEarnings.daysUntil <= 7 ? 'text-amber-400' : 'text-text-primary'}`}>
+                {nextEarnings.date}
+              </span>
+              <span className="text-[10px] font-mono text-text-muted ml-2">
+                ({nextEarnings.daysUntil}d)
+                {nextEarnings.time !== 'unknown' && ` ${nextEarnings.time === 'bmo' ? 'Pre-Market' : 'After-Close'}`}
+                {!nextEarnings.confirmed && ' (est.)'}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* IV signals */}
+        <div className="grid grid-cols-3 gap-2 pt-1">
+          <div className={`text-center p-1.5 rounded ${ivSignals.termStructureBackwardation ? 'bg-amber-500/10' : 'bg-bg-tertiary/30'}`}>
+            <div className="text-[9px] font-mono text-text-muted">Backwardation</div>
+            <div className={`text-xs font-mono font-semibold ${ivSignals.termStructureBackwardation ? 'text-amber-400' : 'text-text-muted'}`}>
+              {ivSignals.termStructureBackwardation ? 'YES' : 'No'}
+            </div>
+          </div>
+          <div className={`text-center p-1.5 rounded ${ivSignals.frontMonthIVPremium > 15 ? 'bg-amber-500/10' : 'bg-bg-tertiary/30'}`}>
+            <div className="text-[9px] font-mono text-text-muted">Front IV Premium</div>
+            <div className={`text-xs font-mono font-semibold ${ivSignals.frontMonthIVPremium > 15 ? 'text-amber-400' : 'text-text-muted'}`}>
+              {ivSignals.frontMonthIVPremium > 0 ? '+' : ''}{ivSignals.frontMonthIVPremium.toFixed(1)}%
+            </div>
+          </div>
+          <div className={`text-center p-1.5 rounded ${ivSignals.ivRankElevated ? 'bg-red-500/10' : 'bg-bg-tertiary/30'}`}>
+            <div className="text-[9px] font-mono text-text-muted">IV Rank High</div>
+            <div className={`text-xs font-mono font-semibold ${ivSignals.ivRankElevated ? 'text-red-400' : 'text-text-muted'}`}>
+              {ivSignals.ivRankElevated ? 'YES' : 'No'}
+            </div>
+          </div>
+        </div>
+
+        {hasImminent && !nextEarnings?.confirmed && (
+          <div className="text-[10px] font-mono text-amber-400/60 pt-1">
+            IV term structure suggests an imminent binary event (earnings, FDA, etc.)
+          </div>
+        )}
       </div>
     </div>
   );
@@ -393,12 +755,21 @@ export default function VolatilityTab() {
 
   return (
     <div className="space-y-4 animate-fade-in">
-      {/* Top row: gauge + stats + term structure */}
+      {/* Top row: VIX card + gauge + stats */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <IVGauge />
-        <IVStats />
-        <TermStructureChart />
+        {snapshot?.vix ? <VIXCard /> : <IVGauge />}
+        {snapshot?.vix ? <IVGauge /> : <IVStats />}
+        {snapshot?.vix ? <IVStats /> : <TermStructureChart />}
       </div>
+
+      {/* IV vs VIX History (upgraded from IV-only chart) */}
+      <IVvsVIXChart />
+
+      {/* Term structure (if VIX card bumped it from top row) */}
+      {snapshot?.vix && <TermStructureChart />}
+
+      {/* Earnings Alert */}
+      <EarningsAlert />
 
       {/* Interpretation */}
       <IVInterpretation />
@@ -410,6 +781,7 @@ export default function VolatilityTab() {
       {snapshot && (
         <div className="text-xs font-mono text-text-muted text-center py-2">
           Polygon snapshot: {snapshot.snapshotCount} contracts analyzed
+          {snapshot.vix && ` | VIX: ${snapshot.vix.price.toFixed(2)}`}
         </div>
       )}
     </div>
