@@ -24,6 +24,16 @@ function isMarketHours(): boolean {
   return time >= 570 && time <= 975;
 }
 
+// Log errors to the diagnostics API for MCP visibility
+function logToServer(severity: string, message: string, context?: Record<string, unknown>) {
+  fetch('/api/diagnostics', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'log-error', severity, source: 'tracker-monitor', message, context }),
+    signal: AbortSignal.timeout(3000),
+  }).catch(() => {});
+}
+
 export default function TrackerMonitor() {
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const runningRef = useRef(false);
@@ -67,15 +77,27 @@ export default function TrackerMonitor() {
             { signal: AbortSignal.timeout(10000) }
           );
 
-          if (!res.ok) continue;
+          if (!res.ok) {
+            logToServer('warn', `Price fetch failed for ${underlying}: HTTP ${res.status}`, { underlying, status: res.status });
+            continue;
+          }
 
-          const data: {
+          let data: {
             quotes: Record<string, { bid: number; ask: number; mid: number; last: number }>;
             spot: number | null;
-          } = await res.json();
+          };
+          try {
+            data = await res.json();
+          } catch (e) {
+            logToServer('error', `JSON parse error on price response for ${underlying}`, { underlying, error: String(e) });
+            continue;
+          }
 
           const currentSpot = data.spot ?? 0;
-          if (currentSpot <= 0) continue;
+          if (currentSpot <= 0) {
+            logToServer('warn', `No spot price returned for ${underlying}`, { underlying, quotesCount: Object.keys(data.quotes).length });
+            continue;
+          }
 
           // Build leg prices array
           const legPrices = Object.entries(data.quotes).map(([symbol, q]) => ({
@@ -85,16 +107,26 @@ export default function TrackerMonitor() {
             mid: q.mid,
           }));
 
+          // Log pricing gaps
+          const missingQuotes = [...occSymbols].filter(s => !data.quotes[s]);
+          if (missingQuotes.length > 0) {
+            logToServer('warn', `Missing quotes for ${missingQuotes.length} OCC symbols`, { underlying, missing: missingQuotes });
+          }
+
           // Evaluate each trade
           for (const trade of underlyingTrades) {
-            evaluateTrade(trade, currentSpot, legPrices);
+            try {
+              evaluateTrade(trade, currentSpot, legPrices);
+            } catch (e) {
+              logToServer('error', `Evaluation failed for trade ${trade.id}`, { tradeId: trade.id, strategy: trade.strategy, error: String(e) });
+            }
           }
-        } catch {
-          // Network error for this underlying — skip, retry next cycle
+        } catch (e) {
+          logToServer('error', `Network error fetching prices for ${underlying}`, { underlying, error: String(e) });
         }
       }
-    } catch {
-      // Silent fail
+    } catch (e) {
+      logToServer('critical', `TrackerMonitor cycle failed`, { error: String(e) });
     } finally {
       runningRef.current = false;
     }

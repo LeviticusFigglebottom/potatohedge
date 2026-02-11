@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { scanMarketFlow, type FlowResult } from '@/lib/providers/polygonFlow';
+import { logErr, logWarn } from '@/lib/errorLogger';
 
 export const maxDuration = 120; // Web search fundamental analysis can take longer
 
@@ -257,6 +258,7 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error ?? 'Unknown error');
+    logErr('claude-ai', `AI analysis failed: ${message}`, { symbol: data?.symbol, mode: data?.mode }, error);
     console.error('[ai/analyze] Error:', message);
     return NextResponse.json({ error: message }, { status: 500 });
   }

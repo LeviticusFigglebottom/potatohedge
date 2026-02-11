@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { logErr, logWarn } from '@/lib/errorLogger';
 
 /**
  * GET /api/tracker/prices?symbols=SPY250214C00605000,SPY250214P00600000&underlying=SPY
@@ -42,6 +43,7 @@ export async function GET(request: NextRequest) {
 
     if (!res.ok) {
       const body = await res.text().catch(() => '');
+      logWarn('tradier', `Quote fetch error: ${res.status}`, { symbols, status: res.status });
       return NextResponse.json({ error: `Tradier error: ${res.status} ${body.slice(0, 200)}` }, { status: 502 });
     }
 
@@ -49,6 +51,7 @@ export async function GET(request: NextRequest) {
     try {
       data = await res.json();
     } catch (e) {
+      logErr('tradier', `JSON parse error on quote response`, { symbols }, e);
       return NextResponse.json({ error: `Tradier JSON parse error: ${e instanceof Error ? e.message : 'malformed response'}` }, { status: 502 });
     }
     const rawQuotes = data.quotes?.quote;
@@ -78,6 +81,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ quotes, spot });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
+    logErr('tradier', `Tracker prices route error: ${msg}`, { symbols, underlying }, err);
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
