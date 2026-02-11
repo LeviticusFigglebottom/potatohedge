@@ -327,8 +327,19 @@ export async function scanMarketFlow(): Promise<FlowResult> {
   }
 
   // Sort alerts by premium descending, keep top 50
+  // But cap per-ticker to avoid one name flooding the list (e.g., TSLA)
   allAlerts.sort((a, b) => b.premium - a.premium);
-  allAlerts = allAlerts.slice(0, 50);
+  const MAX_PER_TICKER = 5;
+  const tickerCounts = new Map<string, number>();
+  const cappedAlerts: FlowAlert[] = [];
+  for (const alert of allAlerts) {
+    const count = tickerCounts.get(alert.ticker) ?? 0;
+    if (count >= MAX_PER_TICKER) continue;
+    tickerCounts.set(alert.ticker, count + 1);
+    cappedAlerts.push(alert);
+    if (cappedAlerts.length >= 50) break;
+  }
+  allAlerts = cappedAlerts;
 
   // Sort per-ticker flow by absolute net premium
   perTickerFlow.sort((a, b) => Math.abs(b.netPremium) - Math.abs(a.netPremium));
