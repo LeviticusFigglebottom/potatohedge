@@ -33,19 +33,16 @@ export async function fetchEquityBars(
   try {
     const bars = await getEquityHistory(ticker, 1, 'day', from, to);
     if (bars.length > 10) {
-      console.log(`[equityBars] ${ticker}: Polygon returned ${bars.length} daily bars`);
       return bars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, t: b.t }));
     }
-    console.warn(`[equityBars] ${ticker}: Polygon returned only ${bars.length} bars, falling back to Tradier`);
-  } catch (err) {
-    console.warn(`[equityBars] ${ticker}: Polygon failed (${err instanceof Error ? err.message : 'unknown'}), falling back to Tradier`);
+  } catch {
+    // Polygon failed — fall back to Tradier
   }
 
   // Fallback: Tradier daily history
   try {
     const ohlcv = await getHistory(ticker, '1D', from, to);
     if (ohlcv.length > 0) {
-      console.log(`[equityBars] ${ticker}: Tradier fallback returned ${ohlcv.length} daily bars`);
       return ohlcv.map(b => ({
         o: b.open,
         h: b.high,
@@ -55,9 +52,8 @@ export async function fetchEquityBars(
         t: b.time * 1000,
       }));
     }
-    console.warn(`[equityBars] ${ticker}: Tradier returned 0 bars`);
-  } catch (err) {
-    console.error(`[equityBars] ${ticker}: Both providers failed. Tradier error: ${err instanceof Error ? err.message : 'unknown'}`);
+  } catch {
+    // Both providers failed
   }
 
   return [];

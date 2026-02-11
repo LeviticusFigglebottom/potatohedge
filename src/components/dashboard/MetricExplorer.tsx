@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import { METRIC_DEFINITIONS, type DailyMetricRecord } from '@/lib/metricHistory';
 import { formatNumber, formatCurrency } from '@/lib/utils/format';
-import { History, TrendingUp, TrendingDown, Minus } from 'lucide-react';
+import { History, TrendingUp, TrendingDown, Minus, Database, CheckCircle, AlertCircle } from 'lucide-react';
 
 type MetricKey = (typeof METRIC_DEFINITIONS)[number]['key'];
 
@@ -282,6 +282,61 @@ function MetricStats({
   );
 }
 
+// ─── Persistence Status ─────────────────────────────────────
+
+function PersistenceStatus({ symbol, recordCount }: { symbol: string; recordCount: number }) {
+  const [status, setStatus] = useState<{ redis: boolean; blob: boolean; serverRecords?: number } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/history?type=status`, { signal: AbortSignal.timeout(4000) })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (cancelled || !data) return;
+        const base = { redis: data.redis, blob: data.blob };
+        // Also check server record count
+        fetch(`/api/history?type=metrics&ticker=${symbol}&days=365`, { signal: AbortSignal.timeout(4000) })
+          .then(r => r.ok ? r.json() : null)
+          .then(sData => {
+            if (cancelled) return;
+            setStatus({ ...base, serverRecords: sData?.count ?? 0 });
+          })
+          .catch(() => { if (!cancelled) setStatus(base); });
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [symbol]);
+
+  const lastRecord = recordCount > 0 ? undefined : null;
+  const localRecords = recordCount;
+
+  if (!status) return null;
+
+  const backendOk = status.redis || status.blob;
+  const serverCount = status.serverRecords ?? 0;
+
+  return (
+    <div className="px-4 py-2 border-t border-border/10 flex items-center gap-3 text-[10px] font-mono text-text-muted/60">
+      <Database className="w-3 h-3" />
+      <span>Local: {localRecords}d</span>
+      <span className="text-text-muted/30">|</span>
+      <span>Server: {serverCount}d</span>
+      <span className="text-text-muted/30">|</span>
+      {backendOk ? (
+        <span className="flex items-center gap-1 text-accent-green/60">
+          <CheckCircle className="w-3 h-3" />
+          {status.redis ? 'Redis' : 'Blob'}
+        </span>
+      ) : (
+        <span className="flex items-center gap-1 text-accent-red/60">
+          <AlertCircle className="w-3 h-3" />
+          No server storage
+        </span>
+      )}
+    </div>
+  );
+}
+
 // ─── Main MetricExplorer ────────────────────────────────────
 
 export default function MetricExplorer() {
@@ -386,6 +441,8 @@ export default function MetricExplorer() {
           </p>
         </div>
       )}
+
+      <PersistenceStatus symbol={symbol} recordCount={records.length} />
     </div>
   );
 }

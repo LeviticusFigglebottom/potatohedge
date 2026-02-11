@@ -33,6 +33,8 @@ export interface TradeIdea {
   risk: string;
   reasoning: string[];
   tags: string[];
+  profitTargetPct: number;  // take profit at +X% of cost (e.g. 50 = +50%)
+  stopLossPct: number;      // stop loss at -X% of cost (e.g. 50 = -50%)
 }
 
 export interface RecommendationOutput {
@@ -99,6 +101,52 @@ export interface RecommendationInput {
     drawdownRatio: number;             // vs SPY during drawdowns
     alpha30d: number;                  // 30d alpha vs SPY
   };
+  // Optional: DTCC swap maturity data
+  swapMaturitiesToday?: number;
+  swapNotionalToday?: number;
+  swapMaturitiesWeek?: number;
+  swapNotionalWeek?: number;
+  // Optional: FINRA short interest + Reg SHO
+  shortInterest?: number;         // total shares short
+  daysToCover?: number;           // SI / avg daily volume
+  regSHOThreshold?: boolean;      // on Reg SHO threshold list (persistent FTDs)
+  // Optional: Options flow data (from Polygon)
+  flowNetPremium?: number;        // net premium for this ticker (positive = net call buying = bullish)
+  flowCallPremium?: number;       // total call premium
+  flowPutPremium?: number;        // total put premium
+  flowSentiment?: 'bullish' | 'bearish' | 'neutral';
+  flowAlertCount?: number;        // number of unusual flow alerts
+  flowSweepCount?: number;        // number of sweep detections
+  flowBlockCount?: number;        // number of block trades
+}
+
+// ─── Helpers ──────────────────────────────────────────────
+
+/** Clamp value to [min, max] */
+function clamp(v: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, v));
+}
+
+/**
+ * Piecewise linear interpolation.
+ * Given sorted breakpoints xs and corresponding weights ys,
+ * returns the interpolated weight for value x.
+ * Clamps to first/last ys if x is outside the range.
+ */
+function plerp(x: number, xs: number[], ys: number[]): number {
+  if (xs.length === 0 || ys.length === 0) return 0;
+  if (xs.length === 1) return ys[0];
+  if (x <= xs[0]) return ys[0];
+  if (x >= xs[xs.length - 1]) return ys[ys.length - 1];
+  for (let i = 1; i < xs.length; i++) {
+    if (x <= xs[i]) {
+      const denom = xs[i] - xs[i - 1];
+      if (denom === 0) return ys[i]; // identical breakpoints
+      const t = (x - xs[i - 1]) / denom;
+      return ys[i - 1] + t * (ys[i] - ys[i - 1]);
+    }
+  }
+  return ys[ys.length - 1];
 }
 
 // ─── Signal Scoring ────────────────────────────────────────
@@ -106,6 +154,9 @@ export interface RecommendationInput {
 function scoreSignals(input: RecommendationInput): Signal[] {
   const signals: Signal[] = [];
   const { spotPrice, dailySigma, atrPercent } = input;
+
+  // Guard: spotPrice must be positive for all percentage calculations
+  if (spotPrice <= 0) return signals;
 
   // 1. GEX Regime
   if (input.totalGEX > 0) {
@@ -240,51 +291,46 @@ function scoreSignals(input: RecommendationInput): Signal[] {
   const pcrConfidence = !pcrReliable ? 0 : totalOptVol < 2000 ? (totalOptVol - 500) / 1500 : 1;
   const effectivePCR = Math.max(0.05, Math.min(20, input.volumePCR));
 
-  if (effectivePCR > 1.3) {
+  // Continuous PCR weight: smoothly interpolates across the full range
+  // PCR 0.3→+0.25, 0.6→+0.10, 0.8→+0.03, 0.95→0, 1.05→0, 1.2→-0.08, 1.5→-0.20, 2.5→-0.30
+  const pcrWeight = plerp(effectivePCR,
+    [0.3, 0.6, 0.8, 0.95, 1.05, 1.2, 1.5, 2.5],
+    [0.25, 0.10, 0.03, 0.0, 0.0, -0.08, -0.20, -0.30]
+  ) * pcrConfidence;
+  if (Math.abs(pcrWeight) > 0.01) {
+    const reliabilityNote = !pcrReliable
+      ? ` (UNRELIABLE: ${minSideVol < 50 ? `only ${minSideVol} contracts on ${input.totalCallVol < input.totalPutVol ? 'call' : 'put'} side` : `low volume: ${totalOptVol}`})`
+      : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : '';
+    const pcrLabel = input.volumePCR > 20 ? '>20' : input.volumePCR < 0.05 ? '<0.05' : input.volumePCR.toFixed(2);
     signals.push({
       name: 'Volume P/C Ratio',
-      direction: 'bearish',
-      weight: (effectivePCR > 2 ? -0.35 : -0.25) * pcrConfidence,
-      description: `PCR ${input.volumePCR > 20 ? '>20' : input.volumePCR.toFixed(2)}${effectivePCR > 2 ? ' — extreme' : ''}${!pcrReliable ? ` (UNRELIABLE: ${minSideVol < 50 ? `only ${minSideVol} contracts on ${input.totalCallVol < input.totalPutVol ? 'call' : 'put'} side` : `low volume: ${totalOptVol}`})` : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — heavy put buying, bearish sentiment or hedging demand`,
-    });
-  } else if (effectivePCR > 1.0) {
-    signals.push({
-      name: 'Volume P/C Ratio',
-      direction: 'bearish',
-      weight: -0.1 * pcrConfidence,
-      description: `PCR ${input.volumePCR.toFixed(2)}${!pcrReliable ? ' (unreliable — thin volume)' : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — slightly put-heavy, mild bearish lean`,
-    });
-  } else if (effectivePCR < 0.6) {
-    signals.push({
-      name: 'Volume P/C Ratio',
-      direction: 'bullish',
-      weight: 0.25 * pcrConfidence,
-      description: `PCR ${input.volumePCR < 0.05 ? '<0.05' : input.volumePCR.toFixed(2)}${!pcrReliable ? ` (UNRELIABLE: ${minSideVol < 50 ? `only ${minSideVol} contracts on ${input.totalCallVol < input.totalPutVol ? 'call' : 'put'} side` : `low volume: ${totalOptVol}`})` : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — strong call dominance, bullish flow`,
-    });
-  } else if (effectivePCR < 0.8) {
-    signals.push({
-      name: 'Volume P/C Ratio',
-      direction: 'bullish',
-      weight: 0.1 * pcrConfidence,
-      description: `PCR ${input.volumePCR.toFixed(2)}${!pcrReliable ? ' (unreliable — thin volume)' : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : ''} — call-heavy, mild bullish lean`,
+      direction: pcrWeight > 0 ? 'bullish' : 'bearish',
+      weight: pcrWeight,
+      description: `PCR ${pcrLabel}${reliabilityNote} — ${effectivePCR < 0.7 ? 'call-dominant, bullish flow' : effectivePCR > 1.5 ? 'heavy put buying, bearish/hedging' : effectivePCR > 1.0 ? 'slightly put-heavy' : 'slightly call-heavy'}`,
     });
   }
 
-  // 6. DEX Bias
-  if (input.totalDEX < 0) {
-    signals.push({
-      name: 'Dealer Delta',
-      direction: 'bullish',
-      weight: 0.1,
-      description: `Dealers short delta ($${abbr(input.totalDEX)}) — must buy underlying to hedge, supportive flow`,
-    });
-  } else if (input.totalDEX > 0) {
-    signals.push({
-      name: 'Dealer Delta',
-      direction: 'bearish',
-      weight: -0.05,
-      description: `Dealers long delta ($${abbr(input.totalDEX)}) — may sell into rallies`,
-    });
+  // 6. DEX Bias — scale weight by magnitude relative to GEX
+  // If DEX is small relative to GEX, it matters less
+  {
+    const dexMag = Math.abs(input.totalDEX);
+    const gexMag = Math.abs(input.totalGEX) || 1;
+    const dexScale = clamp(dexMag / gexMag, 0.2, 2) / 2; // 0.1 to 1.0 multiplier
+    if (input.totalDEX < 0) {
+      signals.push({
+        name: 'Dealer Delta',
+        direction: 'bullish',
+        weight: 0.10 * dexScale,
+        description: `Dealers short delta ($${abbr(input.totalDEX)}) — must buy underlying to hedge, supportive flow`,
+      });
+    } else if (input.totalDEX > 0) {
+      signals.push({
+        name: 'Dealer Delta',
+        direction: 'bearish',
+        weight: -0.05 * dexScale,
+        description: `Dealers long delta ($${abbr(input.totalDEX)}) — may sell into rallies`,
+      });
+    }
   }
 
   // 7. IV Regime
@@ -416,27 +462,26 @@ function scoreSignals(input: RecommendationInput): Signal[] {
     }
   }
 
-  // 11. Momentum — ATR-RELATIVE, not hardcoded
-  // A "big move" is >2σ or >1.5 ATR, NOT a fixed percentage
+  // 11. Momentum — ATR-RELATIVE with continuous weight scaling
+  // Weight ramps smoothly from 0 at 0.8σ to ±0.20 at 3σ+
   const absChange = Math.abs(input.changePercent);
   const moveSigma = dailySigma > 0 ? absChange / dailySigma : 0;
   const moveATR = atrPercent > 0 ? absChange / atrPercent : 0;
 
-  if (moveSigma > 2) {
+  if (moveSigma > 0.8) {
+    // Continuous: 0.8σ→0, 1.2σ→0.04, 2σ→0.10, 3σ→0.16, 4σ→0.20
+    const momMag = clamp(plerp(moveSigma, [0.8, 1.2, 2.0, 3.0, 4.0], [0.0, 0.04, 0.10, 0.16, 0.20]), 0, 0.20);
     const dir = input.changePercent > 0 ? 'bullish' : 'bearish';
+    const sign = input.changePercent > 0 ? 1 : -1;
     signals.push({
       name: 'Momentum',
-      direction: dir,
-      weight: dir === 'bullish' ? Math.min(0.2, moveSigma * 0.05) : Math.max(-0.2, -moveSigma * 0.05),
-      description: `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ move (${moveATR.toFixed(1)}x ATR) — statistically significant for this stock`,
-    });
-  } else if (moveSigma > 1.2) {
-    const dir = input.changePercent > 0 ? 'bullish' : 'bearish';
-    signals.push({
-      name: 'Momentum',
-      direction: dir,
-      weight: dir === 'bullish' ? 0.08 : -0.08,
-      description: `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ (${moveATR.toFixed(1)}x ATR) — above average for this stock's ${atrPercent.toFixed(1)}% daily ATR`,
+      direction: momMag > 0.01 ? dir : 'neutral',
+      weight: momMag * sign,
+      description: moveSigma > 2
+        ? `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ move (${moveATR.toFixed(1)}x ATR) — statistically significant for this stock`
+        : moveSigma > 1.2
+        ? `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ (${moveATR.toFixed(1)}x ATR) — above average for this stock's ${atrPercent.toFixed(1)}% daily ATR`
+        : `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ — within normal range (${atrPercent.toFixed(1)}% ATR)`,
     });
   } else if (absChange > 0.1) {
     signals.push({
@@ -444,6 +489,101 @@ function scoreSignals(input: RecommendationInput): Signal[] {
       direction: 'neutral',
       weight: 0,
       description: `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ — within normal range for this stock (${atrPercent.toFixed(1)}% ATR, ${avgDailyRangePctStr(input.avgDailyRangePct)} avg daily range)`,
+    });
+  }
+
+  // 12. DTCC Swap Maturity Pressure
+  if (input.swapMaturitiesToday && input.swapMaturitiesToday > 0) {
+    const notionalM = (input.swapNotionalToday || 0) / 1e6;
+    const isHeavy = input.swapMaturitiesToday > 100 || notionalM > 50;
+    const weight = isHeavy ? -0.10 : -0.05; // headwind — dealer rebalancing creates friction
+    signals.push({
+      name: 'Swap Maturity',
+      direction: isHeavy ? 'bearish' : 'neutral',
+      weight: isHeavy ? weight : 0,
+      description: `${input.swapMaturitiesToday} swap${input.swapMaturitiesToday > 1 ? 's' : ''} ($${notionalM.toFixed(0)}M notional) maturing today — ${isHeavy ? 'heavy dealer rebalancing pressure' : 'minor dealer flow'}`,
+    });
+  }
+  if (input.swapMaturitiesWeek && input.swapMaturitiesWeek > (input.swapMaturitiesToday || 0)) {
+    const weekNotionalM = (input.swapNotionalWeek || 0) / 1e6;
+    if (input.swapMaturitiesWeek > 200 || weekNotionalM > 100) {
+      signals.push({
+        name: 'Swap Maturity (Week)',
+        direction: 'bearish',
+        weight: -0.05,
+        description: `${input.swapMaturitiesWeek} swaps ($${weekNotionalM.toFixed(0)}M) maturing this week — persistent rebalancing headwind`,
+      });
+    }
+  }
+
+  // 13. Reg SHO Threshold (persistent FTDs)
+  if (input.regSHOThreshold) {
+    signals.push({
+      name: 'Reg SHO Threshold',
+      direction: 'neutral',
+      weight: 0,
+      description: 'On Reg SHO threshold list — persistent failures-to-deliver, potential forced buy-in / squeeze catalyst',
+    });
+  }
+
+  // 14. Short Interest / Days to Cover
+  if (input.daysToCover !== undefined && input.daysToCover > 0) {
+    if (input.daysToCover > 5) {
+      signals.push({
+        name: 'High Short Interest',
+        direction: 'neutral', // could squeeze either way
+        weight: 0,
+        description: `${input.daysToCover.toFixed(1)} days to cover — crowded short, squeeze risk on positive catalysts`,
+      });
+    } else if (input.daysToCover > 2) {
+      signals.push({
+        name: 'Elevated Short Interest',
+        direction: 'neutral',
+        weight: 0,
+        description: `${input.daysToCover.toFixed(1)} days to cover — moderate short positioning`,
+      });
+    }
+  }
+
+  // 15. Options Flow — Institutional Positioning (from Polygon)
+  if (input.flowNetPremium !== undefined && input.flowNetPremium !== 0) {
+    const netM = input.flowNetPremium / 1e6;
+    const absNetM = Math.abs(netM);
+
+    // Weight scales with magnitude: $1M → 0.03, $10M → 0.10, $50M → 0.18, $100M+ → 0.22
+    const flowWeight = plerp(absNetM,
+      [0.5, 1, 5, 10, 50, 100],
+      [0.01, 0.03, 0.08, 0.12, 0.18, 0.22]
+    ) * (input.flowNetPremium > 0 ? 1 : -1);
+
+    if (Math.abs(flowWeight) > 0.01) {
+      const dir: Direction = flowWeight > 0 ? 'bullish' : 'bearish';
+      const callM = (input.flowCallPremium || 0) / 1e6;
+      const putM = (input.flowPutPremium || 0) / 1e6;
+
+      let detail = `Net premium: ${netM > 0 ? '+' : ''}$${netM.toFixed(1)}M`;
+      if (callM > 0 || putM > 0) detail += ` (C: $${callM.toFixed(1)}M / P: $${putM.toFixed(1)}M)`;
+
+      const sweepNote = (input.flowSweepCount || 0) > 0 ? `, ${input.flowSweepCount} sweeps detected` : '';
+      const blockNote = (input.flowBlockCount || 0) > 0 ? `, ${input.flowBlockCount} block trades` : '';
+
+      signals.push({
+        name: 'Options Flow',
+        direction: dir,
+        weight: flowWeight,
+        description: `${detail}${sweepNote}${blockNote} — ${dir === 'bullish' ? 'institutional call buying dominates' : 'institutional put buying / hedging dominates'}`,
+      });
+    }
+  }
+
+  // 16. Flow Alerts — unusual activity confirmation
+  if ((input.flowAlertCount || 0) >= 3 && input.flowSentiment && input.flowSentiment !== 'neutral') {
+    const alertDir: Direction = input.flowSentiment;
+    signals.push({
+      name: 'Unusual Flow Activity',
+      direction: alertDir,
+      weight: alertDir === 'bullish' ? 0.05 : -0.05,
+      description: `${input.flowAlertCount} unusual flow alerts with ${alertDir} sentiment — confirms institutional positioning`,
     });
   }
 
@@ -462,6 +602,9 @@ function generateTrades(
 ): TradeIdea[] {
   const trades: TradeIdea[] = [];
   const { spotPrice, callWall, putWall, gammaFlip, maxPain, atr14, atrPercent } = input;
+
+  // Guard: need valid spot price for all strike calculations
+  if (spotPrice <= 0) return trades;
 
   // ATR-based spread width (use ~1-2 ATR for spread width)
   const spreadWidth = Math.max(1, Math.round(atr14));
@@ -492,6 +635,8 @@ function generateTrades(
           putWall ? `Put Wall at $${putWall.toFixed(0)} provides dealer-driven support` : '',
         ].filter(Boolean),
         tags: ['premium-selling', 'defined-risk', 'theta-positive'],
+        profitTargetPct: 50,
+        stopLossPct: 100,
       });
     }
 
@@ -513,6 +658,8 @@ function generateTrades(
           callWall ? `Call Wall at $${callWall.toFixed(0)} caps upside via dealer hedging` : '',
         ].filter(Boolean),
         tags: ['premium-selling', 'defined-risk', 'theta-positive'],
+        profitTargetPct: 50,
+        stopLossPct: 100,
       });
     }
 
@@ -535,6 +682,8 @@ function generateTrades(
           `Max Pain at $${maxPain} — gravitational pull strengthens into expiration`,
         ].filter(Boolean),
         tags: ['premium-selling', 'range-bound', 'theta-positive', 'highest-conviction'],
+        profitTargetPct: 50,
+        stopLossPct: 100,
       });
     }
   }
@@ -560,6 +709,8 @@ function generateTrades(
           gammaRegime === 'short' ? 'Short gamma — dealer hedging amplifies moves in your favor' : '',
         ].filter(Boolean),
         tags: ['premium-buying', 'defined-risk', 'directional'],
+        profitTargetPct: 75,
+        stopLossPct: 50,
       });
     }
 
@@ -582,6 +733,8 @@ function generateTrades(
           gammaRegime === 'short' ? 'Short gamma amplifies the move' : '',
         ].filter(Boolean),
         tags: ['premium-buying', 'defined-risk', 'directional'],
+        profitTargetPct: 75,
+        stopLossPct: 50,
       });
     }
 
@@ -604,6 +757,8 @@ function generateTrades(
           `Stock averages ${atrPercent.toFixed(1)}% daily moves (${input.avgDailyRangePct.toFixed(1)}% avg range) — sufficient movement potential`,
         ].filter(Boolean),
         tags: ['premium-buying', 'volatility-long', 'non-directional'],
+        profitTargetPct: 50,
+        stopLossPct: 40,
       });
     }
   }
@@ -627,6 +782,8 @@ function generateTrades(
           ...signals.filter(s => s.direction === 'bullish').map(s => s.description).slice(0, 2),
         ],
         tags: ['defined-risk', 'directional'],
+        profitTargetPct: 75,
+        stopLossPct: 50,
       });
     }
 
@@ -647,6 +804,8 @@ function generateTrades(
           ...signals.filter(s => s.direction === 'bearish').map(s => s.description).slice(0, 2),
         ],
         tags: ['defined-risk', 'directional'],
+        profitTargetPct: 75,
+        stopLossPct: 50,
       });
     }
   }
@@ -671,6 +830,8 @@ function generateTrades(
           'Dealer hedging reverses — whipsaw expected',
         ],
         tags: ['event-driven', 'volatility-long', 'short-duration'],
+        profitTargetPct: 40,
+        stopLossPct: 30,
       });
     }
   }
@@ -698,6 +859,8 @@ function generateTrades(
           mpDistATR < 1.5 ? 'Distance achievable within normal daily range' : 'Requires above-average move — lower confidence',
         ],
         tags: ['expiration-play', 'mean-reversion', 'short-duration'],
+        profitTargetPct: 50,
+        stopLossPct: 40,
       });
     }
   }
@@ -711,11 +874,14 @@ function generateTrades(
 export function generateRecommendations(input: RecommendationInput): RecommendationOutput {
   const signals = scoreSignals(input);
   const totalWeight = signals.reduce((s, sig) => s + sig.weight, 0);
+  // No cap — if multiple independent signals genuinely align, the score
+  // should reflect that confluence. Individual weights are already bounded.
   const biasScore = totalWeight * 100;
 
   let overallBias: Direction = 'neutral';
-  if (biasScore > 15) overallBias = 'bullish';
-  else if (biasScore < -15) overallBias = 'bearish';
+  // Wider neutral band (±20) so the label doesn't flip on minor noise
+  if (biasScore > 20) overallBias = 'bullish';
+  else if (biasScore < -20) overallBias = 'bearish';
 
   let volRegime: VolRegime = 'mid';
   if (input.ivRank > 60) volRegime = 'high';

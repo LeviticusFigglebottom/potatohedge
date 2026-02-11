@@ -60,6 +60,7 @@ function SignalConvergence({ signals }: { signals: { name: string; direction: st
     { label: 'Levels', names: ['Call Wall Proximity', 'Call Wall Breach', 'Put Wall Proximity', 'Put Wall Breach', 'Max Pain Magnet'], icon: Target },
     { label: 'Vol', names: ['IV Rank', 'IV/HV Spread'], icon: Activity },
     { label: 'Mom', names: ['Momentum'], icon: TrendingUp },
+    { label: 'Inst', names: ['Swap Maturity', 'Swap Maturity (Week)', 'Reg SHO Threshold', 'High Short Interest', 'Elevated Short Interest'], icon: BarChart3 },
   ];
 
   const catSummary = categories.map(cat => {

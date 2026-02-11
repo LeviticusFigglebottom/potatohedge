@@ -14,22 +14,24 @@ import {
   computeSkew,
   computeStockProfile,
 } from '@/lib/math/analytics';
-import {
-  generateRecommendations,
-  type RecommendationInput,
-} from '@/lib/math/recommendations';
-import type { EquityBar } from '@/lib/providers/equityBars';
+import { generateRecommendations } from '@/lib/math/recommendations';
+import { getSwapDataForTicker } from '@/lib/providers/dtcc';
+import { fetchRegSHOThreshold, getShortInterestForTicker } from '@/lib/providers/finra';
+import { scanTickerFlow } from '@/lib/providers/polygonFlow';
 
 export const maxDuration = 30;
 
+interface EquityBar {
+  o: number; h: number; l: number; c: number; v: number; t: number;
+}
+
 /**
  * Lightweight correlation context from equity bars — no extra API calls needed.
- * Computes mean reversion stats and vol regime performance from daily bars.
  */
 function computeQuickCorrelationCtx(
   bars: EquityBar[],
   hvCurrent: number,
-): RecommendationInput['correlationCtx'] {
+) {
   if (bars.length < 60) return undefined;
 
   const returns: number[] = [];
@@ -38,7 +40,6 @@ function computeQuickCorrelationCtx(
   }
   if (returns.length < 40) return undefined;
 
-  // Rolling 20-day HV for vol regime classification
   const hvValues: number[] = [];
   for (let i = 20; i < returns.length; i++) {
     const window = returns.slice(i - 20, i);
@@ -51,7 +52,6 @@ function computeQuickCorrelationCtx(
   const p33 = sortedHV[Math.floor(sortedHV.length * 0.33)] || 0;
   const p66 = sortedHV[Math.floor(sortedHV.length * 0.66)] || 999;
 
-  // Vol regime forward returns
   const lowVolRets: number[] = [];
   const highVolRets: number[] = [];
   const lowVolWins5d: boolean[] = [];
@@ -67,7 +67,6 @@ function computeQuickCorrelationCtx(
     }
   }
 
-  // Mean reversion: after 2σ+ moves
   const dailySigma = hvCurrent > 0 ? hvCurrent / Math.sqrt(252) : 0.015;
   const bigUps: { next1d: number }[] = [];
   const bigDowns: { next1d: number; next5d: number }[] = [];
@@ -108,11 +107,11 @@ export async function GET(request: NextRequest) {
     const [quote, expirations, historyBars] = await Promise.all([
       getQuote(ticker),
       getExpirations(ticker),
-      fetchEquityBars(ticker, 400),
+      fetchEquityBars(ticker, 250),
     ]);
 
     const spotPrice = quote.last;
-    const nearExps = expirations.slice(0, 4);
+    const nearExps = expirations.slice(0, 3); // 3 expirations max (was 4) to reduce API calls
 
     const chains = await Promise.all(
       nearExps.map(e => getOptionsChain(ticker, e.date).catch(() => null))
@@ -164,7 +163,7 @@ export async function GET(request: NextRequest) {
     const volumePCR = totalCallVol > 0 ? totalPutVol / totalCallVol : 1;
     const oiPCR = totalCallOI > 0 ? totalPutOI / totalCallOI : 1;
 
-    // ATM IV from nearest chain — adaptive tolerance for low-priced stocks
+    // ATM IV from nearest chain
     const atmTolerance = spotPrice < 20 ? 0.10 : spotPrice < 50 ? 0.05 : 0.02;
     const atmOpts = [...nearChain.calls, ...nearChain.puts]
       .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < atmTolerance && o.impliedVolatility > 0.01)
@@ -173,36 +172,43 @@ export async function GET(request: NextRequest) {
       ? atmOpts.slice(0, 4).reduce((s, o) => s + o.impliedVolatility, 0) / Math.min(4, atmOpts.length)
       : 0;
 
-    // HV + IV Rank
-    const closes = historyBars.map(b => b.c).reverse();
+    const closes = historyBars.map((b: EquityBar) => b.c).reverse();
     const hvCurrent = computeHistoricalVolatility(closes, 20);
 
-    // If ATM IV came back as 0 (missing data), fall back to HV * 1.15 as proxy
     if (currentIV === 0 && hvCurrent > 0) {
       currentIV = hvCurrent * 1.15;
     }
 
-    const historicalIVs = closes.slice(0, 252).map((_, i) => {
+    const historicalIVs = closes.slice(0, 252).map((_: number, i: number) => {
       const hv = computeHistoricalVolatility(closes.slice(i), 20);
       return hv > 0 ? hv * 1.15 : 0;
-    }).filter(v => v > 0);
+    }).filter((v: number) => v > 0);
     const ivMetrics = computeIVRankPercentile(currentIV, historicalIVs);
     const ivHvRatio = hvCurrent > 0 ? currentIV / hvCurrent : 1;
 
     const skew = computeSkew(nearChain.calls, nearChain.puts, spotPrice);
 
-    // ── Stock Profile: ATR, daily sigma, avg range ──
-    // historyBars are chronological (oldest first) from Polygon
     const profile = computeStockProfile(
-      historyBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c })),
+      historyBars.map((b: EquityBar) => ({ o: b.o, h: b.h, l: b.l, c: b.c })),
       spotPrice,
       hvCurrent
     );
 
-    // Lightweight correlation context from existing bars
     const correlationCtx = computeQuickCorrelationCtx(historyBars, hvCurrent);
 
-    const input: RecommendationInput = {
+    // Fetch DTCC + FINRA data — independent per-provider timeouts so slow ones don't block fast ones
+    const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
+      Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
+
+    const emptyFlow = { tickerFlow: { ticker, netPremium: 0, callPremium: 0, putPremium: 0, callVolume: 0, putVolume: 0, contractsActive: 0 }, alerts: [] as { tradeType: string; sentiment: string }[] };
+    const [swapData, regSHOSet, siData, flowData] = await Promise.all([
+      raceTimeout(getSwapDataForTicker(ticker).catch(() => null), 4000, null),
+      raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
+      raceTimeout(getShortInterestForTicker(ticker).catch(() => null), 5000, null),
+      raceTimeout(scanTickerFlow(ticker).catch(() => emptyFlow), 5000, emptyFlow),
+    ]);
+
+    const input = {
       symbol: ticker,
       spotPrice,
       totalGEX,
@@ -234,12 +240,33 @@ export async function GET(request: NextRequest) {
       weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
       monthlyExp: nearExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
       correlationCtx,
+      swapMaturitiesToday: swapData?.maturitiesToday,
+      swapNotionalToday: swapData?.notionalToday,
+      swapMaturitiesWeek: swapData?.maturitiesWeek,
+      swapNotionalWeek: swapData?.notionalWeek,
+      shortInterest: siData?.shortInterest,
+      daysToCover: siData?.daysToCover,
+      regSHOThreshold: regSHOSet.has(ticker),
+      // Options flow data
+      flowNetPremium: flowData.tickerFlow.netPremium || undefined,
+      flowCallPremium: flowData.tickerFlow.callPremium || undefined,
+      flowPutPremium: flowData.tickerFlow.putPremium || undefined,
+      flowSentiment: flowData.tickerFlow.netPremium > 0 ? 'bullish' as const : flowData.tickerFlow.netPremium < 0 ? 'bearish' as const : undefined,
+      flowAlertCount: flowData.alerts.length || undefined,
+      flowSweepCount: flowData.alerts.filter(a => a.tradeType === 'sweep').length || undefined,
+      flowBlockCount: flowData.alerts.filter(a => a.tradeType === 'block').length || undefined,
     };
 
     const recommendations = generateRecommendations(input);
     return NextResponse.json(recommendations);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
-    return NextResponse.json({ error: message }, { status: 500 });
+    const stack = error instanceof Error ? error.stack : undefined;
+    console.error('[recommendations] Error:', error);
+    return NextResponse.json({
+      error: message,
+      stack: stack?.split('\n').slice(0, 10),
+      route: '/api/market/recommendations',
+    }, { status: 500 });
   }
 }

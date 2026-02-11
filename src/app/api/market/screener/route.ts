@@ -6,6 +6,7 @@ import {
   findGammaFlip,
   findCallWall,
   findPutWall,
+  computeMaxPain,
 } from '@/lib/math/blackScholes';
 import {
   computeHistoricalVolatility,
@@ -16,10 +17,10 @@ import {
 import { generateRecommendations, type RecommendationInput } from '@/lib/math/recommendations';
 import { getUniverseSymbols } from '@/lib/stockUniverse';
 import type { EquityBar } from '@/lib/providers/equityBars';
+import { fetchSwapData, type SwapData } from '@/lib/providers/dtcc';
+import { fetchRegSHOThreshold, fetchShortInterest, type ShortInterestData } from '@/lib/providers/finra';
 
 export const maxDuration = 300;
-
-export const maxDuration = 300; // 5 minutes — self-hosted, no timeout issues
 
 export interface ScreenerResult {
   symbol: string;
@@ -39,10 +40,14 @@ export interface ScreenerResult {
   putWall: number | null;
   warnings: string[];
   timestamp: number;
+  // DTCC + FINRA data
+  swapMaturitiesToday: number;
+  swapNotionalToday: number;
+  daysToCover: number;
+  regSHO: boolean;
 }
 
-const CONCURRENCY = 8; // parallel stock processing limit
-const CONCURRENCY = 4; // parallel stock processing limit
+const CONCURRENCY = 8; // maximize stocks scanned within 60s Hobby timeout
 
 async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -123,20 +128,25 @@ function computeQuickCorrelationCtx(
   };
 }
 
-async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
+async function analyzeStock(
+  ticker: string,
+  swapMap: Map<string, SwapData>,
+  regSHOSet: Set<string>,
+  siMap: Map<string, ShortInterestData>,
+): Promise<ScreenerResult | null> {
   try {
     // Fetch core data: quote + expirations + equity bars in parallel
     const [quote, expirations, historyBars] = await Promise.all([
       getQuote(ticker),
       getExpirations(ticker).catch(() => []),
-      fetchEquityBars(ticker, 100), // lighter — 100 days is enough for HV20 + ATR14
+      fetchEquityBars(ticker, 250), // match recommendations route exactly
     ]);
 
     const spotPrice = quote.last;
     if (!spotPrice || spotPrice <= 0) return null;
 
-    // Only fetch the nearest 2 expirations for speed
-    const nearExps = expirations.slice(0, 2);
+    // Match recommendations route exactly: 3 nearest expirations
+    const nearExps = expirations.slice(0, 3);
     if (nearExps.length === 0) return null;
 
     const chains = await Promise.all(
@@ -171,7 +181,6 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
     const totalGEX = aggExposures.reduce((s, e) => s + e.netGEX, 0);
     const totalDEX = aggExposures.reduce((s, e) => s + e.netDEX, 0);
     const gammaFlip = findGammaFlip(aggExposures, spotPrice);
-    const gammaFlip = findGammaFlip(aggExposures);
     const callWall = findCallWall(aggExposures);
     const putWall = findPutWall(aggExposures);
 
@@ -189,12 +198,6 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
       .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < atmTolerance && o.impliedVolatility > 0.01)
       .sort((a, b) => Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice));
     let currentIV = atmOpts.length > 0
-    // ATM IV
-    const nearChain = chains[0];
-    const atmOpts = [...nearChain.calls, ...nearChain.puts]
-      .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < 0.02 && o.impliedVolatility > 0.01)
-      .sort((a, b) => Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice));
-    const currentIV = atmOpts.length > 0
       ? atmOpts.slice(0, 4).reduce((s, o) => s + o.impliedVolatility, 0) / Math.min(4, atmOpts.length)
       : 0;
 
@@ -223,24 +226,11 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
       hvCurrent
     );
 
-    // Max pain from nearest chain
-    const maxPainCalc = (() => {
-      const callStrikes = nearChain.calls.map(c => ({ strike: c.strike, openInterest: c.openInterest }));
-      const putStrikes = nearChain.puts.map(p => ({ strike: p.strike, openInterest: p.openInterest }));
-      if (callStrikes.length === 0 && putStrikes.length === 0) return spotPrice;
-      const strikes = [...new Set([...callStrikes.map(s => s.strike), ...putStrikes.map(s => s.strike)])].sort((a, b) => a - b);
-      let minPain = Infinity;
-      let mpStrike = spotPrice;
-      for (const s of strikes) {
-        const callPain = callStrikes.reduce((sum, c) => sum + c.openInterest * Math.max(0, s - c.strike) * 100, 0);
-        const putPain = putStrikes.reduce((sum, p) => sum + p.openInterest * Math.max(0, p.strike - s) * 100, 0);
-        if (callPain + putPain < minPain) {
-          minPain = callPain + putPain;
-          mpStrike = s;
-        }
-      }
-      return mpStrike;
-    })();
+    // Max pain from nearest chain (same helper as recommendations route)
+    const maxPainResult = computeMaxPain(
+      nearChain.calls.map(c => ({ strike: c.strike, openInterest: c.openInterest })),
+      nearChain.puts.map(p => ({ strike: p.strike, openInterest: p.openInterest }))
+    );
 
     // Lightweight correlation context from existing bars
     const correlationCtx = computeQuickCorrelationCtx(historyBars, hvCurrent);
@@ -253,7 +243,7 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
       gammaFlip,
       callWall,
       putWall,
-      maxPain: maxPainCalc,
+      maxPain: maxPainResult.strike,
       volumePCR,
       oiPCR,
       totalCallVol,
@@ -277,6 +267,15 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
       weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
       monthlyExp: nearExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
       correlationCtx,
+      // DTCC swap data
+      swapMaturitiesToday: swapMap.get(ticker)?.maturitiesToday,
+      swapNotionalToday: swapMap.get(ticker)?.notionalToday,
+      swapMaturitiesWeek: swapMap.get(ticker)?.maturitiesWeek,
+      swapNotionalWeek: swapMap.get(ticker)?.notionalWeek,
+      // FINRA data
+      shortInterest: siMap.get(ticker)?.shortInterest,
+      daysToCover: siMap.get(ticker)?.daysToCover,
+      regSHOThreshold: regSHOSet.has(ticker),
     };
 
     const rec = generateRecommendations(input);
@@ -304,6 +303,11 @@ async function analyzeStock(ticker: string): Promise<ScreenerResult | null> {
       putWall,
       warnings: rec.warnings,
       timestamp: Date.now(),
+      // DTCC + FINRA data
+      swapMaturitiesToday: swapMap.get(ticker)?.maturitiesToday || 0,
+      swapNotionalToday: swapMap.get(ticker)?.notionalToday || 0,
+      daysToCover: siMap.get(ticker)?.daysToCover || 0,
+      regSHO: regSHOSet.has(ticker),
     };
   } catch (err) {
     console.error(`[screener] Failed to analyze ${ticker}:`, err instanceof Error ? err.message : err);
@@ -328,6 +332,20 @@ export async function GET(request: NextRequest) {
 
       send({ type: 'start', total: symbols.length });
 
+      // Pre-fetch DTCC + FINRA data once (shared across all stocks)
+      const [swapMap, regSHOSet, siMap] = await Promise.all([
+        fetchSwapData().then(r => r.data).catch(() => new Map<string, SwapData>()),
+        fetchRegSHOThreshold().catch(() => new Set<string>()),
+        fetchShortInterest().catch(() => new Map<string, ShortInterestData>()),
+      ]);
+
+      send({
+        type: 'meta',
+        swapData: swapMap.size > 0,
+        regSHOCount: regSHOSet.size,
+        shortInterestCount: siMap.size,
+      });
+
       const results: ScreenerResult[] = [];
       let completed = 0;
 
@@ -337,18 +355,16 @@ export async function GET(request: NextRequest) {
 
         const batchResults = await Promise.all(
           batch.map(async (sym) => {
-            const result = await analyzeStock(sym);
+            const result = await analyzeStock(sym, swapMap, regSHOSet, siMap);
             completed++;
             send({
               type: 'progress',
               completed,
               total: symbols.length,
               current: sym,
-              result: result ? {
-                symbol: result.symbol,
-                biasScore: result.biasScore,
-                overallBias: result.overallBias,
-              } : null,
+              // Include full result so client can accumulate incrementally
+              // (critical for Hobby plan where function may timeout before 'done')
+              result: result || null,
             });
             return result;
           })
@@ -360,7 +376,7 @@ export async function GET(request: NextRequest) {
 
         // Small delay between batches to avoid rate limit spikes
         if (i + CONCURRENCY < symbols.length) {
-          await sleep(200);
+          await sleep(100);
         }
       }
 

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { scanMarketFlow, type FlowResult } from '@/lib/providers/polygonFlow';
 
 export const maxDuration = 120; // Web search fundamental analysis can take longer
 
@@ -137,6 +138,13 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
   }
 
+  // Fetch institutional flow data (5-min cache, fast after first call)
+  const emptyFlow: FlowResult = {
+    flow: { netCallPremium: 0, netPutPremium: 0, netPremium: 0, totalCallVolume: 0, totalPutVolume: 0, putCallRatio: 0, sentiment: 'neutral', tickersScanned: 0, contractsAnalyzed: 0 },
+    alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
+  };
+  const flowResult = await scanMarketFlow().catch(() => emptyFlow);
+
   // For fundamental mode, fetch live financial data first
   let fundamentals: FundamentalData | null = null;
   if (data.mode === 'fundamental') {
@@ -147,7 +155,7 @@ export async function POST(request: NextRequest) {
   const hasYahooData = !!(fundamentals && fundamentals.marketCap);
   const prompt = data.mode === 'fundamental'
     ? buildFundamentalPrompt(data, fundamentals)
-    : buildPrompt(data);
+    : buildPrompt(data, flowResult);
 
   // Enable Claude web search when doing fundamental analysis without Yahoo data
   // This lets Claude search the web for current financial metrics itself
@@ -333,10 +341,7 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
       signal: AbortSignal.timeout(3000),
     });
     const setCookie = cookieRes.headers.get('set-cookie');
-    if (!setCookie) {
-      console.log('[Yahoo] No cookie returned from fc.yahoo.com');
-      return null;
-    }
+    if (!setCookie) return null;
     // Extract cookie key=value pairs (may have multiple cookies separated by commas)
     const cookieParts = setCookie.split(/,(?=\s*\w+=)/).map(c => c.split(';')[0].trim());
     const cookie = cookieParts.join('; ');
@@ -346,15 +351,9 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
       headers: { 'Cookie': cookie, 'User-Agent': UA },
       signal: AbortSignal.timeout(3000),
     });
-    if (!crumbRes.ok) {
-      console.log(`[Yahoo] Crumb fetch failed: ${crumbRes.status}`);
-      return null;
-    }
+    if (!crumbRes.ok) return null;
     const crumb = await crumbRes.text();
-    if (!crumb || crumb.length > 50) {
-      console.log('[Yahoo] Invalid crumb:', crumb?.slice(0, 20));
-      return null;
-    }
+    if (!crumb || crumb.length > 50) return null;
 
     // Step 3: Fetch financial data with cookie + crumb
     const modules = [
@@ -374,10 +373,7 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
       signal: AbortSignal.timeout(5000),
     });
 
-    if (!res.ok) {
-      console.log(`[Yahoo] quoteSummary failed: ${res.status}`);
-      return null;
-    }
+    if (!res.ok) return null;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const json: any = await res.json();
@@ -465,15 +461,14 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
     };
 
     return data;
-  } catch (err) {
-    console.log('[Yahoo] Fetch error:', err instanceof Error ? err.message : String(err));
+  } catch {
     return null;
   }
 }
 
 // ─── Prompt Builders ──────────────────────────────────────────
 
-function buildPrompt(d: AnalysisRequest): string {
+function buildPrompt(d: AnalysisRequest, flow?: FlowResult): string {
   const pctFmt = (v: number) => `${(v * 100).toFixed(1)}%`;
   const dollarFmt = (v: number) => `$${v.toFixed(2)}`;
   const abbrNum = (n: number) => {
@@ -566,6 +561,29 @@ CORRELATION INSIGHTS
 • ${d.correlations.meanReversion.insight}
 ${d.correlations.sectorRelative ? `• ${d.correlations.sectorRelative.insight}` : ''}` : ''}
 
+${flow && flow.flow.tickersScanned > 0 ? (() => {
+    const f = flow.flow;
+    const tickerFlow = flow.perTickerFlow.find(tf => tf.ticker === d.symbol);
+    const tickerAlerts = flow.alerts.filter(a => a.ticker === d.symbol).slice(0, 8);
+    let section = `MARKET-WIDE OPTIONS FLOW (real-time scan of ${f.tickersScanned} major tickers)
+• Market Net Premium: ${abbrNum(f.netPremium)} (${f.sentiment}) — ${f.netPremium > 0 ? 'institutions net buying calls' : f.netPremium < 0 ? 'institutions net buying puts' : 'balanced'}
+• Market P/C Ratio: ${f.putCallRatio.toFixed(2)} | Call Vol: ${(f.totalCallVolume / 1e3).toFixed(0)}K | Put Vol: ${(f.totalPutVolume / 1e3).toFixed(0)}K`;
+    if (tickerFlow) {
+      section += `\n\n${d.symbol}-SPECIFIC FLOW
+• Net Premium: ${abbrNum(tickerFlow.netPremium)} (${tickerFlow.netPremium > 0 ? 'bullish' : tickerFlow.netPremium < 0 ? 'bearish' : 'neutral'})
+• Call Premium: ${abbrNum(tickerFlow.callPremium)} | Put Premium: ${abbrNum(tickerFlow.putPremium)}`;
+    }
+    if (tickerAlerts.length > 0) {
+      section += `\n\nTop Flow Alerts for ${d.symbol}:`;
+      for (const a of tickerAlerts) {
+        section += `\n  ${a.contractType.toUpperCase()} $${a.strike} ${a.expiry}: ${abbrNum(a.premium)} ${a.tradeType.toUpperCase()} (Vol/OI ${a.volumeOIRatio}x, ${a.sentiment})`;
+      }
+    }
+    if (!tickerFlow && tickerAlerts.length === 0) {
+      section += `\n(${d.symbol} not in flow watchlist or no significant activity detected)`;
+    }
+    return section + '\n';
+  })() : ''}
 ═══════════════════════════════════════════
 YOUR TASK
 ═══════════════════════════════════════════
@@ -583,6 +601,7 @@ Based on ALL the above data, provide 2-4 specific options trade recommendations.
 Also provide:
 - A brief **Market Regime Summary** (2-3 sentences synthesizing all the data into a cohesive picture)
 - **Historical Context** — reference the correlation data: how does this stock typically behave in the current vol regime? Is the current IV fairly priced based on historical over/under-pricing patterns? Does the mean-reversion tendency favor any strategy? How is it performing vs its sector?
+- **Institutional Flow Context** — if flow data is available, analyze: is institutional options flow confirming or diverging from dealer positioning? Are there large block/sweep orders that suggest directional conviction? Does the market-wide flow sentiment align with this ticker's positioning?
 - **What to Watch** — key levels or events that would invalidate the thesis
 - Rate your overall **conviction level** (1-10) and explain why
 

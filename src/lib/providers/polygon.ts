@@ -9,6 +9,9 @@
 
 const BASE = 'https://api.polygon.io';
 
+/** Hard timeout for every Polygon API call to prevent serverless function hangs */
+const FETCH_TIMEOUT = 8000;
+
 function apiKey(): string {
   return process.env.POLYGON_API_KEY || '';
 }
@@ -56,6 +59,7 @@ export async function getOptionsSnapshot(
   // First request
   const firstRes: Response = await fetch(firstUrl, {
     next: { revalidate: 15 },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT),
   });
   if (!firstRes.ok)
     throw new Error(`Polygon snapshot error: ${firstRes.status}`);
@@ -68,6 +72,7 @@ export async function getOptionsSnapshot(
     const pageUrl = `${cursor}&apiKey=${apiKey()}`;
     const pageRes: Response = await fetch(pageUrl, {
       next: { revalidate: 15 },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT),
     });
     if (!pageRes.ok) break;
     const pageData = await pageRes.json();
@@ -96,7 +101,7 @@ export async function getEquityHistory(
     `/v2/aggs/ticker/${ticker.toUpperCase()}/range/${multiplier}/${timespan}/${from}/${to}`,
     { adjusted: 'true', sort: 'asc', limit: '50000' }
   );
-  const res: Response = await fetch(u, { next: { revalidate: 60 } });
+  const res: Response = await fetch(u, { next: { revalidate: 60 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
   if (!res.ok) throw new Error(`Polygon history error: ${res.status}`);
   const data = await res.json();
   return data.results || [];
@@ -108,8 +113,96 @@ export async function getPreviousClose(
   ticker: string
 ): Promise<PolygonBar | null> {
   const u = buildUrl(`/v2/aggs/ticker/${ticker.toUpperCase()}/prev`);
-  const res: Response = await fetch(u, { next: { revalidate: 60 } });
+  const res: Response = await fetch(u, { next: { revalidate: 60 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
   if (!res.ok) return null;
   const data = await res.json();
   return data.results?.[0] || null;
+}
+
+// ─── Short Interest (bi-monthly, all exchanges) ────────────
+
+export interface PolygonShortInterestItem {
+  ticker: string;
+  short_interest: number;
+  avg_daily_volume: number;
+  days_to_cover: number;
+  settlement_date: string;
+}
+
+/**
+ * Fetch short interest data from Polygon.
+ * Covers ALL US equities (NYSE, NASDAQ, OTC) — not just OTC like FINRA CDN.
+ * Supports server-side filtering and pagination.
+ */
+export async function getShortInterestBulk(params?: {
+  ticker?: string;
+  daysToCoverGte?: number;
+  avgDailyVolumeGte?: number;
+  settlementDateGte?: string;
+  limit?: number;
+  sort?: string;
+  order?: 'asc' | 'desc';
+}): Promise<PolygonShortInterestItem[]> {
+  const queryParams: Record<string, string> = {
+    limit: String(params?.limit ?? 1000),
+    sort: params?.sort ?? 'days_to_cover',
+    order: params?.order ?? 'desc',
+  };
+  if (params?.ticker) queryParams.ticker = params.ticker;
+  if (params?.daysToCoverGte) queryParams['days_to_cover.gte'] = String(params.daysToCoverGte);
+  if (params?.avgDailyVolumeGte) queryParams['avg_daily_volume.gte'] = String(params.avgDailyVolumeGte);
+  if (params?.settlementDateGte) queryParams['settlement_date.gte'] = params.settlementDateGte;
+
+  const url = buildUrl('/stocks/v1/short-interest', queryParams);
+  const res: Response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
+  if (!res.ok) throw new Error(`Polygon SI error: ${res.status}`);
+  const data = await res.json();
+  return (data.results || []).filter(
+    (r: PolygonShortInterestItem) => r.ticker && r.short_interest > 0
+  );
+}
+
+// ─── Short Volume (daily, all exchanges) ────────────────────
+
+export interface PolygonShortVolumeItem {
+  ticker: string;
+  date: string;
+  short_volume: number;
+  total_volume: number;
+  short_volume_ratio: number;
+  exempt_volume: number;
+}
+
+/**
+ * Fetch daily short sale volume from Polygon.
+ * More granular than FINRA regShoDaily — includes venue breakdowns.
+ */
+export async function getShortVolumeBulk(params?: {
+  ticker?: string;
+  date?: string;
+  dateGte?: string;
+  shortVolumeRatioGte?: number;
+  totalVolumeGte?: number;
+  limit?: number;
+  sort?: string;
+  order?: 'asc' | 'desc';
+}): Promise<PolygonShortVolumeItem[]> {
+  const queryParams: Record<string, string> = {
+    limit: String(params?.limit ?? 1000),
+    sort: params?.sort ?? 'short_volume_ratio',
+    order: params?.order ?? 'desc',
+  };
+  if (params?.ticker) queryParams.ticker = params.ticker;
+  if (params?.date) queryParams.date = params.date;
+  if (params?.dateGte) queryParams['date.gte'] = params.dateGte;
+  if (params?.shortVolumeRatioGte) queryParams['short_volume_ratio.gte'] = String(params.shortVolumeRatioGte);
+  if (params?.totalVolumeGte) queryParams['total_volume.gte'] = String(params.totalVolumeGte);
+
+  const url = buildUrl('/stocks/v1/short-volume', queryParams);
+  const res: Response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
+  if (!res.ok) throw new Error(`Polygon SV error: ${res.status}`);
+  const data = await res.json();
+  return (data.results || []).filter(
+    (r: PolygonShortVolumeItem) => r.ticker && r.total_volume > 0
+  );
 }

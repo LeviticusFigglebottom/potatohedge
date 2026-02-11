@@ -43,7 +43,7 @@ interface BSInput {
 }
 
 function d1({ S, K, T, r, sigma }: BSInput): number {
-  if (T <= 0 || sigma <= 0) return 0;
+  if (T <= 0 || sigma <= 0 || S <= 0 || K <= 0) return 0;
   return (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
 }
 
@@ -82,7 +82,7 @@ export function delta(params: BSInput, type: 'call' | 'put'): number {
 
 export function gamma(params: BSInput): number {
   const { S, T, sigma } = params;
-  if (T <= 0 || sigma <= 0) return 0;
+  if (T <= 0 || sigma <= 0 || S <= 0) return 0;
   const D1 = d1(params);
   return normPDF(D1) / (S * sigma * Math.sqrt(T));
 }
@@ -147,7 +147,7 @@ export function charm(params: BSInput, type: 'call' | 'put'): number {
 /** Speed: ∂Γ/∂S — rate of change of gamma */
 export function speed(params: BSInput): number {
   const { S, T, sigma } = params;
-  if (T <= 0 || sigma <= 0) return 0;
+  if (T <= 0 || sigma <= 0 || S <= 0) return 0;
   const D1 = d1(params);
   const g = gamma(params);
   return -g / S * (D1 / (sigma * Math.sqrt(T)) + 1);
@@ -161,7 +161,7 @@ export function impliedVolatility(
   marketPrice: number, type: 'call' | 'put',
   maxIter: number = 100, tol: number = 1e-6
 ): number {
-  if (T <= 0) return 0;
+  if (T <= 0 || S <= 0 || K <= 0) return 0;
   
   // Initial guess using Brenner-Subrahmanyam approximation
   let sigma = Math.sqrt(2 * Math.PI / T) * marketPrice / S;
@@ -378,8 +378,10 @@ export function findGammaFlip(exposures: StrikeExposure[], spotPrice?: number): 
 
     // Cumulative GEX from puts (below) to calls (above)
     if (prev.netGEX <= 0 && curr.netGEX > 0) {
-      // Linear interpolation
-      const ratio = Math.abs(prev.netGEX) / (Math.abs(prev.netGEX) + curr.netGEX);
+      // Linear interpolation — guard against both being zero
+      const denom = Math.abs(prev.netGEX) + curr.netGEX;
+      if (denom === 0) continue;
+      const ratio = Math.abs(prev.netGEX) / denom;
       return prev.strike + ratio * (curr.strike - prev.strike);
     }
   }

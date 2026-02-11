@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getExpirations } from '@/lib/providers/tradier';
 
+export const maxDuration = 15;
+
 export async function GET(request: NextRequest) {
   const symbol = request.nextUrl.searchParams.get('symbol');
   if (!symbol) {

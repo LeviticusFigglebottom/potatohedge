@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getOptionsSnapshot } from '@/lib/providers/polygon';
 import { fetchEquityBars } from '@/lib/providers/equityBars';
-import { getOptionsChain, getExpirations } from '@/lib/providers/tradier';
+import { getOptionsChain, getExpirations, getQuote } from '@/lib/providers/tradier';
+import { getVIXHistory } from '@/lib/providers/fred';
 import {
   computeIVRankPercentile,
   computeHistoricalVolatility,
@@ -24,10 +25,14 @@ export async function GET(request: NextRequest) {
     // 1. Tradier nearest chain (reliable ORATS IV)
     // 2. Polygon equity history (for HV computation)
     // 3. Polygon options snapshot (for term structure + skew surface)
-    const [expirations, historyBars, polygonSnapshot] = await Promise.all([
+    // 4. VIX real-time quote (for market vol context)
+    // 5. VIX history from FRED (for time-series overlay)
+    const [expirations, historyBars, polygonSnapshot, vixQuote, vixHistory] = await Promise.all([
       getExpirations(ticker).catch(() => []),
       fetchEquityBars(ticker, 400),
       getOptionsSnapshot(ticker).catch(() => []),
+      getQuote('VIX').catch(() => null),
+      getVIXHistory(400).catch(() => []),
     ]);
 
     // Fetch nearest 3 Tradier chains for ATM IV across expirations
@@ -126,6 +131,8 @@ export async function GET(request: NextRequest) {
     const ivMetrics = computeIVRankPercentile(currentIV, historicalIVs);
     const ivHvRatio = hv20 > 0 ? currentIV / hv20 : 1;
 
+    const vixPrice = vixQuote?.last ?? 0;
+
     const ivContext: IVContext = {
       currentIV,
       ivRank: ivMetrics.ivRank,
@@ -137,7 +144,7 @@ export async function GET(request: NextRequest) {
       ivHvRatio,
       interpretation: '',
     };
-    ivContext.interpretation = interpretIV(ivContext);
+    ivContext.interpretation = interpretIV(ivContext, vixPrice);
 
     // ── Skew Surface from Tradier chains (reliable) + Polygon supplement ──
     // Key: filter out garbage IVs that create spikes
@@ -266,6 +273,24 @@ export async function GET(request: NextRequest) {
       }
     }
 
+    // ── VIX context ──
+    const vixData = vixPrice > 0 ? {
+      price: vixPrice,
+      change: vixQuote?.change ?? 0,
+      changePct: vixQuote?.changePct ?? 0,
+    } : null;
+
+    // Build VIX time series aligned with ivTimeSeries timestamps
+    // FRED dates are YYYY-MM-DD strings, ivTimeSeries times are epoch seconds
+    const vixTimeSeries: { time: number; vix: number }[] = [];
+    if (vixHistory.length > 0) {
+      for (const v of vixHistory) {
+        const t = Math.floor(new Date(v.date + 'T16:00:00-05:00').getTime() / 1000);
+        vixTimeSeries.push({ time: t, vix: v.value / 100 }); // Convert VIX to decimal like IV
+      }
+      vixTimeSeries.sort((a, b) => a.time - b.time);
+    }
+
     return NextResponse.json({
       symbol: ticker,
       spotPrice,
@@ -274,6 +299,8 @@ export async function GET(request: NextRequest) {
       skewSurface: skewSurface.slice(0, 8),
       historicalVol: { hv20, hv60 },
       ivTimeSeries: ivTimeSeries.slice(-252),
+      vix: vixData,
+      vixTimeSeries: vixTimeSeries.slice(-252),
       snapshotCount: polygonSnapshot.length,
       tradierChainsUsed: tradierChains.length,
       timestamp: Date.now(),

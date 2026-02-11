@@ -1,7 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getHistory } from '@/lib/providers/tradier';
+import { getHistory, getQuote } from '@/lib/providers/tradier';
 import { getEquityHistory } from '@/lib/providers/polygon';
 import type { Interval, OHLCV } from '@/types/market';
+
+export const maxDuration = 15;
+
+/**
+ * Format a Date as YYYY-MM-DD in US Eastern timezone.
+ * Serverless runs in UTC; using ET ensures we request the correct market date.
+ */
+function toEasternDate(d: Date): string {
+  return d.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+}
 
 /**
  * Sanitize outlier wicks that distort chart auto-scale.
@@ -12,12 +22,6 @@ import type { Interval, OHLCV } from '@/types/market';
  * so an outlier bar can't pollute its own reference frame.
  * If a wick extends >25% from the neighbor median and no neighbor confirms,
  * clamp the wick to the candle body (open/close).
- * but make the chart unreadable. We detect and clamp extreme wicks
- * while preserving legitimate volatile moves.
- *
- * Logic: for each bar, compare its high/low to a local median of closes.
- * If a wick extends more than 40% from the local median and is far outside
- * the local price range, clamp it to a reasonable multiple of local ATR.
  */
 function sanitizeBars(bars: OHLCV[]): OHLCV[] {
   if (bars.length < 10) return bars;
@@ -58,55 +62,6 @@ function sanitizeBars(bars: OHLCV[]): OHLCV[] {
       const nearestNeighborHigh = Math.max(...neighbors.map(b => b.high));
       if (nearestNeighborHigh > 0 && (high - nearestNeighborHigh) / nearestNeighborHigh > 0.15) {
         high = bodyHigh;
-  const WINDOW = 5; // look at ±5 neighbors
-  const WICK_THRESHOLD = 0.30; // 30% deviation from local median = suspicious
-
-  return bars.map((bar, i) => {
-    // Get local window of closes
-    const start = Math.max(0, i - WINDOW);
-    const end = Math.min(bars.length, i + WINDOW + 1);
-    const localCloses = bars.slice(start, end).map(b => b.close).sort((a, b) => a - b);
-    const median = localCloses[Math.floor(localCloses.length / 2)];
-
-    if (median <= 0) return bar;
-
-    // Local high/low range for "normal" wicks
-    const localHighs = bars.slice(start, end).map(b => b.high);
-    const localLows = bars.slice(start, end).map(b => b.low);
-    const localMax = Math.max(...localHighs);
-    const localMin = Math.min(...localLows);
-    const localRange = localMax - localMin;
-    // Allow wicks up to 3x the local range beyond the local extremes
-    const clampBuffer = Math.max(localRange * 3, median * 0.05);
-
-    let { low, high } = bar;
-
-    // Check if the low wick is an extreme outlier
-    if ((median - low) / median > WICK_THRESHOLD) {
-      // Wick is >30% below median — check if any neighbor is also this low
-      const neighborLows = bars.slice(start, end)
-        .filter((_, j) => j + start !== i)
-        .map(b => b.low);
-      const nearestNeighborLow = Math.min(...neighborLows);
-
-      // If no neighbor is anywhere near this low, it's an outlier wick
-      if ((nearestNeighborLow - low) / nearestNeighborLow > 0.15) {
-        low = Math.max(low, localMin - clampBuffer);
-        // Ensure low doesn't go below body
-        low = Math.min(low, Math.min(bar.open, bar.close));
-      }
-    }
-
-    // Check if the high wick is an extreme outlier (same logic, inverted)
-    if ((high - median) / median > WICK_THRESHOLD) {
-      const neighborHighs = bars.slice(start, end)
-        .filter((_, j) => j + start !== i)
-        .map(b => b.high);
-      const nearestNeighborHigh = Math.max(...neighborHighs);
-
-      if ((high - nearestNeighborHigh) / nearestNeighborHigh > 0.15) {
-        high = Math.min(high, localMax + clampBuffer);
-        high = Math.max(high, Math.max(bar.open, bar.close));
       }
     }
 
@@ -125,29 +80,37 @@ export async function GET(request: NextRequest) {
 
   const ticker = symbol.toUpperCase();
 
+  const headers = { 'Cache-Control': 'no-cache, no-store, must-revalidate' };
+
   try {
     const isIntraday = ['1min', '5min', '15min'].includes(interval);
 
     if (isIntraday) {
       // Polygon for intraday — much longer history than Tradier's 5-day limit
       const history = await getPolygonIntraday(ticker, interval);
-      return NextResponse.json(sanitizeBars(history));
+      return NextResponse.json(sanitizeBars(history), { headers });
     } else {
       // Use Polygon for daily/weekly too — 2+ year lookback vs Tradier's ~1 year
       try {
-        const history = await getPolygonDaily(ticker, interval);
-        if (history.length > 10) return NextResponse.json(sanitizeBars(history));
+        let history = await getPolygonDaily(ticker, interval);
+        // Polygon daily bars only include completed days — the current day's
+        // bar won't appear until after market close. Append a synthetic bar
+        // from the live quote so the chart shows today's price.
+        if (interval === '1D' && history.length > 0) {
+          history = await appendTodayBar(ticker, history);
+        }
+        if (history.length > 10) return NextResponse.json(sanitizeBars(history), { headers });
       } catch { /* fall through to Tradier */ }
 
       // Fallback to Tradier
       const history = await getHistory(ticker, interval);
-      return NextResponse.json(sanitizeBars(history));
+      return NextResponse.json(sanitizeBars(history), { headers });
     }
   } catch (error) {
     // Fallback: try the other provider
     try {
       const history = await getHistory(ticker, interval);
-      return NextResponse.json(sanitizeBars(history));
+      return NextResponse.json(sanitizeBars(history), { headers });
     } catch {
       const message = error instanceof Error ? error.message : 'Unknown error';
       return NextResponse.json({ error: message }, { status: 500 });
@@ -174,8 +137,8 @@ async function getPolygonIntraday(
     ticker,
     mult,
     span,
-    from.toISOString().split('T')[0],
-    to.toISOString().split('T')[0]
+    toEasternDate(from),
+    toEasternDate(to)
   );
 
   return bars.map(bar => ({
@@ -206,8 +169,8 @@ async function getPolygonDaily(
     ticker,
     mult,
     span,
-    from.toISOString().split('T')[0],
-    to.toISOString().split('T')[0]
+    toEasternDate(from),
+    toEasternDate(to)
   );
 
   return bars.map(bar => ({
@@ -218,4 +181,34 @@ async function getPolygonDaily(
     close: bar.c,
     volume: bar.v,
   }));
+}
+
+/**
+ * Append a synthetic bar for today from the live Tradier quote.
+ * This ensures the chart shows current-day price action even though
+ * Polygon's daily bar won't be finalized until after market close.
+ */
+async function appendTodayBar(ticker: string, bars: OHLCV[]): Promise<OHLCV[]> {
+  try {
+    const lastBar = bars[bars.length - 1];
+    const lastBarDate = new Date(lastBar.time * 1000).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const todayET = toEasternDate(new Date());
+
+    if (lastBarDate >= todayET) return bars; // Already have today's bar
+
+    const quote = await getQuote(ticker);
+    if (!quote.last || quote.last <= 0 || !quote.open || quote.open <= 0) return bars;
+
+    // Create today's bar from quote data
+    const todayMidnight = new Date(todayET + 'T00:00:00-05:00').getTime() / 1000;
+    bars.push({
+      time: todayMidnight,
+      open: quote.open,
+      high: quote.high || Math.max(quote.open, quote.last),
+      low: quote.low || Math.min(quote.open, quote.last),
+      close: quote.last,
+      volume: quote.volume || 0,
+    });
+  } catch { /* Ignore — just show bars without today */ }
+  return bars;
 }
