@@ -513,33 +513,63 @@ interface AITradeIdea {
 function parseAITradeIdeas(text: string): AITradeIdea[] {
   const ideas: AITradeIdea[] = [];
 
-  // Find the OPTIONS TRADE IDEAS section
-  const sectionMatch = text.match(/(?:OPTIONS?\s+TRADE\s+IDEAS?|TRADE\s+IDEAS?)\s*[-—]*\s*\n/i);
-  if (!sectionMatch) return ideas;
+  // Find the line containing "TRADE IDEAS" (any heading style: ##, **, numbered, etc.)
+  const lines = text.split('\n');
+  let sectionStart = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/trade\s+ideas?/i.test(lines[i]) && /option/i.test(lines[i])) {
+      sectionStart = i + 1;
+      break;
+    }
+  }
+  // Fallback: just "TRADE IDEAS" without "option"
+  if (sectionStart === -1) {
+    for (let i = 0; i < lines.length; i++) {
+      if (/trade\s+ideas?/i.test(lines[i])) {
+        sectionStart = i + 1;
+        break;
+      }
+    }
+  }
+  if (sectionStart === -1) return ideas;
 
-  const sectionStart = sectionMatch.index! + sectionMatch[0].length;
-  // Section ends at next ## heading or end of text
-  const nextSection = text.slice(sectionStart).match(/\n##\s/);
-  const sectionText = nextSection
-    ? text.slice(sectionStart, sectionStart + nextSection.index!)
-    : text.slice(sectionStart);
+  // Find section end: next ## heading (that isn't a trade idea)
+  let sectionEnd = lines.length;
+  for (let i = sectionStart; i < lines.length; i++) {
+    // A new major section heading (not a numbered trade) ends the section
+    if (/^#{1,3}\s/.test(lines[i]) && !/trade/i.test(lines[i]) && !/\d+\.\s/.test(lines[i])) {
+      sectionEnd = i;
+      break;
+    }
+  }
+
+  const sectionText = lines.slice(sectionStart, sectionEnd).join('\n');
 
   // Split by numbered trade ideas: "1.", "2.", "3.", etc.
-  const tradeBlocks = sectionText.split(/\n\s*(?=\d+\.\s+)/);
+  // Handle: "1. TITLE", "**1. TITLE**", "### 1. TITLE"
+  const tradeBlocks = sectionText.split(/\n\s*(?=(?:#{1,3}\s*|\*{1,2})?\d+\.\s+)/);
 
   for (const block of tradeBlocks) {
     const trimmed = block.trim();
-    if (!trimmed || !/^\d+\.\s/.test(trimmed)) continue;
+    if (!trimmed) continue;
+    // Must start with optional ###/**, then a number
+    if (!/^(?:#{1,3}\s*|\*{1,2})?\d+\.\s/.test(trimmed)) continue;
 
-    // Extract title (first line after the number)
-    const titleMatch = trimmed.match(/^\d+\.\s+(.+)/);
-    const title = titleMatch ? titleMatch[1].replace(/\*\*/g, '').trim() : '';
+    // Extract title (first line after the number, strip markdown)
+    const titleMatch = trimmed.match(/^(?:#{1,3}\s*|\*{1,2})?\d+\.\s+(.+)/);
+    const title = titleMatch ? titleMatch[1].replace(/\*\*/g, '').replace(/^#+\s*/, '').trim() : '';
 
-    // Helper: extract a field value from "**FieldName:** value" or "FieldName: value"
+    // Helper: extract a field value, handling various markdown formats
+    // Matches: "**Ticker:** TSLA", "Ticker: TSLA", "- **Ticker:** TSLA", "Strike(s): 419/430"
     const field = (name: string): string => {
-      const re = new RegExp(`\\*{0,2}${name}[:\\s]*\\*{0,2}\\s*(.+)`, 'i');
-      const m = trimmed.match(re);
-      return m ? m[1].replace(/\*\*/g, '').trim() : '';
+      for (const line of trimmed.split('\n')) {
+        const stripped = line.replace(/^[\s\-*|>]+/, '').trim();
+        // Flexible: field name + optional extra chars before colon + value
+        const re = new RegExp(`^\\*{0,2}${name}[^:]*:\\s*\\*{0,2}(.+)`, 'i');
+        const m = stripped.match(re);
+        if (m) return m[1].replace(/\*\*/g, '').replace(/\|?\s*$/, '').trim();
+      }
+      return '';
     };
 
     const ticker = field('Ticker');
@@ -555,7 +585,7 @@ function parseAITradeIdeas(text: string): AITradeIdea[] {
       entry: field('Entry'),
       target: field('Target'),
       stopMaxLoss: field('Stop') || field('Max Loss'),
-      thesis: field('Thesis'),
+      thesis: field('Thesis') || field('Thesi'),
       invalidation: field('Invalidation'),
     });
   }
@@ -711,6 +741,7 @@ export async function POST() {
 
     // Parse Claude's AI-generated trade ideas from the narrative
     const parsedAIIdeas = parseAITradeIdeas(text);
+    console.log(`[ai/briefing] Parsed ${parsedAIIdeas.length} AI trade ideas from narrative (${text.length} chars). Tickers: ${parsedAIIdeas.map(i => i.ticker).join(', ') || 'none'}`);
 
     // Enrich parsed AI ideas with stock scan data (expiration, spot price, levels)
     const aiTradeIdeas = parsedAIIdeas.map(ai => {
