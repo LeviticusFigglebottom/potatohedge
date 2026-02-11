@@ -19,6 +19,7 @@ function historyKey(type: string, ticker?: string): string {
   if (type === 'metrics' && ticker) return `optix:metrics:${ticker.toUpperCase()}`;
   if (type === 'flow' && ticker) return `optix:flow:${ticker.toUpperCase()}`;
   if (type === 'flow') return `optix:flow:market`;
+  if (type === 'tracked-trades') return `optix:tracked-trades:all`;
   return '';
 }
 
@@ -46,8 +47,8 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ ...status, connected: await testConnection() });
   }
 
-  if (!type || (type !== 'metrics' && type !== 'flow')) {
-    return NextResponse.json({ error: 'type must be "metrics", "flow", or "status"' }, { status: 400 });
+  if (!type || (type !== 'metrics' && type !== 'flow' && type !== 'tracked-trades')) {
+    return NextResponse.json({ error: 'type must be "metrics", "flow", "tracked-trades", or "status"' }, { status: 400 });
   }
 
   const ticker = params.get('ticker') || undefined;

@@ -4,8 +4,9 @@ import { useState, useCallback } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import {
   Newspaper, Loader2, AlertTriangle, TrendingUp, TrendingDown, Minus,
-  Wallet, ChevronDown, ChevronUp, CheckCircle2, Sparkles,
+  Wallet, ChevronDown, ChevronUp, CheckCircle2, Sparkles, Eye,
 } from 'lucide-react';
+import { buildTrackedTradeFromAlgo, addTrackedTrade } from '@/lib/tradeTracker';
 
 // ─── Trade rule storage (shared with PaperTradingTab + PaperMonitor) ───
 interface TradeRule {
@@ -173,6 +174,45 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
   const { setActiveTab } = useDashboardStore();
   const [expanded, setExpanded] = useState<number | null>(null);
   const [paperStatus, setPaperStatus] = useState<Record<number, string>>({});
+  const [trackedIdeas, setTrackedIdeas] = useState<Set<number>>(new Set());
+
+  const handleTrack = (idea: TradeIdea, idx: number) => {
+    const tracked = buildTrackedTradeFromAlgo({
+      symbol: idea.ticker,
+      spotPrice: idea.spot,
+      trade: {
+        strategy: idea.strategy,
+        direction: idea.direction,
+        confidence: idea.confidence,
+        score: idea.score,
+        expiration: idea.expiration,
+        strikes: idea.strikes,
+        entry: idea.entry,
+        risk: idea.risk,
+        reasoning: idea.reasoning,
+        tags: idea.tags,
+        profitTargetPct: idea.profitTargetPct,
+        stopLossPct: idea.stopLossPct,
+      },
+      marketSnapshot: {
+        ivRank: idea.ivRank,
+        currentIV: idea.currentIV,
+        hvCurrent: 0,
+        totalGEX: 0,
+        gammaFlip: idea.gammaFlip,
+        callWall: idea.callWall,
+        putWall: idea.putWall,
+        biasScore: idea.biasScore,
+        overallBias: idea.bias,
+        volRegime: idea.ivRank > 60 ? 'high' : idea.ivRank < 30 ? 'low' : 'mid',
+        gammaRegime: 'neutral',
+      },
+      source: 'ai-briefing',
+      nearestExp: idea.nearestExp,
+    });
+    addTrackedTrade(tracked);
+    setTrackedIdeas(prev => new Set(prev).add(idx));
+  };
 
   const handlePaperTrade = async (idea: TradeIdea, idx: number) => {
     setPaperStatus(s => ({ ...s, [idx]: 'placing...' }));
@@ -494,6 +534,18 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
                         {status === 'placing...' ? 'Placing...' : 'Paper Trade'}
                       </button>
                     )}
+                    {trackedIdeas.has(idx) ? (
+                      <span className="text-xs font-mono text-accent-green flex items-center gap-1">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> Tracked
+                      </span>
+                    ) : (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleTrack(idea, idx); }}
+                        className="px-3 py-1.5 rounded-md text-xs font-mono bg-accent-purple/15 text-accent-purple border border-accent-purple/25 hover:bg-accent-purple/25 transition-all flex items-center gap-1.5"
+                      >
+                        <Eye className="w-3.5 h-3.5" /> Track
+                      </button>
+                    )}
                   </div>
                 </div>
               )}
@@ -509,6 +561,45 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
   const { setActiveTab } = useDashboardStore();
   const [expanded, setExpanded] = useState<number | null>(null);
   const [paperStatus, setPaperStatus] = useState<Record<number, string>>({});
+  const [trackedIdeas, setTrackedIdeas] = useState<Set<number>>(new Set());
+
+  const handleTrack = (idea: AITradeIdea, idx: number) => {
+    const dirLow = idea.direction.toLowerCase();
+    const direction = dirLow.includes('bull') ? 'bullish' : dirLow.includes('bear') ? 'bearish' : 'neutral';
+    const tracked = buildTrackedTradeFromAlgo({
+      symbol: idea.ticker,
+      spotPrice: idea.spot,
+      trade: {
+        strategy: idea.strategy,
+        direction,
+        confidence: 'medium',
+        score: 70,
+        expiration: idea.expiration,
+        strikes: idea.strikes,
+        entry: idea.entry,
+        risk: idea.stopMaxLoss || 'See trade details',
+        reasoning: [idea.thesis, idea.invalidation ? `Invalidation: ${idea.invalidation}` : ''].filter(Boolean),
+        tags: ['ai-generated'],
+      },
+      marketSnapshot: {
+        ivRank: idea.ivRank,
+        currentIV: 0,
+        hvCurrent: 0,
+        totalGEX: 0,
+        gammaFlip: idea.gammaFlip,
+        callWall: idea.callWall,
+        putWall: idea.putWall,
+        biasScore: idea.biasScore,
+        overallBias: idea.bias,
+        volRegime: idea.ivRank > 60 ? 'high' : idea.ivRank < 30 ? 'low' : 'mid',
+        gammaRegime: 'neutral',
+      },
+      source: 'ai-briefing',
+      nearestExp: idea.nearestExp,
+    });
+    addTrackedTrade(tracked);
+    setTrackedIdeas(prev => new Set(prev).add(idx));
+  };
 
   const handlePaperTrade = async (idea: AITradeIdea, idx: number) => {
     setPaperStatus(s => ({ ...s, [idx]: 'placing...' }));
@@ -754,6 +845,18 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
                       >
                         <Wallet className="w-3.5 h-3.5" />
                         {status === 'placing...' ? 'Placing...' : 'Paper Trade'}
+                      </button>
+                    )}
+                    {trackedIdeas.has(idx) ? (
+                      <span className="text-xs font-mono text-accent-green flex items-center gap-1">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> Tracked
+                      </span>
+                    ) : (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleTrack(idea, idx); }}
+                        className="px-3 py-1.5 rounded-md text-xs font-mono bg-accent-cyan/15 text-accent-cyan border border-accent-cyan/25 hover:bg-accent-cyan/25 transition-all flex items-center gap-1.5"
+                      >
+                        <Eye className="w-3.5 h-3.5" /> Track
                       </button>
                     )}
                   </div>

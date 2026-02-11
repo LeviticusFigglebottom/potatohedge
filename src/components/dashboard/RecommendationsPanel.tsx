@@ -1,11 +1,13 @@
 'use client';
 
+import { useState } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import {
   Crosshair, TrendingUp, TrendingDown, Minus, AlertTriangle,
   ChevronRight, Shield, Zap, Target, ArrowUpRight, ArrowDownRight, Circle,
-  BarChart3, Activity,
+  BarChart3, Activity, Eye, CheckCircle2,
 } from 'lucide-react';
+import { buildTrackedTradeFromAlgo, addTrackedTrade, loadTrackedTrades } from '@/lib/tradeTracker';
 
 function BiasGauge({ score, bias }: { score: number; bias: string }) {
   // score: -100 to +100
@@ -147,11 +149,12 @@ function SignalsList({ signals }: { signals: { name: string; direction: string; 
   );
 }
 
-function TradeCard({ trade }: { trade: {
+function TradeCard({ trade, onTrack, tracked }: { trade: {
   strategy: string; direction: string; confidence: string; score: number;
   expiration: string; strikes: string; entry: string; risk: string;
   reasoning: string[]; tags: string[];
-}}) {
+  profitTargetPct?: number; stopLossPct?: number;
+}; onTrack?: () => void; tracked?: boolean }) {
   const dirColor = trade.direction === 'bullish' ? 'text-accent-green' :
     trade.direction === 'bearish' ? 'text-accent-red' : 'text-accent-cyan';
   const dirBg = trade.direction === 'bullish' ? 'border-accent-green/30' :
@@ -173,9 +176,11 @@ function TradeCard({ trade }: { trade: {
             </div>
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          <div className={`text-xl font-mono font-bold ${dirColor}`}>{trade.score}</div>
-          <div className="text-[10px] text-text-muted">/100</div>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
+            <div className={`text-xl font-mono font-bold ${dirColor}`}>{trade.score}</div>
+            <div className="text-[10px] text-text-muted">/100</div>
+          </div>
         </div>
       </div>
 
@@ -209,12 +214,28 @@ function TradeCard({ trade }: { trade: {
           </ul>
         </div>
 
-        <div className="flex flex-wrap gap-1.5 pt-1">
-          {trade.tags.map((tag) => (
-            <span key={tag} className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-bg-tertiary text-text-muted">
-              {tag}
-            </span>
-          ))}
+        <div className="flex items-center justify-between pt-1">
+          <div className="flex flex-wrap gap-1.5">
+            {trade.tags.map((tag) => (
+              <span key={tag} className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-bg-tertiary text-text-muted">
+                {tag}
+              </span>
+            ))}
+          </div>
+          {onTrack && (
+            tracked ? (
+              <span className="text-xs font-mono text-accent-green flex items-center gap-1 shrink-0">
+                <CheckCircle2 className="w-3.5 h-3.5" /> Tracked
+              </span>
+            ) : (
+              <button
+                onClick={onTrack}
+                className="px-3 py-1.5 rounded-md text-xs font-mono bg-accent-cyan/15 text-accent-cyan border border-accent-cyan/25 hover:bg-accent-cyan/25 transition-all flex items-center gap-1.5 shrink-0"
+              >
+                <Eye className="w-3.5 h-3.5" /> Track
+              </button>
+            )
+          )}
         </div>
       </div>
     </div>
@@ -222,7 +243,41 @@ function TradeCard({ trade }: { trade: {
 }
 
 export default function RecommendationsPanel() {
-  const { recommendations, loading, symbol } = useDashboardStore();
+  const { recommendations, loading, symbol, quote, multiGEX, snapshot, expirations } = useDashboardStore();
+  const [trackedIds, setTrackedIds] = useState<Set<string>>(new Set());
+
+  const handleTrackTrade = (trade: typeof recommendations extends null ? never : NonNullable<typeof recommendations>['trades'][number], idx: number) => {
+    if (!recommendations || !quote) return;
+    const nearestExp = expirations[0]?.date || new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+
+    const tracked = buildTrackedTradeFromAlgo({
+      symbol,
+      spotPrice: quote.last,
+      trade: {
+        ...trade,
+        profitTargetPct: (trade as { profitTargetPct?: number }).profitTargetPct,
+        stopLossPct: (trade as { stopLossPct?: number }).stopLossPct,
+      },
+      marketSnapshot: {
+        ivRank: snapshot?.iv?.ivRank ?? 0,
+        currentIV: snapshot?.iv?.currentIV ?? 0,
+        hvCurrent: snapshot?.iv?.hvCurrent ?? 0,
+        totalGEX: multiGEX?.aggregated?.totalGEX ?? 0,
+        gammaFlip: multiGEX?.aggregated?.gammaFlip ?? null,
+        callWall: multiGEX?.aggregated?.callWall ?? null,
+        putWall: multiGEX?.aggregated?.putWall ?? null,
+        biasScore: recommendations.biasScore,
+        overallBias: recommendations.overallBias,
+        volRegime: recommendations.volRegime,
+        gammaRegime: recommendations.gammaRegime,
+      },
+      source: 'algorithm',
+      nearestExp,
+    });
+
+    addTrackedTrade(tracked);
+    setTrackedIds(prev => new Set(prev).add(`algo-${idx}`));
+  };
 
   if (loading.recommendations && !recommendations) {
     return (
@@ -289,7 +344,12 @@ export default function RecommendationsPanel() {
         {recommendations.trades.length > 0 ? (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
             {recommendations.trades.map((trade, i) => (
-              <TradeCard key={i} trade={trade} />
+              <TradeCard
+                key={i}
+                trade={trade}
+                onTrack={() => handleTrackTrade(trade, i)}
+                tracked={trackedIds.has(`algo-${i}`)}
+              />
             ))}
           </div>
         ) : (
