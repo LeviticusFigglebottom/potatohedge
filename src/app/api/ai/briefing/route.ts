@@ -512,67 +512,77 @@ interface AITradeIdea {
 
 function parseAITradeIdeas(text: string): AITradeIdea[] {
   const ideas: AITradeIdea[] = [];
-
-  // Find the line containing "TRADE IDEAS" (any heading style: ##, **, numbered, etc.)
   const lines = text.split('\n');
-  let sectionStart = -1;
+
+  // Strategy 1: Find "TRADE N:" blocks (Claude's primary format)
+  // e.g., "TRADE 1: TSLA MOMENTUM PLAY" or "**TRADE 1: TSLA MOMENTUM**"
+  const tradeStartIndices: number[] = [];
   for (let i = 0; i < lines.length; i++) {
-    if (/trade\s+ideas?/i.test(lines[i]) && /option/i.test(lines[i])) {
-      sectionStart = i + 1;
-      break;
+    if (/^\s*\*{0,2}TRADE\s+\d+/i.test(lines[i])) {
+      tradeStartIndices.push(i);
     }
   }
-  // Fallback: just "TRADE IDEAS" without "option"
-  if (sectionStart === -1) {
+
+  // Strategy 2 (fallback): Find "N." numbered blocks after a "TRADE IDEAS" heading
+  if (tradeStartIndices.length === 0) {
+    let inSection = false;
     for (let i = 0; i < lines.length; i++) {
       if (/trade\s+ideas?/i.test(lines[i])) {
-        sectionStart = i + 1;
+        inSection = true;
+        continue;
+      }
+      if (inSection && /^\s*(?:#{1,3}\s*|\*{1,2})?\d+\.\s+\S/.test(lines[i])) {
+        tradeStartIndices.push(i);
+      }
+      // Stop at next major heading that isn't trade-related
+      if (inSection && /^#{1,2}\s/.test(lines[i]) && !/trade/i.test(lines[i]) && !/\d+\./.test(lines[i])) {
         break;
       }
     }
   }
-  if (sectionStart === -1) return ideas;
 
-  // Find section end: next ## heading (that isn't a trade idea)
-  let sectionEnd = lines.length;
-  for (let i = sectionStart; i < lines.length; i++) {
-    // A new major section heading (not a numbered trade) ends the section
-    if (/^#{1,3}\s/.test(lines[i]) && !/trade/i.test(lines[i]) && !/\d+\.\s/.test(lines[i])) {
-      sectionEnd = i;
-      break;
-    }
-  }
+  if (tradeStartIndices.length === 0) return ideas;
 
-  const sectionText = lines.slice(sectionStart, sectionEnd).join('\n');
+  // Process each trade block
+  for (let t = 0; t < tradeStartIndices.length; t++) {
+    const start = tradeStartIndices[t];
+    const end = t + 1 < tradeStartIndices.length ? tradeStartIndices[t + 1] : Math.min(start + 30, lines.length);
+    const blockLines = lines.slice(start, end);
+    const block = blockLines.join('\n');
 
-  // Split by numbered trade ideas: "1.", "2.", "3.", etc.
-  // Handle: "1. TITLE", "**1. TITLE**", "### 1. TITLE"
-  const tradeBlocks = sectionText.split(/\n\s*(?=(?:#{1,3}\s*|\*{1,2})?\d+\.\s+)/);
+    // Extract title from first line
+    const titleLine = blockLines[0].replace(/\*\*/g, '').trim();
+    const titleMatch = titleLine.match(/(?:TRADE\s+\d+\s*[:\-–—]\s*)(.*)/i)
+      || titleLine.match(/^\d+\.\s+(.*)/);
+    const title = titleMatch ? titleMatch[1].trim() : titleLine;
 
-  for (const block of tradeBlocks) {
-    const trimmed = block.trim();
-    if (!trimmed) continue;
-    // Must start with optional ###/**, then a number
-    if (!/^(?:#{1,3}\s*|\*{1,2})?\d+\.\s/.test(trimmed)) continue;
-
-    // Extract title (first line after the number, strip markdown)
-    const titleMatch = trimmed.match(/^(?:#{1,3}\s*|\*{1,2})?\d+\.\s+(.+)/);
-    const title = titleMatch ? titleMatch[1].replace(/\*\*/g, '').replace(/^#+\s*/, '').trim() : '';
-
-    // Helper: extract a field value, handling various markdown formats
-    // Matches: "**Ticker:** TSLA", "Ticker: TSLA", "- **Ticker:** TSLA", "Strike(s): 419/430"
+    // Field extractor: handles multiple formats
     const field = (name: string): string => {
-      for (const line of trimmed.split('\n')) {
-        const stripped = line.replace(/^[\s\-*|>]+/, '').trim();
-        // Flexible: field name + optional extra chars before colon + value
-        const re = new RegExp(`^\\*{0,2}${name}[^:]*:\\s*\\*{0,2}(.+)`, 'i');
-        const m = stripped.match(re);
-        if (m) return m[1].replace(/\*\*/g, '').replace(/\|?\s*$/, '').trim();
+      for (const line of blockLines) {
+        const raw = line.trim();
+
+        // Format A: Pipe-separated table: "| **Ticker** | TSLA |" or "| Ticker | TSLA |" or "| Ticker: | TSLA |"
+        const pipeMatch = raw.match(new RegExp(
+          `\\|\\s*\\*{0,2}${name}[^|]*\\*{0,2}\\s*\\|\\s*(.+?)\\s*\\|?\\s*$`, 'i'
+        ));
+        if (pipeMatch) return pipeMatch[1].replace(/\*\*/g, '').trim();
+
+        // Format B: "**Field:** Value" or "Field: Value" (with optional leading - * >)
+        const stripped = raw.replace(/^[\s\-*|>]+/, '').trim();
+        const colonMatch = stripped.match(new RegExp(
+          `^\\*{0,2}${name}[^:]*:\\s*\\*{0,2}(.+)`, 'i'
+        ));
+        if (colonMatch) return colonMatch[1].replace(/\*\*/g, '').replace(/\|?\s*$/, '').trim();
       }
       return '';
     };
 
-    const ticker = field('Ticker');
+    let ticker = field('Ticker');
+    // Fallback: extract ticker from title (first uppercase word that looks like a symbol)
+    if (!ticker || !/^[A-Z]{1,5}$/.test(ticker)) {
+      const titleTicker = title.match(/\b([A-Z]{1,5})\b/);
+      if (titleTicker) ticker = titleTicker[1];
+    }
     if (!ticker || !/^[A-Z]{1,5}$/.test(ticker)) continue;
 
     ideas.push({
