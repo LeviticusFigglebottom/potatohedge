@@ -243,7 +243,18 @@ export async function POST(request: NextRequest) {
       result = await callClaude(false);
     }
 
-    return NextResponse.json({ analysis: result.text, model: result.model, usage: result.usage });
+    // Parse structured trade ideas from the JSON block in Claude's response
+    const tradeIdeas = parseTradeIdeasFromAnalysis(result.text);
+
+    // Strip the JSON block from the displayed analysis text
+    const cleanAnalysis = result.text.replace(/```json\s*\[[\s\S]*?\]\s*```\s*$/, '').trim();
+
+    return NextResponse.json({
+      analysis: cleanAnalysis,
+      tradeIdeas,
+      model: result.model,
+      usage: result.usage,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error ?? 'Unknown error');
     console.error('[ai/analyze] Error:', message);
@@ -607,7 +618,29 @@ Also provide:
 
 Be specific, quantitative, and reference the actual data. Do NOT give generic advice. Every recommendation should be traceable back to specific data points above. Think like a professional options desk analyst writing a trade memo.
 
-Format your response using clear headers and be concise but thorough.`;
+Format your response using clear headers and be concise but thorough.
+
+IMPORTANT — STRUCTURED OUTPUT:
+After your narrative analysis, you MUST include a machine-readable JSON block at the very end of your response. This block will be parsed by our system to allow users to track your recommendations.
+Wrap the JSON in \`\`\`json ... \`\`\` code fences. The JSON must be an array of trade objects:
+\`\`\`json
+[
+  {
+    "strategy": "Bull Put Spread",
+    "direction": "bullish",
+    "confidence": "high",
+    "strikes": "Sell $600P / Buy $595P",
+    "expiration": "2025-02-21 (7 DTE)",
+    "entry": "Enter at current levels with spot near $605",
+    "profitTargetPct": 50,
+    "stopLossPct": 100,
+    "risk": "Max loss $500 per spread",
+    "reasoning": ["GEX positive = mean reversion favors put sellers", "IV rank 65 supports premium selling"],
+    "tags": ["credit-spread", "theta-play"]
+  }
+]
+\`\`\`
+Include ALL trades you recommended in the narrative. Use the exact strategy names and strike prices from your analysis.`;
 }
 
 function buildFundamentalPrompt(d: AnalysisRequest, fin: FundamentalData | null): string {
@@ -792,4 +825,50 @@ Using the live data above as your foundation, provide a complete equity research
 - Conviction level (1-10) with justification
 
 Be specific, data-driven, and balanced. Use the LIVE numbers provided — do not substitute with older data from training. Format with clear headers.`;
+}
+
+// ─── Parse structured trade ideas from Claude's JSON block ───
+
+interface ParsedTradeIdea {
+  strategy: string;
+  direction: string;
+  confidence: string;
+  strikes: string;
+  expiration: string;
+  entry: string;
+  profitTargetPct: number;
+  stopLossPct: number;
+  risk: string;
+  reasoning: string[];
+  tags: string[];
+}
+
+function parseTradeIdeasFromAnalysis(text: string): ParsedTradeIdea[] {
+  try {
+    // Look for the last JSON code block in the response
+    const jsonBlocks = [...text.matchAll(/```json\s*([\s\S]*?)```/g)];
+    if (jsonBlocks.length === 0) return [];
+
+    const lastBlock = jsonBlocks[jsonBlocks.length - 1][1].trim();
+    const parsed = JSON.parse(lastBlock);
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .filter((t: Record<string, unknown>) => t && typeof t.strategy === 'string')
+      .map((t: Record<string, unknown>) => ({
+        strategy: String(t.strategy || ''),
+        direction: String(t.direction || 'neutral'),
+        confidence: String(t.confidence || 'medium'),
+        strikes: String(t.strikes || ''),
+        expiration: String(t.expiration || ''),
+        entry: String(t.entry || ''),
+        profitTargetPct: Number(t.profitTargetPct) || 50,
+        stopLossPct: Number(t.stopLossPct) || 100,
+        risk: String(t.risk || ''),
+        reasoning: Array.isArray(t.reasoning) ? t.reasoning.map(String) : [],
+        tags: Array.isArray(t.tags) ? t.tags.map(String) : [],
+      }));
+  } catch {
+    return [];
+  }
 }

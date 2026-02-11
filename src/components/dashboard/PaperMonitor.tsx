@@ -85,16 +85,40 @@ export default function PaperMonitor() {
         const matched = positions.filter(p => ruleSymbols.includes(p.symbol));
         if (matched.length === 0) continue;
 
+        // Enforce minimum holding period: don't auto-exit within 5 minutes of creation
+        const createdTime = new Date(rule.createdAt).getTime();
+        const ageMs = Date.now() - createdTime;
+        if (ageMs < 5 * 60 * 1000) continue; // 5-minute grace period
+
         let triggered: 'target' | 'stop' | null = null;
 
         // Grouped percentage-based P&L (spreads, condors, straddles)
         if (rule.profitTargetPct || rule.stopLossPct) {
-          const totalCost = matched.reduce((s, p) => s + Math.abs(p.cost_basis), 0);
+          // Use NET cost basis (sum with sign) for proper spread P/L calculation
+          // Credit spreads: net cost_basis is negative (credit received)
+          // Debit spreads: net cost_basis is positive (debit paid)
+          const netCost = matched.reduce((s, p) => s + p.cost_basis, 0);
           const totalPL = matched.reduce((s, p) => s + p.unrealizedPL, 0);
-          const plPct = totalCost > 0 ? (totalPL / totalCost) * 100 : 0;
 
-          if (rule.profitTargetPct && plPct >= rule.profitTargetPct) triggered = 'target';
-          if (rule.stopLossPct && plPct <= -rule.stopLossPct) triggered = 'stop';
+          // For percentage calc, use absolute net cost as the reference
+          // For very small positions (< $25 net premium), use dollar-based thresholds instead
+          const absNetCost = Math.abs(netCost);
+
+          if (absNetCost < 25) {
+            // Thin premium positions: use absolute dollar thresholds instead of percentages
+            // Require at least $10 profit or $50 loss before triggering
+            const dollarTarget = Math.max(10, absNetCost * (rule.profitTargetPct / 100));
+            const dollarStop = Math.max(50, absNetCost * (rule.stopLossPct / 100));
+
+            if (rule.profitTargetPct && totalPL >= dollarTarget) triggered = 'target';
+            if (rule.stopLossPct && totalPL <= -dollarStop) triggered = 'stop';
+          } else {
+            // Normal positions: use percentage of net cost basis
+            const plPct = absNetCost > 0 ? (totalPL / absNetCost) * 100 : 0;
+
+            if (rule.profitTargetPct && plPct >= rule.profitTargetPct) triggered = 'target';
+            if (rule.stopLossPct && plPct <= -rule.stopLossPct) triggered = 'stop';
+          }
         }
 
         // Legacy: absolute price targets
