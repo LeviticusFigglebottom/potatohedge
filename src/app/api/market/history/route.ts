@@ -3,6 +3,8 @@ import { getHistory, getQuote } from '@/lib/providers/tradier';
 import { getEquityHistory } from '@/lib/providers/polygon';
 import type { Interval, OHLCV } from '@/types/market';
 
+export const maxDuration = 15;
+
 /**
  * Format a Date as YYYY-MM-DD in US Eastern timezone.
  * Serverless runs in UTC; using ET ensures we request the correct market date.

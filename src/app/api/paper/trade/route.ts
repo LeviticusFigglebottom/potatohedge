@@ -1,4 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
+
+export const maxDuration = 15;
+
 import {
   placeSingleOrder,
   placeMultiLegOrder,

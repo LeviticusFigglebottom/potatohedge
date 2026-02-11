@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getOptionsChain } from '@/lib/providers/tradier';
+
+export const maxDuration = 15;
+
 import {
   computeDealerExposureFromChain,
   findGammaFlip,

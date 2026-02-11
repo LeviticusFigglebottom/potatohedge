@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getOrders, cancelOrder, parseOCCSymbol } from '@/lib/providers/tradierPaper';
 
+export const maxDuration = 15;
+
 /**
  * GET /api/paper/orders — Get all orders with parsed OCC symbols.
  */

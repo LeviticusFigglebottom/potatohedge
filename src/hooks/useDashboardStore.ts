@@ -201,23 +201,27 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
   },
 
   saveAndLoadMetricHistory: () => {
+    // Capture symbol at call time to prevent race condition on rapid symbol switching
     const { symbol, quote, multiGEX, snapshot } = get();
+    const capturedSymbol = symbol;
 
     // Need at least some data to save a meaningful record
     if (!multiGEX && !snapshot && !quote) {
       // No data at all — just try to load existing history
-      loadMetricHistoryWithSync(symbol).then(merged => {
-        if (merged.length > 0) set({ metricHistory: merged });
+      loadMetricHistoryWithSync(capturedSymbol).then(merged => {
+        // Only update state if we're still on the same symbol
+        if (get().symbol === capturedSymbol && merged.length > 0) set({ metricHistory: merged });
       }).catch(() => {
-        const existing = loadMetricHistory(symbol);
+        if (get().symbol !== capturedSymbol) return;
+        const existing = loadMetricHistory(capturedSymbol);
         if (existing.length > 0) set({ metricHistory: existing });
       });
       return;
     }
 
-    // Save whatever data we have (partial is better than nothing)
-    const today = new Date();
-    const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    // Build record — use ET date for consistency with market calendar
+    const now = new Date();
+    const date = now.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
     const record: DailyMetricRecord = {
       date,
       timestamp: Date.now(),
@@ -238,12 +242,16 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
       putWall: multiGEX?.aggregated?.putWall ?? null,
       maxPain: multiGEX?.maxPain?.strike ?? 0,
     };
-    saveMetricSnapshot(symbol, record);
-    set({ metricHistory: loadMetricHistory(symbol) });
+    saveMetricSnapshot(capturedSymbol, record);
+
+    // Only update state if still on same symbol
+    if (get().symbol === capturedSymbol) {
+      set({ metricHistory: loadMetricHistory(capturedSymbol) });
+    }
 
     // Async: merge with server data (updates state when ready)
-    loadMetricHistoryWithSync(symbol).then(merged => {
-      if (merged.length > 0) set({ metricHistory: merged });
+    loadMetricHistoryWithSync(capturedSymbol).then(merged => {
+      if (get().symbol === capturedSymbol && merged.length > 0) set({ metricHistory: merged });
     }).catch(() => {});
   },
 

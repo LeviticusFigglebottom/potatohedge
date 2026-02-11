@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server';
 import { getBalances, getPositions, getGainLoss, getOptionQuotes, parseOCCSymbol } from '@/lib/providers/tradierPaper';
 
+export const maxDuration = 15;
+
 /**
  * GET /api/paper/account — Full paper trading account snapshot:
  * balances, open positions (with parsed symbols + live quotes), and recent gain/loss history.

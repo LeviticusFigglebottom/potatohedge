@@ -3,6 +3,8 @@ import { getQuote } from '@/lib/providers/tradier';
 import { getPreviousClose } from '@/lib/providers/polygon';
 import type { Quote } from '@/types/market';
 
+export const maxDuration = 15;
+
 export async function GET(request: NextRequest) {
   const symbol = request.nextUrl.searchParams.get('symbol');
   if (!symbol) {

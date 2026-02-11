@@ -94,7 +94,7 @@ function computeQuickCorrelationCtx(
     const fwd5 = returns.slice(idx, idx + 5).reduce((s, r) => s + r, 0);
     const fwd20 = returns.slice(idx, idx + 20).reduce((s, r) => s + r, 0);
     if (hvValues[i] <= p33) { lowVolRets.push(fwd20); lowVolWins5d.push(fwd5 > 0); }
-    else if (hvValues[i] >= sorted[Math.floor(sorted.length * 0.66)] || 999) { highVolRets.push(fwd20); }
+    else if (hvValues[i] >= (sorted[Math.floor(sorted.length * 0.66)] ?? 999)) { highVolRets.push(fwd20); }
   }
   const dailySigma = hvCurrent > 0 ? hvCurrent / Math.sqrt(252) : 0.015;
   const bigUps: { next1d: number }[] = [];

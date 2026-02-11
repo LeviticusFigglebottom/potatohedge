@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { closePosition, parseOCCSymbol } from '@/lib/providers/tradierPaper';
 
+export const maxDuration = 15;
+
 /**
  * POST /api/paper/close — Close an open position.
  * Body: { symbol: 'SPY260211C00700000', quantity: 1, orderType?: 'market'|'limit', limitPrice?: 3.50 }

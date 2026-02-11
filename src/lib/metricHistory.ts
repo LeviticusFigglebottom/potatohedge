@@ -33,6 +33,59 @@ export interface DailyMetricRecord {
 const STORAGE_PREFIX = 'optix_history_';
 const MAX_RECORDS = 365;
 
+/**
+ * Check if a given date is a US market trading day (not weekend, not known holiday).
+ * Uses Eastern Time for date determination.
+ */
+function isMarketDay(date: Date): boolean {
+  // Convert to ET for accurate day-of-week
+  const etStr = date.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  const [y, m, d] = etStr.split('-').map(Number);
+  const etDate = new Date(y, m - 1, d);
+  const dow = etDate.getDay();
+  // Weekend check
+  if (dow === 0 || dow === 6) return false;
+  // Major US market holidays (fixed dates + observed rules)
+  const mmdd = `${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  const fixedHolidays = [
+    '01-01', // New Year's Day
+    '06-19', // Juneteenth
+    '07-04', // Independence Day
+    '11-11', // Veterans Day (markets closed on observed)
+    '12-25', // Christmas
+  ];
+  if (fixedHolidays.includes(mmdd)) return false;
+  // MLK Day: 3rd Monday of January
+  if (m === 1 && dow === 1 && d >= 15 && d <= 21) return false;
+  // Presidents' Day: 3rd Monday of February
+  if (m === 2 && dow === 1 && d >= 15 && d <= 21) return false;
+  // Good Friday: skip (varies, hard to compute without full Easter algo)
+  // Memorial Day: last Monday of May
+  if (m === 5 && dow === 1 && d >= 25) return false;
+  // Labor Day: 1st Monday of September
+  if (m === 9 && dow === 1 && d <= 7) return false;
+  // Thanksgiving: 4th Thursday of November
+  if (m === 11 && dow === 4 && d >= 22 && d <= 28) return false;
+  return true;
+}
+
+/**
+ * Check if a metric record has meaningful data (not all zeros from API failures).
+ * Returns true if at least some core fields have non-zero values.
+ */
+function hasSignificantData(record: DailyMetricRecord): boolean {
+  // spotPrice must be positive (a $0 stock isn't real data)
+  if (!record.spotPrice || record.spotPrice <= 0) return false;
+  // At least one of these core fields should be non-zero
+  return (
+    record.totalGEX !== 0 ||
+    record.totalDEX !== 0 ||
+    record.volumePCR !== 0 ||
+    record.currentIV !== 0 ||
+    record.ivRank !== 0
+  );
+}
+
 function storageKey(symbol: string): string {
   return `${STORAGE_PREFIX}${symbol.toUpperCase()}`;
 }
@@ -54,12 +107,27 @@ export function loadMetricHistory(symbol: string): DailyMetricRecord[] {
 
 export function saveMetricSnapshot(symbol: string, record: DailyMetricRecord): void {
   if (typeof window === 'undefined') return;
+
+  // Guard: Don't save weekend/holiday data — it's stale from last close
+  if (!isMarketDay(new Date(record.timestamp))) return;
+
+  // Guard: Don't save all-zero records from API failures — they skew analytics
+  if (!hasSignificantData(record)) return;
+
   try {
     const history = loadMetricHistory(symbol);
 
-    // Replace today's record if it exists, otherwise append
+    // Replace today's record if it exists, but only if new data is better
     const existingIdx = history.findIndex(r => r.date === record.date);
     if (existingIdx >= 0) {
+      // Keep the record with more non-zero fields (more complete data)
+      const existing = history[existingIdx];
+      const countNonZero = (r: DailyMetricRecord) =>
+        [r.totalGEX, r.totalDEX, r.volumePCR, r.currentIV, r.ivRank, r.totalVanna, r.totalCharm]
+          .filter(v => v !== 0).length;
+      if (countNonZero(record) < countNonZero(existing) && record.timestamp <= existing.timestamp) {
+        return; // Existing record is better, don't overwrite
+      }
       history[existingIdx] = record;
     } else {
       history.push(record);

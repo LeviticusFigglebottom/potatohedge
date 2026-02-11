@@ -134,11 +134,15 @@ function clamp(v: number, min: number, max: number): number {
  * Clamps to first/last ys if x is outside the range.
  */
 function plerp(x: number, xs: number[], ys: number[]): number {
+  if (xs.length === 0 || ys.length === 0) return 0;
+  if (xs.length === 1) return ys[0];
   if (x <= xs[0]) return ys[0];
   if (x >= xs[xs.length - 1]) return ys[ys.length - 1];
   for (let i = 1; i < xs.length; i++) {
     if (x <= xs[i]) {
-      const t = (x - xs[i - 1]) / (xs[i] - xs[i - 1]);
+      const denom = xs[i] - xs[i - 1];
+      if (denom === 0) return ys[i]; // identical breakpoints
+      const t = (x - xs[i - 1]) / denom;
       return ys[i - 1] + t * (ys[i] - ys[i - 1]);
     }
   }
@@ -150,6 +154,9 @@ function plerp(x: number, xs: number[], ys: number[]): number {
 function scoreSignals(input: RecommendationInput): Signal[] {
   const signals: Signal[] = [];
   const { spotPrice, dailySigma, atrPercent } = input;
+
+  // Guard: spotPrice must be positive for all percentage calculations
+  if (spotPrice <= 0) return signals;
 
   // 1. GEX Regime
   if (input.totalGEX > 0) {
@@ -595,6 +602,9 @@ function generateTrades(
 ): TradeIdea[] {
   const trades: TradeIdea[] = [];
   const { spotPrice, callWall, putWall, gammaFlip, maxPain, atr14, atrPercent } = input;
+
+  // Guard: need valid spot price for all strike calculations
+  if (spotPrice <= 0) return trades;
 
   // ATR-based spread width (use ~1-2 ATR for spread width)
   const spreadWidth = Math.max(1, Math.round(atr14));

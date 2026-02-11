@@ -278,16 +278,17 @@ async function fetchSwapDataInner(): Promise<SwapResult> {
 
       if (!res.ok) throw new Error(`${res.status}`);
 
+      // Read body ONCE as arrayBuffer, then check content if needed
+      const buffer = new Uint8Array(await res.arrayBuffer());
+      if (buffer.length < 100) throw new Error('Too small');
+
       const contentType = res.headers.get('content-type') || '';
       if (contentType.includes('html') || contentType.includes('text/plain')) {
-        const preview = await res.text().catch(() => '');
-        if (preview.includes('<html') || preview.includes('host_not_allowed') || preview.length < 100) {
+        const preview = new TextDecoder().decode(buffer.slice(0, 500));
+        if (preview.includes('<html') || preview.includes('host_not_allowed')) {
           throw new Error('Non-data response');
         }
       }
-
-      const buffer = new Uint8Array(await res.arrayBuffer());
-      if (buffer.length < 100) throw new Error('Too small');
 
       let csvText: string;
       if (buffer[0] === 0x50 && buffer[1] === 0x4b) {

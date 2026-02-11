@@ -1,3 +1,5 @@
+export const maxDuration = 15;
+
 /**
  * History API — client read/write for persistent metric and flow history.
  *
