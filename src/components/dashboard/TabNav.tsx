@@ -1,7 +1,7 @@
 'use client';
 
 import { useDashboardStore, type TabId } from '@/hooks/useDashboardStore';
-import { LayoutDashboard, TableProperties, Shield, Activity, LineChart, Radar, Building2, Newspaper, Wallet, Eye } from 'lucide-react';
+import { LayoutDashboard, TableProperties, Shield, Activity, LineChart, Radar, Building2, Newspaper, Wallet, Eye, HeartPulse } from 'lucide-react';
 
 const TABS: { id: TabId; label: string; icon: React.ElementType }[] = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
@@ -14,6 +14,7 @@ const TABS: { id: TabId; label: string; icon: React.ElementType }[] = [
   { id: 'tracker', label: 'AI Tracker', icon: Eye },
   { id: 'paper', label: 'Paper Trades', icon: Wallet },
   { id: 'chain', label: 'Options Chain', icon: TableProperties },
+  { id: 'diagnostics', label: 'Diagnostics', icon: HeartPulse },
 ];
 
 export default function TabNav() {
