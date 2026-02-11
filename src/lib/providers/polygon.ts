@@ -63,7 +63,12 @@ export async function getOptionsSnapshot(
   });
   if (!firstRes.ok)
     throw new Error(`Polygon snapshot error: ${firstRes.status}`);
-  const firstData = await firstRes.json();
+  let firstData;
+  try {
+    firstData = await firstRes.json();
+  } catch (e) {
+    throw new Error(`Polygon snapshot JSON parse error: ${e instanceof Error ? e.message : 'malformed response'}`);
+  }
   if (firstData.results) allResults.push(...firstData.results);
 
   // Pagination
@@ -75,7 +80,12 @@ export async function getOptionsSnapshot(
       signal: AbortSignal.timeout(FETCH_TIMEOUT),
     });
     if (!pageRes.ok) break;
-    const pageData = await pageRes.json();
+    let pageData;
+    try {
+      pageData = await pageRes.json();
+    } catch {
+      break; // Malformed JSON on pagination — return what we have
+    }
     if (pageData.results) allResults.push(...pageData.results);
     cursor = pageData.next_url;
   }
@@ -103,7 +113,12 @@ export async function getEquityHistory(
   );
   const res: Response = await fetch(u, { next: { revalidate: 60 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
   if (!res.ok) throw new Error(`Polygon history error: ${res.status}`);
-  const data = await res.json();
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    throw new Error(`Polygon history JSON parse error: ${e instanceof Error ? e.message : 'malformed response'}`);
+  }
   return data.results || [];
 }
 
@@ -115,7 +130,12 @@ export async function getPreviousClose(
   const u = buildUrl(`/v2/aggs/ticker/${ticker.toUpperCase()}/prev`);
   const res: Response = await fetch(u, { next: { revalidate: 60 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) });
   if (!res.ok) return null;
-  const data = await res.json();
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    return null; // Malformed JSON from Polygon
+  }
   return data.results?.[0] || null;
 }
 
@@ -156,7 +176,12 @@ export async function getShortInterestBulk(params?: {
   const url = buildUrl('/stocks/v1/short-interest', queryParams);
   const res: Response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
   if (!res.ok) throw new Error(`Polygon SI error: ${res.status}`);
-  const data = await res.json();
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    throw new Error(`Polygon SI JSON parse error: ${e instanceof Error ? e.message : 'malformed response'}`);
+  }
   return (data.results || []).filter(
     (r: PolygonShortInterestItem) => r.ticker && r.short_interest > 0
   );
@@ -201,7 +226,12 @@ export async function getShortVolumeBulk(params?: {
   const url = buildUrl('/stocks/v1/short-volume', queryParams);
   const res: Response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
   if (!res.ok) throw new Error(`Polygon SV error: ${res.status}`);
-  const data = await res.json();
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    throw new Error(`Polygon SV JSON parse error: ${e instanceof Error ? e.message : 'malformed response'}`);
+  }
   return (data.results || []).filter(
     (r: PolygonShortVolumeItem) => r.ticker && r.total_volume > 0
   );

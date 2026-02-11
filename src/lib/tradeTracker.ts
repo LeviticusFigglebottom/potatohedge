@@ -152,9 +152,11 @@ export function saveTrackedTrades(trades: TrackedTrade[]): void {
 
 async function syncTrackedTradesToServer(trades: TrackedTrade[]): Promise<void> {
   // Wrap each trade as a history record with date + timestamp for persistence layer compat
+  // Use trade ID as the `date` field because the persistence layer deduplicates by `date`.
+  // Using the actual date would cause only 1 trade per day to survive server sync.
   const records = trades.map(t => ({
     ...t,
-    date: new Date(t.trackedAt).toISOString().slice(0, 10),
+    date: t.id,  // unique per trade — prevents dedup from losing multi-trade-per-day data
     timestamp: t.trackedAt,
   }));
   await fetch('/api/history', {

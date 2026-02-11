@@ -71,7 +71,11 @@ async function blobGet<T>(key: string): Promise<T[] | null> {
     signal: AbortSignal.timeout(5000),
   });
   if (!res.ok) return null;
-  return res.json();
+  try {
+    return await res.json();
+  } catch {
+    return null; // Malformed JSON from blob storage
+  }
 }
 
 async function blobSet<T>(key: string, data: T[]): Promise<void> {

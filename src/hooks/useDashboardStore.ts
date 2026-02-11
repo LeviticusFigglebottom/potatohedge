@@ -113,7 +113,11 @@ const api = async (path: string) => {
     const truncated = isHtml ? `[HTML error page - serverless function crashed]` : (body.length > 300 ? body.slice(0, 200) + '...' : body);
     throw new Error(`[${path}] ${res.status}: ${truncated}`);
   }
-  return res.json();
+  try {
+    return await res.json();
+  } catch (e) {
+    throw new Error(`[${path}] JSON parse error: ${e instanceof Error ? e.message : 'malformed response'}`);
+  }
 };
 
 export const useDashboardStore = create<DashboardStore>((set, get) => ({

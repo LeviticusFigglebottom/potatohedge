@@ -45,7 +45,12 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: `Tradier error: ${res.status} ${body.slice(0, 200)}` }, { status: 502 });
     }
 
-    const data = await res.json();
+    let data;
+    try {
+      data = await res.json();
+    } catch (e) {
+      return NextResponse.json({ error: `Tradier JSON parse error: ${e instanceof Error ? e.message : 'malformed response'}` }, { status: 502 });
+    }
     const rawQuotes = data.quotes?.quote;
     if (!rawQuotes) {
       return NextResponse.json({ quotes: {}, spot: null });
