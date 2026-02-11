@@ -286,20 +286,34 @@ export function evaluateTrade(
     return trades.find(t => t.id === trade.id) ?? null;
   }
 
-  // If pending, auto-enter immediately (we track at market)
+  // If pending, capture entry prices and transition to entered
   if (trade.status === 'pending') {
+    // Fill entry prices from current market data (first observation = entry)
+    const entryLegs = trade.legs.map(leg => {
+      const price = currentLegPrices.find(p => p.symbol === leg.optionSymbol);
+      if (price && price.mid > 0) {
+        return { ...leg, entryBid: price.bid, entryAsk: price.ask, entryMid: price.mid };
+      }
+      return leg;
+    });
+    const entryValue = calculatePositionValue(entryLegs, 'entry');
+
     updates.status = 'entered';
     updates.enteredAt = now;
+    updates.legs = entryLegs;
+    updates.entryDebit = entryValue;
   }
 
   // Calculate current position value for entered trades
   if (trade.status === 'entered' || updates.status === 'entered') {
-    const currentLegs = trade.legs.map(leg => {
+    // Use updated legs if we just entered, otherwise use existing legs
+    const activeLeg = updates.legs ?? trade.legs;
+    const currentLegs = activeLeg.map(leg => {
       const price = currentLegPrices.find(p => p.symbol === leg.optionSymbol);
       return { ...leg, exitBid: price?.bid ?? 0, exitAsk: price?.ask ?? 0, exitMid: price?.mid ?? 0 };
     });
     const currentValue = calculatePositionValue(currentLegs, 'exit');
-    const entryValue = trade.entryDebit ?? calculatePositionValue(trade.legs, 'entry');
+    const entryValue = updates.entryDebit ?? trade.entryDebit ?? calculatePositionValue(activeLeg, 'entry');
     const unrealizedPL = currentValue - entryValue;
     const plPct = trade.maxRisk && trade.maxRisk !== 0 ? (unrealizedPL / Math.abs(trade.maxRisk)) * 100 : 0;
 
@@ -501,9 +515,13 @@ export function buildTrackedTradeFromAlgo(params: {
   // Build basic legs from strikes text if not provided
   const parsedLegs: TrackedLeg[] = legs ?? parseLegsFromStrikesText(symbol, trade.strikes, trade.strategy, expirationDate, spotPrice);
 
-  // Calculate entry debit/credit and max risk
-  const entryValue = calculatePositionValue(parsedLegs, 'entry');
-  const maxRisk = calculateMaxRisk(parsedLegs, trade.strategy);
+  // Calculate max risk (entry prices are 0 until TrackerMonitor fills them)
+  const maxRisk = calculateMaxRisk(parsedLegs, trade.strategy, spotPrice);
+
+  // Entry value is null until TrackerMonitor fetches real option prices
+  // This prevents phantom P/L from estimated prices
+  const hasRealPrices = parsedLegs.some(l => l.entryMid > 0);
+  const entryValue = hasRealPrices ? calculatePositionValue(parsedLegs, 'entry') : null;
 
   return {
     id: `track-${source}-${symbol}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -524,17 +542,17 @@ export function buildTrackedTradeFromAlgo(params: {
     tags: trade.tags,
     marketSnapshot,
     trackedAt: Date.now(),
-    enteredAt: Date.now(), // Enter immediately on track
+    enteredAt: null,            // Stays pending until TrackerMonitor prices the legs
     exitedAt: null,
     expirationDate,
-    status: 'entered',
+    status: 'pending',          // Will transition to 'entered' once real prices are fetched
     outcome: null,
     entryDebit: entryValue,
     exitValue: null,
     realizedPL: null,
     realizedPLPct: null,
     maxRisk,
-    priceHistory: [{ timestamp: Date.now(), spotPrice, positionValue: entryValue }],
+    priceHistory: [],           // Empty until TrackerMonitor starts tracking
     exitReason: null,
     notes: '',
   };
@@ -542,7 +560,8 @@ export function buildTrackedTradeFromAlgo(params: {
 
 /**
  * Parse legs from the strikes text description.
- * This is a best-effort parser — option prices are estimated from the strategy context.
+ * This is a best-effort parser — option prices are estimated conservatively.
+ * Real prices will be filled by TrackerMonitor on first evaluation cycle.
  */
 function parseLegsFromStrikesText(
   symbol: string,
@@ -553,11 +572,47 @@ function parseLegsFromStrikesText(
 ): TrackedLeg[] {
   const legs: TrackedLeg[] = [];
   const stratLow = strategy.toLowerCase();
+  const textLow = strikesText.toLowerCase();
 
-  // Extract all dollar amounts
+  // Extract all dollar amounts from strikes text
   const allStrikes = [...strikesText.matchAll(/\$(\d+(?:\.\d+)?)/g)].map(m => parseFloat(m[1]));
-  const sellStrikes = [...strikesText.matchAll(/sell\s+\$(\d+(?:\.\d+)?)/gi)].map(m => parseFloat(m[1]));
-  const buyStrikes = [...strikesText.matchAll(/buy\s+\$(\d+(?:\.\d+)?)/gi)].map(m => parseFloat(m[1]));
+
+  // Extract explicit buy/sell + strike + type patterns
+  // e.g., "Sell $690P / Buy $685P" or "Buy $695C / Sell $700C"
+  const sellStrikes = [...strikesText.matchAll(/sell\s+\$?(\d+(?:\.\d+)?)\s*([CP]|call|put)?/gi)].map(m => ({
+    strike: parseFloat(m[1]),
+    type: m[2] ? (m[2].toLowerCase().startsWith('c') ? 'call' : 'put') : null,
+  }));
+  const buyStrikes = [...strikesText.matchAll(/buy\s+\$?(\d+(?:\.\d+)?)\s*([CP]|call|put)?/gi)].map(m => ({
+    strike: parseFloat(m[1]),
+    type: m[2] ? (m[2].toLowerCase().startsWith('c') ? 'call' : 'put') : null,
+  }));
+
+  // Also detect "Sell $690P" format (strike immediately followed by C/P)
+  const sellWithType = [...strikesText.matchAll(/sell[^$]*\$(\d+(?:\.\d+)?)([CP])/gi)].map(m => ({
+    strike: parseFloat(m[1]),
+    type: m[2].toLowerCase() === 'c' ? 'call' as const : 'put' as const,
+  }));
+  const buyWithType = [...strikesText.matchAll(/buy[^$]*\$(\d+(?:\.\d+)?)([CP])/gi)].map(m => ({
+    strike: parseFloat(m[1]),
+    type: m[2].toLowerCase() === 'c' ? 'call' as const : 'put' as const,
+  }));
+
+  // Merge type info
+  for (const s of sellWithType) {
+    const existing = sellStrikes.find(e => e.strike === s.strike);
+    if (existing && !existing.type) existing.type = s.type;
+    else if (!existing) sellStrikes.push({ strike: s.strike, type: s.type });
+  }
+  for (const b of buyWithType) {
+    const existing = buyStrikes.find(e => e.strike === b.strike);
+    if (existing && !existing.type) existing.type = b.type;
+    else if (!existing) buyStrikes.push({ strike: b.strike, type: b.type });
+  }
+
+  // Detect quantity patterns like "2x" or "×2"
+  const quantityMatch = strikesText.match(/(\d+)\s*x\s/i) || strikesText.match(/×\s*(\d+)/);
+  const defaultQty = quantityMatch ? parseInt(quantityMatch[1]) : 1;
 
   // Helper to build OCC symbol
   const occ = (type: 'C' | 'P', strike: number) => {
@@ -569,84 +624,205 @@ function parseLegsFromStrikesText(
     return `${symbol.toUpperCase()}${yy}${mm}${dd}${type}${s}`;
   };
 
-  // Estimate mid price based on distance from spot and strategy type
-  const estimateMid = (strike: number, type: 'call' | 'put'): number => {
-    const dist = type === 'call' ? spotPrice - strike : strike - spotPrice;
-    const intrinsic = Math.max(0, dist);
-    // Rough extrinsic estimate based on ATM ~2-5% of spot
-    const extrinsic = Math.max(0.10, spotPrice * 0.02 * Math.exp(-Math.abs(strike - spotPrice) / spotPrice * 5));
-    return Math.round((intrinsic + extrinsic) * 100) / 100;
-  };
+  const makeLeg = (strike: number, type: 'call' | 'put', side: 'long' | 'short', quantity: number = 1): TrackedLeg => ({
+    optionSymbol: occ(type === 'call' ? 'C' : 'P', strike),
+    optionType: type,
+    strike,
+    expiration,
+    side,
+    quantity,
+    // Entry prices set to 0 — will be filled by TrackerMonitor with real market data
+    entryBid: 0,
+    entryAsk: 0,
+    entryMid: 0,
+    exitBid: null,
+    exitAsk: null,
+    exitMid: null,
+    entryDelta: 0,
+    entryGamma: 0,
+    entryTheta: 0,
+    entryVega: 0,
+    entryIV: 0,
+  });
 
-  const makeLeg = (strike: number, type: 'call' | 'put', side: 'long' | 'short'): TrackedLeg => {
-    const mid = estimateMid(strike, type);
-    return {
-      optionSymbol: occ(type === 'call' ? 'C' : 'P', strike),
-      optionType: type,
-      strike,
-      expiration,
-      side,
-      quantity: 1,
-      entryBid: mid * 0.95,
-      entryAsk: mid * 1.05,
-      entryMid: mid,
-      exitBid: null,
-      exitAsk: null,
-      exitMid: null,
-      entryDelta: 0,
-      entryGamma: 0,
-      entryTheta: 0,
-      entryVega: 0,
-      entryIV: 0,
-    };
-  };
+  // ── Strategy-specific parsing ────────────────────────────
 
-  // Parse based on strategy type
+  // Iron Condor: sell inner call + sell inner put, buy outer wings
   if (stratLow.includes('iron condor')) {
-    const sellCallMatch = strikesText.match(/sell\s+\$(\d+(?:\.\d+)?)c/i) || strikesText.match(/\$(\d+(?:\.\d+)?)C/);
-    const sellPutMatch = strikesText.match(/sell\s+\$(\d+(?:\.\d+)?)p/i) || strikesText.match(/\$(\d+(?:\.\d+)?)P/);
-    if (sellCallMatch && sellPutMatch) {
-      const sc = parseFloat(sellCallMatch[1]);
-      const sp = parseFloat(sellPutMatch[1]);
-      const width = allStrikes.length > 2 ? Math.abs(allStrikes[2] - allStrikes[1]) : 5;
-      legs.push(makeLeg(sc, 'call', 'short'), makeLeg(sc + width, 'call', 'long'), makeLeg(sp, 'put', 'short'), makeLeg(sp - width, 'put', 'long'));
+    // Try to find 4 strikes
+    if (allStrikes.length >= 4) {
+      const sorted = [...allStrikes].sort((a, b) => a - b);
+      legs.push(makeLeg(sorted[0], 'put', 'long'));    // buy lower put wing
+      legs.push(makeLeg(sorted[1], 'put', 'short'));   // sell inner put
+      legs.push(makeLeg(sorted[2], 'call', 'short'));  // sell inner call
+      legs.push(makeLeg(sorted[3], 'call', 'long'));   // buy upper call wing
+    } else if (sellStrikes.length >= 2) {
+      // Sell strikes given, infer wings
+      const putSell = sellStrikes.find(s => s.type === 'put')?.strike || Math.min(...sellStrikes.map(s => s.strike));
+      const callSell = sellStrikes.find(s => s.type === 'call')?.strike || Math.max(...sellStrikes.map(s => s.strike));
+      const width = 5; // default wing width
+      legs.push(makeLeg(putSell - width, 'put', 'long'));
+      legs.push(makeLeg(putSell, 'put', 'short'));
+      legs.push(makeLeg(callSell, 'call', 'short'));
+      legs.push(makeLeg(callSell + width, 'call', 'long'));
     }
-  } else if (stratLow.includes('bull put') || (stratLow.includes('put') && stratLow.includes('credit'))) {
-    const sell = sellStrikes[0] || Math.max(...allStrikes);
-    const buy = buyStrikes[0] || Math.min(...allStrikes);
-    if (sell && buy) {
-      legs.push(makeLeg(sell, 'put', 'short'), makeLeg(buy, 'put', 'long'));
+  }
+  // Iron Butterfly
+  else if (stratLow.includes('iron butterfly') || stratLow.includes('iron fly')) {
+    const center = allStrikes[0] || Math.round(spotPrice);
+    const width = allStrikes.length >= 3 ? Math.abs(allStrikes[2] - allStrikes[0]) / 2 : 5;
+    legs.push(makeLeg(center - width, 'put', 'long'));
+    legs.push(makeLeg(center, 'put', 'short'));
+    legs.push(makeLeg(center, 'call', 'short'));
+    legs.push(makeLeg(center + width, 'call', 'long'));
+  }
+  // Bull Put Spread / Put Credit Spread
+  else if (stratLow.includes('bull put') || (stratLow.includes('put') && stratLow.includes('credit'))) {
+    const sell = sellStrikes[0]?.strike || Math.max(...allStrikes);
+    const buy = buyStrikes[0]?.strike || Math.min(...allStrikes);
+    if (sell && buy && isFinite(sell) && isFinite(buy)) {
+      legs.push(makeLeg(sell, 'put', 'short'));
+      legs.push(makeLeg(buy, 'put', 'long'));
     }
-  } else if (stratLow.includes('bear call') || (stratLow.includes('call') && stratLow.includes('credit'))) {
-    const sell = sellStrikes[0] || Math.min(...allStrikes);
-    const buy = buyStrikes[0] || Math.max(...allStrikes);
-    if (sell && buy) {
-      legs.push(makeLeg(sell, 'call', 'short'), makeLeg(buy, 'call', 'long'));
+  }
+  // Bear Call Spread / Call Credit Spread
+  else if (stratLow.includes('bear call') || (stratLow.includes('call') && stratLow.includes('credit'))) {
+    const sell = sellStrikes[0]?.strike || Math.min(...allStrikes);
+    const buy = buyStrikes[0]?.strike || Math.max(...allStrikes);
+    if (sell && buy && isFinite(sell) && isFinite(buy)) {
+      legs.push(makeLeg(sell, 'call', 'short'));
+      legs.push(makeLeg(buy, 'call', 'long'));
     }
-  } else if (stratLow.includes('bull call') || stratLow.includes('call debit')) {
-    const buy = buyStrikes[0] || Math.min(...allStrikes);
-    const sell = sellStrikes[0] || Math.max(...allStrikes);
-    if (buy && sell) {
-      legs.push(makeLeg(buy, 'call', 'long'), makeLeg(sell, 'call', 'short'));
+  }
+  // Bull Call Spread / Call Debit Spread
+  else if (stratLow.includes('bull call') || stratLow.includes('call debit')) {
+    const buy = buyStrikes[0]?.strike || Math.min(...allStrikes);
+    const sell = sellStrikes[0]?.strike || Math.max(...allStrikes);
+    if (buy && sell && isFinite(buy) && isFinite(sell)) {
+      legs.push(makeLeg(buy, 'call', 'long'));
+      legs.push(makeLeg(sell, 'call', 'short'));
     }
-  } else if (stratLow.includes('bear put') || stratLow.includes('put debit')) {
-    const buy = buyStrikes[0] || Math.max(...allStrikes);
-    const sell = sellStrikes[0] || Math.min(...allStrikes);
-    if (buy && sell) {
-      legs.push(makeLeg(buy, 'put', 'long'), makeLeg(sell, 'put', 'short'));
+  }
+  // Bear Put Spread / Put Debit Spread
+  else if (stratLow.includes('bear put') || stratLow.includes('put debit')) {
+    const buy = buyStrikes[0]?.strike || Math.max(...allStrikes);
+    const sell = sellStrikes[0]?.strike || Math.min(...allStrikes);
+    if (buy && sell && isFinite(buy) && isFinite(sell)) {
+      legs.push(makeLeg(buy, 'put', 'long'));
+      legs.push(makeLeg(sell, 'put', 'short'));
     }
-  } else if (stratLow.includes('straddle')) {
+  }
+  // Call Ratio Backspread: sell 1 lower, buy 2 higher
+  else if (stratLow.includes('ratio') && stratLow.includes('backspread') && stratLow.includes('call')) {
+    if (allStrikes.length >= 2) {
+      const sorted = [...allStrikes].sort((a, b) => a - b);
+      legs.push(makeLeg(sorted[0], 'call', 'short', 1));
+      legs.push(makeLeg(sorted[1], 'call', 'long', 2));
+    }
+  }
+  // Put Ratio Backspread: sell 1 higher, buy 2 lower
+  else if (stratLow.includes('ratio') && stratLow.includes('backspread') && stratLow.includes('put')) {
+    if (allStrikes.length >= 2) {
+      const sorted = [...allStrikes].sort((a, b) => a - b);
+      legs.push(makeLeg(sorted[1], 'put', 'short', 1));
+      legs.push(makeLeg(sorted[0], 'put', 'long', 2));
+    }
+  }
+  // Ratio Spread (generic): detect from buy/sell patterns
+  else if (stratLow.includes('ratio') && !stratLow.includes('backspread')) {
+    if (allStrikes.length >= 2) {
+      const sorted = [...allStrikes].sort((a, b) => a - b);
+      const type = stratLow.includes('put') ? 'put' : 'call';
+      if (type === 'call') {
+        legs.push(makeLeg(sorted[0], 'call', 'long', 1));
+        legs.push(makeLeg(sorted[1], 'call', 'short', 2));
+      } else {
+        legs.push(makeLeg(sorted[1], 'put', 'long', 1));
+        legs.push(makeLeg(sorted[0], 'put', 'short', 2));
+      }
+    }
+  }
+  // Jade Lizard: short put + bear call spread (short call + long higher call)
+  else if (stratLow.includes('jade lizard')) {
+    if (allStrikes.length >= 3) {
+      const sorted = [...allStrikes].sort((a, b) => a - b);
+      legs.push(makeLeg(sorted[0], 'put', 'short'));
+      legs.push(makeLeg(sorted[1], 'call', 'short'));
+      legs.push(makeLeg(sorted[2], 'call', 'long'));
+    }
+  }
+  // Straddle
+  else if (stratLow.includes('straddle')) {
     const strike = allStrikes[0] || Math.round(spotPrice);
-    legs.push(makeLeg(strike, 'call', 'long'), makeLeg(strike, 'put', 'long'));
-  } else if (stratLow.includes('strangle')) {
+    const side = stratLow.includes('short') || stratLow.includes('sell') ? 'short' : 'long';
+    legs.push(makeLeg(strike, 'call', side));
+    legs.push(makeLeg(strike, 'put', side));
+  }
+  // Strangle
+  else if (stratLow.includes('strangle')) {
     const putStrike = Math.min(...allStrikes) || Math.round(spotPrice * 0.97);
     const callStrike = Math.max(...allStrikes) || Math.round(spotPrice * 1.03);
-    legs.push(makeLeg(callStrike, 'call', 'long'), makeLeg(putStrike, 'put', 'long'));
-  } else {
-    // Fallback: single leg
+    const side = stratLow.includes('short') || stratLow.includes('sell') ? 'short' : 'long';
+    legs.push(makeLeg(callStrike, 'call', side));
+    legs.push(makeLeg(putStrike, 'put', side));
+  }
+  // Calendar / Diagonal Spread (same strike, different expirations)
+  else if (stratLow.includes('calendar') || stratLow.includes('diagonal')) {
     const strike = allStrikes[0] || Math.round(spotPrice);
-    const type = /put|bear/i.test(strategy) ? 'put' : 'call';
+    const type = stratLow.includes('put') ? 'put' : 'call';
+    // Front month: short, back month: long (standard calendar)
+    legs.push(makeLeg(strike, type as 'call' | 'put', 'short'));
+    // For the long leg, we'd ideally use a later expiration, but we use same for tracking
     legs.push(makeLeg(strike, type as 'call' | 'put', 'long'));
+  }
+  // Butterfly
+  else if (stratLow.includes('butterfly')) {
+    const type = stratLow.includes('put') ? 'put' : 'call';
+    if (allStrikes.length >= 3) {
+      const sorted = [...allStrikes].sort((a, b) => a - b);
+      legs.push(makeLeg(sorted[0], type as 'call' | 'put', 'long'));
+      legs.push(makeLeg(sorted[1], type as 'call' | 'put', 'short', 2));
+      legs.push(makeLeg(sorted[2], type as 'call' | 'put', 'long'));
+    }
+  }
+  // Cash-Secured Put / Naked Put / Short Put / Put Sale → SELL put
+  else if (
+    (stratLow.includes('cash') && stratLow.includes('put')) ||
+    stratLow.includes('naked put') ||
+    stratLow.includes('short put') ||
+    (stratLow.includes('put') && (stratLow.includes('sale') || stratLow.includes('sell') || stratLow.includes('write')))
+  ) {
+    const strike = allStrikes[0] || Math.round(spotPrice * 0.97);
+    legs.push(makeLeg(strike, 'put', 'short'));
+  }
+  // Covered Call / Naked Call / Short Call / Call Sale → SELL call
+  else if (
+    stratLow.includes('covered call') ||
+    stratLow.includes('naked call') ||
+    stratLow.includes('short call') ||
+    (stratLow.includes('call') && (stratLow.includes('sale') || stratLow.includes('sell') || stratLow.includes('write')))
+  ) {
+    const strike = allStrikes[0] || Math.round(spotPrice * 1.03);
+    legs.push(makeLeg(strike, 'call', 'short'));
+  }
+  // Explicit sell/buy patterns in strikes text
+  else if (sellStrikes.length > 0 || buyStrikes.length > 0) {
+    for (const s of sellStrikes) {
+      const type = s.type || (textLow.includes('put') ? 'put' : 'call');
+      legs.push(makeLeg(s.strike, type as 'call' | 'put', 'short'));
+    }
+    for (const b of buyStrikes) {
+      const type = b.type || (textLow.includes('put') ? 'put' : 'call');
+      legs.push(makeLeg(b.strike, type as 'call' | 'put', 'long'));
+    }
+  }
+  // Fallback: single leg — detect side from strategy name
+  else {
+    const strike = allStrikes[0] || Math.round(spotPrice);
+    const type = /put|bear/i.test(strategy + strikesText) ? 'put' : 'call';
+    // Detect if this is a short/sell position from strategy name
+    const isShort = /\b(sell|short|write|sale|credit|naked|covered)\b/i.test(strategy);
+    legs.push(makeLeg(strike, type as 'call' | 'put', isShort ? 'short' : 'long'));
   }
 
   return legs;
@@ -654,26 +830,60 @@ function parseLegsFromStrikesText(
 
 /**
  * Estimate max risk for a given position structure.
+ * Returns in dollar terms per contract(s).
  */
-function calculateMaxRisk(legs: TrackedLeg[], strategy: string): number {
+function calculateMaxRisk(legs: TrackedLeg[], strategy: string, spotPrice: number): number {
   const stratLow = strategy.toLowerCase();
-  const entryValue = calculatePositionValue(legs, 'entry');
 
-  if (stratLow.includes('debit') || stratLow.includes('straddle') || stratLow.includes('strangle')) {
-    // Max risk = debit paid
-    return Math.abs(entryValue);
-  }
+  // For defined-risk spreads, max risk = spread width × 100
+  const strikes = legs.map(l => l.strike).sort((a, b) => a - b);
+  const hasMultipleLegs = legs.length >= 2;
 
-  if (stratLow.includes('credit') || stratLow.includes('iron condor')) {
-    // Max risk = spread width * 100 - credit received
-    const strikes = legs.map(l => l.strike).sort((a, b) => a - b);
-    if (strikes.length >= 2) {
-      const maxSpreadWidth = strikes[strikes.length - 1] - strikes[0];
-      const perLegWidth = legs.length >= 4 ? (strikes[1] - strikes[0]) : maxSpreadWidth;
-      return perLegWidth * 100 + entryValue; // credit is negative entryValue
+  // Iron condor / iron butterfly: max risk = wider wing × 100
+  if (stratLow.includes('iron condor') || stratLow.includes('iron butterfly') || stratLow.includes('iron fly')) {
+    if (strikes.length >= 4) {
+      const putWingWidth = strikes[1] - strikes[0];
+      const callWingWidth = strikes[3] - strikes[2];
+      return Math.max(putWingWidth, callWingWidth) * 100;
     }
   }
 
-  // Fallback: entry cost as max risk
-  return Math.abs(entryValue);
+  // Vertical spreads (2 legs, same type): max risk = width × 100
+  if (hasMultipleLegs && strikes.length >= 2) {
+    const width = strikes[strikes.length - 1] - strikes[0];
+    if (width > 0 && width <= 100) { // sanity check
+      // Credit spreads: max risk = width - credit received
+      // Debit spreads: max risk = debit paid
+      // Since we don't know exact prices yet, use width as conservative max risk
+      return width * 100;
+    }
+  }
+
+  // Cash-secured put: max risk = strike × 100 (assigned at strike)
+  if (stratLow.includes('cash') && stratLow.includes('put')) {
+    const putStrike = strikes[0] || spotPrice;
+    return putStrike * 100;
+  }
+
+  // Naked put / short put
+  if ((stratLow.includes('naked') || stratLow.includes('short')) && stratLow.includes('put')) {
+    const putStrike = strikes[0] || spotPrice;
+    return putStrike * 100;
+  }
+
+  // Single long option: max risk = premium paid (unknown, estimate from spot)
+  if (legs.length === 1 && legs[0].side === 'long') {
+    // Conservative estimate: ~3% of spot price per contract for near-ATM
+    return spotPrice * 0.03 * 100;
+  }
+
+  // Straddle/strangle: max risk = total premium paid
+  if (stratLow.includes('straddle') || stratLow.includes('strangle')) {
+    if (legs.every(l => l.side === 'long')) {
+      return spotPrice * 0.04 * 100; // ~4% of spot for straddle premium
+    }
+  }
+
+  // Fallback: conservative estimate based on spot
+  return spotPrice * 0.05 * 100;
 }

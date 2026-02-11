@@ -208,13 +208,20 @@ function TradeRow({ trade, onRemove }: { trade: TrackedTrade; onRemove: (id: str
 
   // Calculate unrealized P/L for open trades using last price history entry
   const lastSnapshot = trade.priceHistory[trade.priceHistory.length - 1];
-  const currentValue = lastSnapshot?.positionValue ?? trade.entryDebit;
-  const unrealizedPL = currentValue && trade.entryDebit ? currentValue - trade.entryDebit : null;
-  const unrealizedPLPct = unrealizedPL && trade.maxRisk ? (unrealizedPL / Math.abs(trade.maxRisk)) * 100 : null;
+  const hasPricingData = trade.entryDebit !== null && trade.entryDebit !== 0 && trade.priceHistory.length > 0;
+  let unrealizedPL: number | null = null;
+  let unrealizedPLPct: number | null = null;
+
+  if (isOpen && hasPricingData && lastSnapshot) {
+    const currentValue = lastSnapshot.positionValue;
+    unrealizedPL = currentValue - (trade.entryDebit ?? 0);
+    unrealizedPLPct = trade.maxRisk && trade.maxRisk !== 0 ? (unrealizedPL / Math.abs(trade.maxRisk)) * 100 : null;
+  }
 
   const displayPL = isOpen ? unrealizedPL : trade.realizedPL;
   const displayPLPct = isOpen ? unrealizedPLPct : trade.realizedPLPct;
   const plColor = (displayPL ?? 0) >= 0 ? 'text-accent-green' : 'text-accent-red';
+  const awaitingPrices = isOpen && !hasPricingData;
 
   const holdDays = trade.enteredAt
     ? ((trade.exitedAt ?? Date.now()) - trade.enteredAt) / (1000 * 60 * 60 * 24)
@@ -247,7 +254,9 @@ function TradeRow({ trade, onRemove }: { trade: TrackedTrade; onRemove: (id: str
 
         {/* P/L */}
         <div className="text-right w-20 shrink-0">
-          {displayPL !== null ? (
+          {awaitingPrices ? (
+            <span className="text-[10px] font-mono text-text-muted/60 animate-pulse">Pricing...</span>
+          ) : displayPL !== null ? (
             <>
               <div className={`text-xs font-mono font-semibold ${plColor}`}>
                 {displayPL >= 0 ? '+' : ''}{displayPLPct?.toFixed(1)}%
@@ -310,8 +319,10 @@ function TradeRow({ trade, onRemove }: { trade: TrackedTrade; onRemove: (id: str
                   <span className="text-text-secondary">{leg.optionType.toUpperCase()}</span>
                   <span className="text-accent-cyan">${leg.strike}</span>
                   <span className="text-text-muted">{leg.expiration}</span>
-                  <span className="text-text-muted ml-auto">Entry: ${leg.entryMid.toFixed(2)}</span>
-                  {leg.exitMid !== null && (
+                  <span className="text-text-muted ml-auto">
+                    {leg.entryMid > 0 ? `Entry: $${leg.entryMid.toFixed(2)}` : 'Awaiting entry price'}
+                  </span>
+                  {leg.exitMid !== null && leg.exitMid > 0 && (
                     <span className={`${(leg.exitMid - leg.entryMid) * (leg.side === 'long' ? 1 : -1) >= 0 ? 'text-accent-green' : 'text-accent-red'}`}>
                       Exit: ${leg.exitMid.toFixed(2)}
                     </span>
@@ -442,7 +453,13 @@ export default function TrackedTradesTab() {
   const [showAnalytics, setShowAnalytics] = useState(true);
   const [confirmRemoveAll, setConfirmRemoveAll] = useState(false);
 
-  // Load trades on mount
+  // Load trades on mount and refresh periodically (to pick up TrackerMonitor updates)
+  const refreshTrades = useCallback(() => {
+    const current = loadTrackedTrades();
+    setTrades(current);
+    setAnalytics(computeAnalytics(current));
+  }, []);
+
   useEffect(() => {
     setLoading(true);
     loadTrackedTradesWithSync().then(loaded => {
@@ -450,12 +467,13 @@ export default function TrackedTradesTab() {
       setAnalytics(computeAnalytics(loaded));
       setLoading(false);
     }).catch(() => {
-      const local = loadTrackedTrades();
-      setTrades(local);
-      setAnalytics(computeAnalytics(local));
+      refreshTrades();
       setLoading(false);
     });
-  }, []);
+    // Refresh every 30s to pick up TrackerMonitor background updates
+    const interval = setInterval(refreshTrades, 30000);
+    return () => clearInterval(interval);
+  }, [refreshTrades]);
 
   const handleRemove = useCallback((id: string) => {
     const updated = removeTrackedTrade(id);
