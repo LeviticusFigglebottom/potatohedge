@@ -243,6 +243,40 @@ function analyzeTicker(
   };
 }
 
+// ─── Single-Ticker Flow ──────────────────────────────────────
+
+/**
+ * Scan flow for a single ticker. Lighter weight than scanMarketFlow().
+ * Reuses cached data if available (ticker is in watchlist and cache is fresh).
+ */
+export async function scanTickerFlow(ticker: string): Promise<{ tickerFlow: TickerFlow; alerts: FlowAlert[] }> {
+  const empty = {
+    tickerFlow: { ticker, netPremium: 0, callPremium: 0, putPremium: 0, callVolume: 0, putVolume: 0, contractsActive: 0 },
+    alerts: [] as FlowAlert[],
+  };
+
+  if (!apiKey()) return empty;
+
+  // Check market flow cache — if ticker is in watchlist and cache is fresh, reuse
+  if (flowCache && Date.now() - flowCache.timestamp < CACHE_TTL) {
+    const cached = flowCache.result.perTickerFlow.find(tf => tf.ticker === ticker.toUpperCase());
+    if (cached) {
+      return {
+        tickerFlow: cached,
+        alerts: flowCache.result.alerts.filter(a => a.ticker === ticker.toUpperCase()),
+      };
+    }
+  }
+
+  try {
+    const snapshots = await fetchSnapshotPage(ticker);
+    if (snapshots.length === 0) return empty;
+    return analyzeTicker(ticker, snapshots);
+  } catch {
+    return empty;
+  }
+}
+
 // ─── Main Entry Point ───────────────────────────────────────
 
 export async function scanMarketFlow(): Promise<FlowResult> {

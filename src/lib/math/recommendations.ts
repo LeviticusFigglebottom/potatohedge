@@ -110,6 +110,14 @@ export interface RecommendationInput {
   shortInterest?: number;         // total shares short
   daysToCover?: number;           // SI / avg daily volume
   regSHOThreshold?: boolean;      // on Reg SHO threshold list (persistent FTDs)
+  // Optional: Options flow data (from Polygon)
+  flowNetPremium?: number;        // net premium for this ticker (positive = net call buying = bullish)
+  flowCallPremium?: number;       // total call premium
+  flowPutPremium?: number;        // total put premium
+  flowSentiment?: 'bullish' | 'bearish' | 'neutral';
+  flowAlertCount?: number;        // number of unusual flow alerts
+  flowSweepCount?: number;        // number of sweep detections
+  flowBlockCount?: number;        // number of block trades
 }
 
 // ─── Helpers ──────────────────────────────────────────────
@@ -528,6 +536,48 @@ function scoreSignals(input: RecommendationInput): Signal[] {
         description: `${input.daysToCover.toFixed(1)} days to cover — moderate short positioning`,
       });
     }
+  }
+
+  // 15. Options Flow — Institutional Positioning (from Polygon)
+  if (input.flowNetPremium !== undefined && input.flowNetPremium !== 0) {
+    const netM = input.flowNetPremium / 1e6;
+    const absNetM = Math.abs(netM);
+
+    // Weight scales with magnitude: $1M → 0.03, $10M → 0.10, $50M → 0.18, $100M+ → 0.22
+    const flowWeight = plerp(absNetM,
+      [0.5, 1, 5, 10, 50, 100],
+      [0.01, 0.03, 0.08, 0.12, 0.18, 0.22]
+    ) * (input.flowNetPremium > 0 ? 1 : -1);
+
+    if (Math.abs(flowWeight) > 0.01) {
+      const dir: Direction = flowWeight > 0 ? 'bullish' : 'bearish';
+      const callM = (input.flowCallPremium || 0) / 1e6;
+      const putM = (input.flowPutPremium || 0) / 1e6;
+
+      let detail = `Net premium: ${netM > 0 ? '+' : ''}$${netM.toFixed(1)}M`;
+      if (callM > 0 || putM > 0) detail += ` (C: $${callM.toFixed(1)}M / P: $${putM.toFixed(1)}M)`;
+
+      const sweepNote = (input.flowSweepCount || 0) > 0 ? `, ${input.flowSweepCount} sweeps detected` : '';
+      const blockNote = (input.flowBlockCount || 0) > 0 ? `, ${input.flowBlockCount} block trades` : '';
+
+      signals.push({
+        name: 'Options Flow',
+        direction: dir,
+        weight: flowWeight,
+        description: `${detail}${sweepNote}${blockNote} — ${dir === 'bullish' ? 'institutional call buying dominates' : 'institutional put buying / hedging dominates'}`,
+      });
+    }
+  }
+
+  // 16. Flow Alerts — unusual activity confirmation
+  if ((input.flowAlertCount || 0) >= 3 && input.flowSentiment && input.flowSentiment !== 'neutral') {
+    const alertDir: Direction = input.flowSentiment;
+    signals.push({
+      name: 'Unusual Flow Activity',
+      direction: alertDir,
+      weight: alertDir === 'bullish' ? 0.05 : -0.05,
+      description: `${input.flowAlertCount} unusual flow alerts with ${alertDir} sentiment — confirms institutional positioning`,
+    });
   }
 
   return signals;

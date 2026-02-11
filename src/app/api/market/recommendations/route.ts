@@ -17,6 +17,7 @@ import {
 import { generateRecommendations } from '@/lib/math/recommendations';
 import { getSwapDataForTicker } from '@/lib/providers/dtcc';
 import { fetchRegSHOThreshold, getShortInterestForTicker } from '@/lib/providers/finra';
+import { scanTickerFlow } from '@/lib/providers/polygonFlow';
 
 export const maxDuration = 30;
 
@@ -199,10 +200,12 @@ export async function GET(request: NextRequest) {
     const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
       Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 
-    const [swapData, regSHOSet, siData] = await Promise.all([
+    const emptyFlow = { tickerFlow: { ticker, netPremium: 0, callPremium: 0, putPremium: 0, callVolume: 0, putVolume: 0, contractsActive: 0 }, alerts: [] as { tradeType: string; sentiment: string }[] };
+    const [swapData, regSHOSet, siData, flowData] = await Promise.all([
       raceTimeout(getSwapDataForTicker(ticker).catch(() => null), 4000, null),
       raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
       raceTimeout(getShortInterestForTicker(ticker).catch(() => null), 5000, null),
+      raceTimeout(scanTickerFlow(ticker).catch(() => emptyFlow), 5000, emptyFlow),
     ]);
 
     const input = {
@@ -244,6 +247,14 @@ export async function GET(request: NextRequest) {
       shortInterest: siData?.shortInterest,
       daysToCover: siData?.daysToCover,
       regSHOThreshold: regSHOSet.has(ticker),
+      // Options flow data
+      flowNetPremium: flowData.tickerFlow.netPremium || undefined,
+      flowCallPremium: flowData.tickerFlow.callPremium || undefined,
+      flowPutPremium: flowData.tickerFlow.putPremium || undefined,
+      flowSentiment: flowData.tickerFlow.netPremium > 0 ? 'bullish' as const : flowData.tickerFlow.netPremium < 0 ? 'bearish' as const : undefined,
+      flowAlertCount: flowData.alerts.length || undefined,
+      flowSweepCount: flowData.alerts.filter(a => a.tradeType === 'sweep').length || undefined,
+      flowBlockCount: flowData.alerts.filter(a => a.tradeType === 'block').length || undefined,
     };
 
     const recommendations = generateRecommendations(input);

@@ -494,6 +494,75 @@ Be opinionated and direct. Use **bold** for key names, levels, and directional c
   return prompt;
 }
 
+// ─── Parse Claude's trade ideas from narrative text ──────────
+
+interface AITradeIdea {
+  title: string;
+  ticker: string;
+  direction: string;
+  strategy: string;
+  strikes: string;
+  expiration: string;
+  entry: string;
+  target: string;
+  stopMaxLoss: string;
+  thesis: string;
+  invalidation: string;
+}
+
+function parseAITradeIdeas(text: string): AITradeIdea[] {
+  const ideas: AITradeIdea[] = [];
+
+  // Find the OPTIONS TRADE IDEAS section
+  const sectionMatch = text.match(/(?:OPTIONS?\s+TRADE\s+IDEAS?|TRADE\s+IDEAS?)\s*[-—]*\s*\n/i);
+  if (!sectionMatch) return ideas;
+
+  const sectionStart = sectionMatch.index! + sectionMatch[0].length;
+  // Section ends at next ## heading or end of text
+  const nextSection = text.slice(sectionStart).match(/\n##\s/);
+  const sectionText = nextSection
+    ? text.slice(sectionStart, sectionStart + nextSection.index!)
+    : text.slice(sectionStart);
+
+  // Split by numbered trade ideas: "1.", "2.", "3.", etc.
+  const tradeBlocks = sectionText.split(/\n\s*(?=\d+\.\s+)/);
+
+  for (const block of tradeBlocks) {
+    const trimmed = block.trim();
+    if (!trimmed || !/^\d+\.\s/.test(trimmed)) continue;
+
+    // Extract title (first line after the number)
+    const titleMatch = trimmed.match(/^\d+\.\s+(.+)/);
+    const title = titleMatch ? titleMatch[1].replace(/\*\*/g, '').trim() : '';
+
+    // Helper: extract a field value from "**FieldName:** value" or "FieldName: value"
+    const field = (name: string): string => {
+      const re = new RegExp(`\\*{0,2}${name}[:\\s]*\\*{0,2}\\s*(.+)`, 'i');
+      const m = trimmed.match(re);
+      return m ? m[1].replace(/\*\*/g, '').trim() : '';
+    };
+
+    const ticker = field('Ticker');
+    if (!ticker || !/^[A-Z]{1,5}$/.test(ticker)) continue;
+
+    ideas.push({
+      title,
+      ticker,
+      direction: field('Direction'),
+      strategy: field('Strategy'),
+      strikes: field('Strike'),
+      expiration: field('Expiration'),
+      entry: field('Entry'),
+      target: field('Target'),
+      stopMaxLoss: field('Stop') || field('Max Loss'),
+      thesis: field('Thesis'),
+      invalidation: field('Invalidation'),
+    });
+  }
+
+  return ideas;
+}
+
 export async function POST() {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -640,6 +709,26 @@ export async function POST() {
       .sort((a, b) => b.score - a.score)
       .slice(0, 15);
 
+    // Parse Claude's AI-generated trade ideas from the narrative
+    const parsedAIIdeas = parseAITradeIdeas(text);
+
+    // Enrich parsed AI ideas with stock scan data (expiration, spot price, levels)
+    const aiTradeIdeas = parsedAIIdeas.map(ai => {
+      const scan = results.find(s => s.symbol === ai.ticker);
+      return {
+        ...ai,
+        spot: scan?.price ?? 0,
+        nearestExp: scan?.nearestExp ?? '',
+        nearestDTE: scan?.nearestDTE ?? 0,
+        gammaFlip: scan?.gammaFlip ?? null,
+        callWall: scan?.callWall ?? null,
+        putWall: scan?.putWall ?? null,
+        ivRank: scan?.ivRank ?? 0,
+        biasScore: scan?.biasScore ?? 0,
+        bias: scan?.bias ?? 'neutral',
+      };
+    });
+
     return NextResponse.json({
       analysis: text,
       stocksScanned: results.length,
@@ -647,6 +736,7 @@ export async function POST() {
       indices: results.filter(r => INDICES.includes(r.symbol)),
       vix: vixPrice,
       tradeIdeas,
+      aiTradeIdeas,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error ?? 'Unknown error');
