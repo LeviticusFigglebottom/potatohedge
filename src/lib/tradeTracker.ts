@@ -685,7 +685,18 @@ export function buildTrackedTradeFromAlgo(params: {
   const expirationDate = nearestExp;
 
   // Build basic legs from strikes text if not provided
-  const parsedLegs: TrackedLeg[] = legs ?? parseLegsFromStrikesText(symbol, trade.strikes, trade.strategy, expirationDate, spotPrice);
+  let parsedLegs: TrackedLeg[] = legs ?? parseLegsFromStrikesText(symbol, trade.strikes, trade.strategy, expirationDate, spotPrice);
+
+  // Auto-size if all legs have qty=1 (no explicit sizing in the text).
+  // The algo recommendations include "Nx" in strikes text which parseLegsFromStrikesText respects.
+  // AI trade ideas typically don't include sizing, so we apply portfolio-based sizing here.
+  const allQtyOne = parsedLegs.length > 0 && parsedLegs.every(l => l.quantity === 1);
+  if (allQtyOne) {
+    const optimalQty = sizePosition(parsedLegs, trade.strategy, spotPrice);
+    if (optimalQty > 1) {
+      parsedLegs = parsedLegs.map(l => ({ ...l, quantity: optimalQty }));
+    }
+  }
 
   // Calculate max risk (entry prices are 0 until TrackerMonitor fills them)
   const maxRisk = calculateMaxRisk(parsedLegs, trade.strategy, spotPrice);
@@ -1056,6 +1067,74 @@ function calculateMaxRisk(legs: TrackedLeg[], strategy: string, spotPrice: numbe
 
   // Fallback: conservative estimate based on spot
   return spotPrice * 0.05 * 100 * qty;
+}
+
+// ─── Position Sizing ─────────────────────────────────────
+
+const PORTFOLIO_SIZE = 100_000;
+const MAX_ALLOCATION_PCT = 0.05; // 5% of portfolio per trade
+const MIN_ALLOCATION_PCT = 0.01; // 1% minimum per trade
+const MAX_CONTRACTS = 10;
+
+/**
+ * Calculate the per-contract max risk for a given set of legs.
+ * Returns the max risk in dollars for ONE contract of the position.
+ */
+export function maxRiskPerContract(legs: TrackedLeg[], strategy: string, spotPrice: number): number {
+  const stratLow = strategy.toLowerCase();
+  const strikes = legs.map(l => l.strike).sort((a, b) => a - b);
+
+  // Iron condor: wider wing width × 100
+  if (stratLow.includes('iron condor') || stratLow.includes('iron butterfly') || stratLow.includes('iron fly')) {
+    if (strikes.length >= 4) {
+      const putWing = strikes[1] - strikes[0];
+      const callWing = strikes[3] - strikes[2];
+      return Math.max(putWing, callWing) * 100;
+    }
+  }
+
+  // Vertical spreads: width × 100
+  if (legs.length >= 2 && strikes.length >= 2) {
+    const width = strikes[strikes.length - 1] - strikes[0];
+    if (width > 0 && width <= 100) return width * 100;
+  }
+
+  // Cash-secured/naked puts: strike × 100
+  if ((stratLow.includes('cash') || stratLow.includes('naked') || stratLow.includes('short')) && stratLow.includes('put')) {
+    return (strikes[0] || spotPrice) * 100;
+  }
+
+  // Single long option: estimate ~3% of spot × 100
+  if (legs.length === 1 && legs[0].side === 'long') {
+    return spotPrice * 0.03 * 100;
+  }
+
+  // Straddle/strangle: ~4% of spot × 100
+  if (stratLow.includes('straddle') || stratLow.includes('strangle')) {
+    return spotPrice * 0.04 * 100;
+  }
+
+  // Fallback: 5% of spot × 100
+  return spotPrice * 0.05 * 100;
+}
+
+/**
+ * Calculate optimal contract quantity for a trade, targeting 1-5% of portfolio.
+ * Returns at least 1, at most MAX_CONTRACTS.
+ */
+export function sizePosition(legs: TrackedLeg[], strategy: string, spotPrice: number): number {
+  const riskPer = maxRiskPerContract(legs, strategy, spotPrice);
+  if (riskPer <= 0) return 1;
+
+  const maxAllocation = PORTFOLIO_SIZE * MAX_ALLOCATION_PCT; // $5,000
+  const minAllocation = PORTFOLIO_SIZE * MIN_ALLOCATION_PCT; // $1,000
+
+  // Target: fill up to max allocation
+  const targetQty = Math.floor(maxAllocation / riskPer);
+  // Floor: at least meet min allocation
+  const minQty = Math.ceil(minAllocation / riskPer);
+
+  return Math.max(1, Math.min(MAX_CONTRACTS, Math.max(minQty, targetQty)));
 }
 
 // ─── Purge Helpers ────────────────────────────────────────
