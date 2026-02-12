@@ -1197,7 +1197,8 @@ export function hasAdequatePremium(
 const PORTFOLIO_SIZE = 100_000;
 const MAX_ALLOCATION_PCT = 0.05; // 5% of portfolio per trade
 const MIN_ALLOCATION_PCT = 0.01; // 1% minimum per trade
-const MAX_CONTRACTS = 10;
+const MAX_CONTRACTS_SINGLE = 10; // Cap for naked/single-leg (unlimited downside)
+const MAX_CONTRACTS_SPREAD = 20; // Higher cap for defined-risk spreads
 
 /**
  * Calculate the per-contract max risk for a given set of legs.
@@ -1244,11 +1245,15 @@ export function maxRiskPerContract(legs: TrackedLeg[], strategy: string, spotPri
 /**
  * Calculate optimal contract quantity for a trade, targeting 1-5% of portfolio.
  * Also enforces minimum position value ($100 per contract notional).
- * Returns at least 1, at most MAX_CONTRACTS.
+ * Defined-risk spreads allow up to 20 contracts; naked/single-leg capped at 10.
  */
 export function sizePosition(legs: TrackedLeg[], strategy: string, spotPrice: number): number {
   const riskPer = maxRiskPerContract(legs, strategy, spotPrice);
   if (riskPer <= 0) return 1;
+
+  // Defined-risk (spreads) can size more aggressively since max loss is capped
+  const isDefinedRisk = legs.length >= 2 && legs.some(l => l.side === 'long') && legs.some(l => l.side === 'short');
+  const maxContracts = isDefinedRisk ? MAX_CONTRACTS_SPREAD : MAX_CONTRACTS_SINGLE;
 
   const maxAllocation = PORTFOLIO_SIZE * MAX_ALLOCATION_PCT; // $5,000
   const minAllocation = PORTFOLIO_SIZE * MIN_ALLOCATION_PCT; // $1,000
@@ -1258,15 +1263,18 @@ export function sizePosition(legs: TrackedLeg[], strategy: string, spotPrice: nu
   // Floor: at least meet min allocation
   const minQty = Math.ceil(minAllocation / riskPer);
 
-  let qty = Math.max(1, Math.min(MAX_CONTRACTS, Math.max(minQty, targetQty)));
+  let qty = Math.max(1, Math.min(maxContracts, Math.max(minQty, targetQty)));
 
   // Enforce minimum position value: if we have entry prices, check that
   // total position notional per contract ≥ $100 ($1.00 × 100 shares).
   // If premium is too low, reduce qty to 1 (the trade itself is suspect).
-  const avgMid = legs.filter(l => l.entryMid > 0).reduce((s, l) => s + l.entryMid, 0) / Math.max(1, legs.filter(l => l.entryMid > 0).length);
-  if (avgMid > 0 && avgMid < MIN_PREMIUM_PER_CONTRACT) {
-    // Penny options — sizing won't help, just use 1 contract
-    qty = 1;
+  const pricedLegs = legs.filter(l => l.entryMid > 0);
+  if (pricedLegs.length > 0) {
+    const avgMid = pricedLegs.reduce((s, l) => s + l.entryMid, 0) / pricedLegs.length;
+    if (avgMid < MIN_PREMIUM_PER_CONTRACT) {
+      // Penny options — sizing won't help, just use 1 contract
+      qty = 1;
+    }
   }
 
   return qty;

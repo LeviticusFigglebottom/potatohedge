@@ -388,6 +388,101 @@ function QuickTradeForm({ onSubmit, onClose }: {
   );
 }
 
+// ─── Spread Grouping Helper ─────────────────────────────────
+
+interface SpreadGroup {
+  id: string;
+  strategy: string;
+  thesis: string;
+  underlying: string;
+  legs: Position[];
+  netCostBasis: number;
+  netCurrentValue: number;
+  netPL: number;
+  netPLPct: number;
+  rule: TradeRule | undefined;
+  spreadLabel: string;
+}
+
+/** Group positions into spreads using trade rules. Ungrouped positions stay as single-leg groups. */
+function groupPositionsIntoSpreads(positions: Position[]): SpreadGroup[] {
+  const rules = loadRules();
+  const assigned = new Set<number>(); // position IDs already assigned to a group
+  const groups: SpreadGroup[] = [];
+
+  // First pass: group by trade rules
+  for (const rule of rules) {
+    const ruleSymbols = new Set(rule.occSymbols || (rule.occSymbol ? [rule.occSymbol] : []));
+    if (ruleSymbols.size === 0) continue;
+
+    const matched = positions.filter(p => ruleSymbols.has(p.symbol) && !assigned.has(p.id));
+    if (matched.length === 0) continue;
+
+    for (const p of matched) assigned.add(p.id);
+
+    const netCost = matched.reduce((s, p) => s + p.cost_basis, 0);
+    const netCurrentValue = matched.reduce((s, p) => {
+      const sign = p.quantity > 0 ? 1 : -1;
+      return s + p.currentPrice * Math.abs(p.quantity) * 100 * sign;
+    }, 0);
+    const netPL = matched.reduce((s, p) => s + p.unrealizedPL, 0);
+    const absNetCost = Math.abs(netCost);
+    const netPLPct = absNetCost > 0 ? (netPL / absNetCost) * 100 : 0;
+
+    // Build spread label like "AAPL Bull Call $260/$265 ×10"
+    const underlying = rule.underlying || matched[0]?.parsed?.underlying || '';
+    const strikes = matched
+      .map(p => p.parsed?.strike)
+      .filter((s): s is number => s !== undefined)
+      .sort((a, b) => a - b);
+    const qty = Math.max(...matched.map(p => Math.abs(p.quantity)));
+    const strikesStr = strikes.map(s => `$${s}`).join('/');
+    const strategyClean = rule.strategy.replace(/^\[AI\]\s*/, '');
+    const spreadLabel = `${underlying} ${strategyClean} ${strikesStr} ×${qty}`;
+
+    groups.push({
+      id: rule.id,
+      strategy: rule.strategy,
+      thesis: rule.thesis,
+      underlying,
+      legs: matched,
+      netCostBasis: netCost,
+      netCurrentValue,
+      netPL,
+      netPLPct,
+      rule,
+      spreadLabel,
+    });
+  }
+
+  // Second pass: ungrouped positions become single-leg groups
+  for (const p of positions) {
+    if (assigned.has(p.id)) continue;
+    const rule = getRuleForSymbol(p.symbol);
+    const underlying = p.parsed?.underlying || '';
+    const strike = p.parsed?.strike || 0;
+    const type = p.parsed?.type === 'C' ? 'Call' : 'Put';
+    const side = p.quantity > 0 ? 'Long' : 'Short';
+    const spreadLabel = `${underlying} ${side} $${strike} ${type} ×${Math.abs(p.quantity)}`;
+
+    groups.push({
+      id: `single-${p.id}`,
+      strategy: rule?.strategy || 'Single',
+      thesis: rule?.thesis || '',
+      underlying,
+      legs: [p],
+      netCostBasis: p.cost_basis,
+      netCurrentValue: p.currentValue * (p.quantity > 0 ? 1 : -1),
+      netPL: p.unrealizedPL,
+      netPLPct: p.unrealizedPLPct,
+      rule,
+      spreadLabel,
+    });
+  }
+
+  return groups;
+}
+
 // ─── Main Component ─────────────────────────────────────────
 
 export default function PaperTradingTab() {
@@ -671,95 +766,143 @@ export default function PaperTradingTab() {
       {/* Quick Trade Form */}
       {showForm && <QuickTradeForm onSubmit={handleTrade} onClose={() => setShowForm(false)} />}
 
-      {/* Open Positions */}
-      <div className="panel">
-        <div className="panel-header">
-          <span className="panel-title flex items-center gap-2">
-            <DollarSign className="w-4 h-4 text-accent-cyan" />
-            Open Positions ({positions.length})
-          </span>
-        </div>
-        {positions.length === 0 ? (
-          <div className="px-4 pb-4 text-sm text-text-muted font-mono">No open positions</div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-border/30">
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Contract</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Qty</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Entry</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Current</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">P&L</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Target / Stop</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {positions.map(p => {
-                  const rule = getRuleForSymbol(p.symbol);
+      {/* Open Positions — grouped by spread */}
+      {(() => {
+        const spreadGroups = groupPositionsIntoSpreads(positions);
+        return (
+          <div className="panel">
+            <div className="panel-header">
+              <span className="panel-title flex items-center gap-2">
+                <DollarSign className="w-4 h-4 text-accent-cyan" />
+                Open Positions ({spreadGroups.length} spread{spreadGroups.length !== 1 ? 's' : ''}, {positions.length} leg{positions.length !== 1 ? 's' : ''})
+              </span>
+            </div>
+            {spreadGroups.length === 0 ? (
+              <div className="px-4 pb-4 text-sm text-text-muted font-mono">No open positions</div>
+            ) : (
+              <div className="space-y-0">
+                {spreadGroups.map(group => {
+                  const isMultiLeg = group.legs.length > 1;
                   return (
-                    <tr key={p.id} className="border-b border-border/10 hover:bg-bg-hover/50">
-                      <td className="px-3 py-2">
-                        <div className="font-mono text-text-primary font-semibold">{fmtOCC(p.parsed, p.symbol)}</div>
-                        {rule?.strategy && rule.strategy !== 'Manual' && <div className="text-[10px] text-accent-cyan/60 font-mono">{rule.strategy}</div>}
-                        {rule?.thesis && <div className="text-[10px] text-text-muted truncate max-w-[200px]">{rule.thesis}</div>}
-                      </td>
-                      <td className={`px-3 py-2 font-mono ${p.quantity > 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {p.quantity > 0 ? '+' : ''}{p.quantity}
-                      </td>
-                      <td className="px-3 py-2 font-mono text-text-secondary">{fmtMoney(p.costPerContract)}</td>
-                      <td className="px-3 py-2 font-mono text-text-primary">
-                        {p.currentPrice > 0 ? fmtMoney(p.currentPrice) : '—'}
-                        <div className="text-[10px] text-text-muted">{p.bid > 0 ? `${fmtMoney(p.bid)}/${fmtMoney(p.ask)}` : ''}</div>
-                      </td>
-                      <td className="px-3 py-2">
-                        {p.currentPrice > 0 ? (
-                          <PLBadge value={p.unrealizedPL} pct={p.unrealizedPLPct} />
-                        ) : (
-                          <span className="text-text-muted text-xs">—</span>
-                        )}
-                      </td>
-                      <td className="px-3 py-2">
-                        <ExitProgress
-                          rule={rule}
-                          plPct={p.unrealizedPLPct}
-                        />
-                      </td>
-                      <td className="px-3 py-2">
-                        <div className="flex items-center gap-1">
-                          <button
-                            onClick={() => setEditingRule(editingRule === p.symbol ? null : p.symbol)}
-                            className="text-xs font-mono text-accent-cyan hover:text-accent-cyan/80 px-1.5 py-0.5"
-                            title="Set exit rules"
-                          >
-                            <Target className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            onClick={() => handleManualClose(p)}
-                            className="text-xs text-red-400 hover:text-red-300 font-mono px-1.5 py-0.5"
-                            title="Close position"
-                          >
-                            Close
-                          </button>
+                    <div key={group.id} className="border-b border-border/10 hover:bg-bg-hover/30 transition-colors">
+                      {/* Spread summary row */}
+                      <div className="px-4 py-3 flex items-center justify-between gap-4">
+                        <div className="flex-1 min-w-0">
+                          <div className="font-mono text-text-primary font-semibold text-sm">
+                            {group.spreadLabel}
+                          </div>
+                          {group.strategy && group.strategy !== 'Single' && group.strategy !== 'Manual' && (
+                            <div className="text-[10px] text-accent-cyan/70 font-mono mt-0.5">{group.strategy}</div>
+                          )}
+                          {group.thesis && <div className="text-[10px] text-text-muted truncate max-w-[300px] mt-0.5">{group.thesis}</div>}
                         </div>
-                        {editingRule === p.symbol && (
+
+                        <div className="flex items-center gap-4 flex-shrink-0">
+                          {/* Net cost basis */}
+                          <div className="text-right">
+                            <div className="text-[10px] text-text-muted font-mono">Net Cost</div>
+                            <div className={`text-xs font-mono font-semibold ${group.netCostBasis >= 0 ? 'text-text-secondary' : 'text-green-400'}`}>
+                              {group.netCostBasis >= 0 ? fmtMoney(group.netCostBasis) : `${fmtMoney(Math.abs(group.netCostBasis))} cr`}
+                            </div>
+                          </div>
+
+                          {/* Net P/L */}
+                          <div className="text-right min-w-[120px]">
+                            <div className="text-[10px] text-text-muted font-mono">Net P&L</div>
+                            <PLBadge value={group.netPL} pct={group.netPLPct} />
+                          </div>
+
+                          {/* Exit progress */}
+                          <div className="min-w-[130px]">
+                            <ExitProgress rule={group.rule} plPct={group.netPLPct} />
+                          </div>
+
+                          {/* Actions */}
+                          <div className="flex items-center gap-1">
+                            {group.legs.length > 0 && (
+                              <>
+                                <button
+                                  onClick={() => setEditingRule(editingRule === group.id ? null : group.id)}
+                                  className="text-xs font-mono text-accent-cyan hover:text-accent-cyan/80 px-1.5 py-0.5"
+                                  title="Edit exit rules"
+                                >
+                                  <Target className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  onClick={async () => {
+                                    for (const leg of group.legs) {
+                                      await handleManualClose(leg);
+                                    }
+                                  }}
+                                  className="text-xs text-red-400 hover:text-red-300 font-mono px-1.5 py-0.5"
+                                  title="Close all legs"
+                                >
+                                  Close
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Individual leg details (shown for multi-leg spreads) */}
+                      {isMultiLeg && (
+                        <div className="px-4 pb-2">
+                          <table className="w-full text-xs">
+                            <tbody>
+                              {group.legs.map(p => (
+                                <tr key={p.id} className="text-text-muted">
+                                  <td className="py-0.5 font-mono w-1/3">
+                                    <span className={p.quantity > 0 ? 'text-green-400/70' : 'text-red-400/70'}>
+                                      {p.quantity > 0 ? 'BUY' : 'SELL'}
+                                    </span>
+                                    {' '}{fmtOCC(p.parsed, p.symbol)}
+                                  </td>
+                                  <td className="py-0.5 font-mono text-center">
+                                    <span className={p.quantity > 0 ? 'text-green-400/60' : 'text-red-400/60'}>
+                                      {p.quantity > 0 ? '+' : ''}{p.quantity}
+                                    </span>
+                                  </td>
+                                  <td className="py-0.5 font-mono text-right">
+                                    Entry: {fmtMoney(p.costPerContract)}
+                                  </td>
+                                  <td className="py-0.5 font-mono text-right">
+                                    Now: {p.currentPrice > 0 ? fmtMoney(p.currentPrice) : '—'}
+                                    {p.bid > 0 && <span className="text-text-muted/50"> ({fmtMoney(p.bid)}/{fmtMoney(p.ask)})</span>}
+                                  </td>
+                                  <td className="py-0.5 font-mono text-right">
+                                    {p.currentPrice > 0 ? (
+                                      <span className={p.unrealizedPL >= 0 ? 'text-green-400/60' : 'text-red-400/60'}>
+                                        {p.unrealizedPL >= 0 ? '+' : ''}{fmtMoney(p.unrealizedPL)}
+                                      </span>
+                                    ) : '—'}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+
+                      {/* Inline edit rule form */}
+                      {editingRule === group.id && group.legs.length > 0 && (
+                        <div className="px-4 pb-3">
                           <EditRuleForm
-                            position={p}
-                            rule={rule}
+                            position={group.legs[0]}
+                            rule={group.rule}
                             onSave={saveRule}
                             onClose={() => setEditingRule(null)}
                           />
-                        )}
-                      </td>
-                    </tr>
+                        </div>
+                      )}
+                    </div>
                   );
                 })}
-              </tbody>
-            </table>
+              </div>
+            )}
           </div>
-        )}
-      </div>
+        );
+      })()}
 
       {/* Open Orders */}
       {openOrders.length > 0 && (
