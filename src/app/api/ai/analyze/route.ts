@@ -144,7 +144,13 @@ export async function POST(request: NextRequest) {
     flow: { netCallPremium: 0, netPutPremium: 0, netPremium: 0, totalCallVolume: 0, totalPutVolume: 0, putCallRatio: 0, sentiment: 'neutral', tickersScanned: 0, contractsAnalyzed: 0 },
     alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
   };
-  const flowResult = await scanMarketFlow().catch(() => emptyFlow);
+
+  // Fetch flow, VIX, and basic earnings data in parallel for trade mode
+  const [flowResult, vixData, earningsContext] = await Promise.all([
+    scanMarketFlow().catch(() => emptyFlow),
+    fetchVIXContext().catch(() => null),
+    data.mode !== 'fundamental' ? fetchEarningsContext(data.symbol).catch(() => null) : Promise.resolve(null),
+  ]);
 
   // For fundamental mode, fetch live financial data first
   let fundamentals: FundamentalData | null = null;
@@ -156,7 +162,7 @@ export async function POST(request: NextRequest) {
   const hasYahooData = !!(fundamentals && fundamentals.marketCap);
   const prompt = data.mode === 'fundamental'
     ? buildFundamentalPrompt(data, fundamentals)
-    : buildPrompt(data, flowResult);
+    : buildPrompt(data, flowResult, vixData, earningsContext);
 
   // Enable Claude web search when doing fundamental analysis without Yahoo data
   // This lets Claude search the web for current financial metrics itself
@@ -481,7 +487,99 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
 
 // ─── Prompt Builders ──────────────────────────────────────────
 
-function buildPrompt(d: AnalysisRequest, flow?: FlowResult): string {
+// ─── VIX Context (quick Tradier quote) ─────────────────────
+
+interface VIXContext { price: number; changePct: number; level: string }
+
+async function fetchVIXContext(): Promise<VIXContext | null> {
+  const token = process.env.TRADIER_API_KEY;
+  if (!token) return null;
+  const baseUrl = process.env.TRADIER_SANDBOX === 'true'
+    ? 'https://sandbox.tradier.com/v1'
+    : 'https://api.tradier.com/v1';
+  const res = await fetch(`${baseUrl}/markets/quotes?symbols=VIX&greeks=false`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const q = data.quotes?.quote;
+  if (!q) return null;
+  const price = q.last ?? q.bid ?? 0;
+  const prevClose = q.prevclose ?? q.close ?? price;
+  const changePct = prevClose > 0 ? ((price - prevClose) / prevClose) * 100 : 0;
+  const level = price > 30 ? 'EXTREME FEAR' : price > 25 ? 'HIGH FEAR' : price > 20 ? 'ELEVATED' : price > 15 ? 'MODERATE' : 'LOW / COMPLACENT';
+  return { price, changePct, level };
+}
+
+// ─── Earnings Context (quick Yahoo fetch) ──────────────────
+
+interface EarningsContext {
+  nextEarningsDate: string | null;
+  daysToEarnings: number | null;
+  lastQuarterSurprise: string | null;
+  earningsImpact: string;
+}
+
+async function fetchEarningsContext(symbol: string): Promise<EarningsContext | null> {
+  try {
+    // Quick Yahoo Finance summary fetch for earnings dates
+    const res = await fetch(
+      `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=calendarEvents,earningsHistory`,
+      { signal: AbortSignal.timeout(5000), headers: { 'User-Agent': 'Mozilla/5.0' } }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const result = data?.quoteSummary?.result?.[0];
+    if (!result) return null;
+
+    // Next earnings date
+    const earningsDates = result.calendarEvents?.earnings?.earningsDate;
+    let nextDate: string | null = null;
+    let daysTo: number | null = null;
+    if (earningsDates && earningsDates.length > 0) {
+      const raw = earningsDates[0]?.raw ?? earningsDates[0]?.fmt;
+      if (typeof raw === 'number') {
+        nextDate = new Date(raw * 1000).toISOString().slice(0, 10);
+      } else if (typeof raw === 'string') {
+        nextDate = raw;
+      }
+      if (nextDate) {
+        daysTo = Math.round((new Date(nextDate).getTime() - Date.now()) / 86400000);
+      }
+    }
+
+    // Last quarter surprise
+    let lastSurprise: string | null = null;
+    const history = result.earningsHistory?.history;
+    if (history && history.length > 0) {
+      const last = history[history.length - 1];
+      const pct = last.surprisePercent?.raw;
+      if (pct != null) {
+        lastSurprise = `${pct > 0 ? '+' : ''}${(pct * 100).toFixed(1)}% surprise`;
+      }
+    }
+
+    // Impact assessment
+    let impact = 'No upcoming earnings impact';
+    if (daysTo !== null) {
+      if (daysTo <= 0) impact = 'EARNINGS TODAY/JUST REPORTED — expect extreme IV and gaps';
+      else if (daysTo <= 3) impact = 'EARNINGS IMMINENT — IV crush risk on any premium sold, IV expansion benefits buyers';
+      else if (daysTo <= 7) impact = 'Earnings within 1 week — IV typically expands into the event';
+      else if (daysTo <= 14) impact = 'Earnings in 2 weeks — consider positioning around the event';
+      else if (daysTo <= 30) impact = 'Earnings within a month — factor into expiration selection';
+      else impact = 'Earnings > 30 days out — minimal near-term impact';
+    }
+
+    return { nextEarningsDate: nextDate, daysToEarnings: daysTo, lastQuarterSurprise: lastSurprise, earningsImpact: impact };
+  } catch {
+    return null;
+  }
+}
+
+// ─── Trade Analysis Prompt Builder ─────────────────────────
+
+function buildPrompt(d: AnalysisRequest, flow?: FlowResult, vix?: VIXContext | null, earnings?: EarningsContext | null): string {
   const pctFmt = (v: number) => `${(v * 100).toFixed(1)}%`;
   const dollarFmt = (v: number) => `$${v.toFixed(2)}`;
   const abbrNum = (n: number) => {
@@ -507,7 +605,15 @@ PRICE ACTION
 • Today's move: ${moveSigma.toFixed(1)}σ (${moveATR.toFixed(1)}x ATR) — ${moveSigma > 2.5 ? 'ABNORMALLY LARGE' : moveSigma > 1.5 ? 'above average' : 'within normal range'}
 • Volume: ${(d.volume / 1e6).toFixed(1)}M (${d.avgVolume > 0 ? ((d.volume / d.avgVolume) * 100).toFixed(0) : '?'}% of avg)
 • Bid/Ask: ${dollarFmt(d.bid)} × ${dollarFmt(d.ask)}
-
+${vix ? `
+MARKET REGIME (VIX)
+• VIX: ${vix.price.toFixed(2)} (${vix.changePct > 0 ? '+' : ''}${vix.changePct.toFixed(1)}%) — ${vix.level}
+• ${vix.price > 25 ? 'HIGH VIX favors premium selling strategies. Vanna flows are large — vol drops force dealer buying.' : vix.price > 18 ? 'MODERATE VIX — balanced opportunity set. Watch for vol expansion/compression signals.' : 'LOW VIX — premium cheap, favor buying strategies or low-risk theta plays. Beware complacency → tail risk.'}
+` : ''}${earnings ? `
+EARNINGS CONTEXT
+• Next Earnings: ${earnings.nextEarningsDate ?? 'Unknown'}${earnings.daysToEarnings !== null ? ` (${earnings.daysToEarnings} days away)` : ''}
+• ${earnings.earningsImpact}${earnings.lastQuarterSurprise ? `\n• Last Quarter: ${earnings.lastQuarterSurprise}` : ''}
+` : ''}
 STOCK VOLATILITY PROFILE
 • 14-day ATR: ${dollarFmt(d.atr14)} (${d.atrPercent.toFixed(2)}% of price)
 • Daily 1σ: ${d.dailySigma.toFixed(2)}% | Avg daily range: ${d.avgDailyRangePct.toFixed(2)}%
