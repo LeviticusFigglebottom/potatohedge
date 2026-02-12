@@ -40,6 +40,11 @@ function saveGroupRule(rule: TradeRule) {
   localStorage.setItem('optix-paper-rules', JSON.stringify(rules));
 }
 
+function parseQuantity(strikesText: string): number {
+  const m = strikesText.match(/^(\d+)\s*x\s/i) || strikesText.match(/×\s*(\d+)/);
+  return m ? Math.max(1, Math.min(10, parseInt(m[1]))) : 1;
+}
+
 function buildOCC(symbol: string, expiration: string, type: 'C' | 'P', strike: number): string {
   const d = new Date(expiration + 'T12:00:00');
   const yy = String(d.getFullYear()).slice(-2);
@@ -237,6 +242,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
 
       const exp = idea.nearestExp;
       const thesis = `${idea.strategy} — ${idea.reasoning[0] || ''}`;
+      const qty = parseQuantity(idea.strikes);
 
       if (isIronCondor && allStrikes.length >= 2) {
         // Iron condor: sell call + sell put, buy wings
@@ -260,10 +266,10 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
             orderType: 'credit',
             duration: 'gtc',
             legs: [
-              { expiration: exp, optionType: 'C', strike: sellCall, side: 'sell_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'C', strike: sellCall + wingWidth, side: 'buy_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'P', strike: sellPut, side: 'sell_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'P', strike: sellPut - wingWidth, side: 'buy_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'C', strike: sellCall, side: 'sell_to_open', quantity: qty },
+              { expiration: exp, optionType: 'C', strike: sellCall + wingWidth, side: 'buy_to_open', quantity: qty },
+              { expiration: exp, optionType: 'P', strike: sellPut, side: 'sell_to_open', quantity: qty },
+              { expiration: exp, optionType: 'P', strike: sellPut - wingWidth, side: 'buy_to_open', quantity: qty },
             ],
             thesis,
           }),
@@ -334,8 +340,8 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
             orderType,
             duration: 'gtc',
             legs: [
-              { expiration: exp, optionType: optType, strike: leg1Strike, side: leg1Side, quantity: 1 },
-              { expiration: exp, optionType: optType, strike: leg2Strike, side: leg2Side, quantity: 1 },
+              { expiration: exp, optionType: optType, strike: leg1Strike, side: leg1Side, quantity: qty },
+              { expiration: exp, optionType: optType, strike: leg2Strike, side: leg2Side, quantity: qty },
             ],
             thesis,
           }),
@@ -363,8 +369,8 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
             orderType: 'debit',
             duration: 'gtc',
             legs: [
-              { expiration: exp, optionType: 'C', strike, side: 'buy_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'P', strike, side: 'buy_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'C', strike, side: 'buy_to_open', quantity: qty },
+              { expiration: exp, optionType: 'P', strike, side: 'buy_to_open', quantity: qty },
             ],
             thesis,
           }),
@@ -393,8 +399,8 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
             orderType: 'debit',
             duration: 'gtc',
             legs: [
-              { expiration: exp, optionType: 'P', strike: putStrike, side: 'buy_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'C', strike: callStrike, side: 'buy_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'P', strike: putStrike, side: 'buy_to_open', quantity: qty },
+              { expiration: exp, optionType: 'C', strike: callStrike, side: 'buy_to_open', quantity: qty },
             ],
             thesis,
           }),
@@ -425,7 +431,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
             optionType,
             strike,
             side: 'buy_to_open',
-            quantity: 1,
+            quantity: qty,
             orderType: 'market',
             duration: 'gtc',
             thesis,
@@ -629,6 +635,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
 
       const exp = idea.nearestExp;
       const thesis = `[AI] ${idea.title} — ${idea.thesis || idea.strategy}`;
+      const qty = parseQuantity(idea.strikes);
 
       if (isIronCondor && allStrikes.length >= 2) {
         const sellCallMatch = strikesLow.match(/(\d+)\s*c/i) || strikesLow.match(/sell\s+\$?(\d+)/i);
@@ -643,10 +650,10 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           body: JSON.stringify({
             type: 'spread', symbol: idea.ticker, orderType: 'credit', duration: 'gtc',
             legs: [
-              { expiration: exp, optionType: 'C', strike: sellCall, side: 'sell_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'C', strike: sellCall + wingWidth, side: 'buy_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'P', strike: sellPut, side: 'sell_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'P', strike: sellPut - wingWidth, side: 'buy_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'C', strike: sellCall, side: 'sell_to_open', quantity: qty },
+              { expiration: exp, optionType: 'C', strike: sellCall + wingWidth, side: 'buy_to_open', quantity: qty },
+              { expiration: exp, optionType: 'P', strike: sellPut, side: 'sell_to_open', quantity: qty },
+              { expiration: exp, optionType: 'P', strike: sellPut - wingWidth, side: 'buy_to_open', quantity: qty },
             ],
             thesis,
           }),
@@ -695,8 +702,8 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           body: JSON.stringify({
             type: 'spread', symbol: idea.ticker, orderType, duration: 'gtc',
             legs: [
-              { expiration: exp, optionType: optType, strike: leg1Strike, side: leg1Side, quantity: 1 },
-              { expiration: exp, optionType: optType, strike: leg2Strike, side: leg2Side, quantity: 1 },
+              { expiration: exp, optionType: optType, strike: leg1Strike, side: leg1Side, quantity: qty },
+              { expiration: exp, optionType: optType, strike: leg2Strike, side: leg2Side, quantity: qty },
             ],
             thesis,
           }),
@@ -722,8 +729,8 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           body: JSON.stringify({
             type: 'spread', symbol: idea.ticker, orderType: 'debit', duration: 'gtc',
             legs: [
-              { expiration: exp, optionType: 'C', strike: callStrike, side: 'buy_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'P', strike: putStrike, side: 'buy_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'C', strike: callStrike, side: 'buy_to_open', quantity: qty },
+              { expiration: exp, optionType: 'P', strike: putStrike, side: 'buy_to_open', quantity: qty },
             ],
             thesis,
           }),
@@ -747,7 +754,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             type: 'single', symbol: idea.ticker, expiration: exp, optionType,
-            strike, side: 'buy_to_open', quantity: 1, orderType: 'market', duration: 'gtc', thesis,
+            strike, side: 'buy_to_open', quantity: qty, orderType: 'market', duration: 'gtc', thesis,
           }),
         });
         const data = await res.json();
