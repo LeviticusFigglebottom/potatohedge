@@ -776,12 +776,13 @@ async function forceEvaluateTrades() {
           };
           results.push({
             tradeId: trade.id, symbol: underlying, action: 'expired',
-            detail: `Expired with P/L $${pl.toFixed(2)} (${plPct.toFixed(1)}%)`,
+            detail: `${trade.strategy}${trade.expirationDate ? ` (${trade.expirationDate})` : ''} — expired with P/L $${pl.toFixed(2)} (${plPct.toFixed(1)}%)`,
           });
           continue;
         }
 
         // Pending → entered
+        let justEntered = false;
         if (trade.status === 'pending') {
           const entryLegs = trade.legs.map(leg => {
             const price = quotes[leg.optionSymbol];
@@ -798,10 +799,7 @@ async function forceEvaluateTrades() {
             legs: entryLegs,
             entryDebit: entryValue,
           };
-          results.push({
-            tradeId: trade.id, symbol: underlying, action: 'entered',
-            detail: `Filled entry at $${entryValue.toFixed(2)}`,
-          });
+          justEntered = true;
         }
 
         // Evaluate entered trades for profit/stop
@@ -824,6 +822,8 @@ async function forceEvaluateTrades() {
           const profitTarget = (activeTrade as Record<string, unknown>).profitTargetPct as number ?? 50;
           const stopLoss = (activeTrade as Record<string, unknown>).stopLossPct as number ?? 100;
 
+          const label = `${trade.strategy}${trade.expirationDate ? ` (${trade.expirationDate})` : ''}`;
+
           if (plPct >= profitTarget) {
             trades[idx] = {
               ...trades[idx], status: 'exited', exitedAt: now, spotAtExit: currentSpot,
@@ -832,7 +832,7 @@ async function forceEvaluateTrades() {
             };
             results.push({
               tradeId: trade.id, symbol: underlying, action: 'profit-target',
-              detail: `Hit profit target: $${unrealizedPL.toFixed(2)} (${plPct.toFixed(1)}%)`,
+              detail: `${label} — hit profit target: $${unrealizedPL.toFixed(2)} (${plPct.toFixed(1)}%)`,
             });
           } else if (plPct <= -stopLoss) {
             trades[idx] = {
@@ -842,13 +842,16 @@ async function forceEvaluateTrades() {
             };
             results.push({
               tradeId: trade.id, symbol: underlying, action: 'stop-loss',
-              detail: `Hit stop loss: $${unrealizedPL.toFixed(2)} (${plPct.toFixed(1)}%)`,
+              detail: `${label} — hit stop loss: $${unrealizedPL.toFixed(2)} (${plPct.toFixed(1)}%)`,
             });
           } else {
             trades[idx] = { ...trades[idx], priceHistory };
             results.push({
-              tradeId: trade.id, symbol: underlying, action: 'priced',
-              detail: `Unrealized P/L: $${unrealizedPL.toFixed(2)} (${plPct.toFixed(1)}%) — no exit trigger`,
+              tradeId: trade.id, symbol: underlying,
+              action: justEntered ? 'entered' : 'priced',
+              detail: justEntered
+                ? `${label} — filled entry at $${entryValue.toFixed(2)}, current P/L: $${unrealizedPL.toFixed(2)} (${plPct.toFixed(1)}%)`
+                : `${label} — unrealized P/L: $${unrealizedPL.toFixed(2)} (${plPct.toFixed(1)}%)`,
             });
           }
         }
