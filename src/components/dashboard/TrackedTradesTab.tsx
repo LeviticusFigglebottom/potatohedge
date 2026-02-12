@@ -453,7 +453,8 @@ export default function TrackedTradesTab() {
   const [showAnalytics, setShowAnalytics] = useState(true);
   const [confirmRemoveAll, setConfirmRemoveAll] = useState(false);
 
-  // Load trades on mount and refresh periodically (to pick up TrackerMonitor updates)
+  // Load trades on mount — use localStorage first (instant, always fresh),
+  // then sync with server in background to pick up diagnostics changes.
   const refreshTrades = useCallback(() => {
     const current = loadTrackedTrades();
     setTrades(current);
@@ -461,17 +462,18 @@ export default function TrackedTradesTab() {
   }, []);
 
   useEffect(() => {
-    setLoading(true);
-    loadTrackedTradesWithSync().then(loaded => {
-      setTrades(loaded);
-      setAnalytics(computeAnalytics(loaded));
-      setLoading(false);
-    }).catch(() => {
-      refreshTrades();
-      setLoading(false);
-    });
-    // Refresh every 30s to pick up TrackerMonitor background updates
-    const interval = setInterval(refreshTrades, 30000);
+    // Immediate load from localStorage (fast, always authoritative)
+    refreshTrades();
+    setLoading(false);
+
+    // Background server sync — only adopts server-only trades or server-exited trades
+    loadTrackedTradesWithSync().then(synced => {
+      setTrades(synced);
+      setAnalytics(computeAnalytics(synced));
+    }).catch(() => {});
+
+    // Refresh every 15s to pick up TrackerMonitor background updates from localStorage
+    const interval = setInterval(refreshTrades, 15000);
     return () => clearInterval(interval);
   }, [refreshTrades]);
 

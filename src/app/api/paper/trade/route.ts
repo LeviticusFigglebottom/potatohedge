@@ -117,18 +117,30 @@ export async function POST(request: NextRequest) {
         : 'market' as const;
 
       let result: { id: number; status: string };
+      let usedFallback = false;
 
       try {
         result = await placeMultiLegOrder({
           symbol,
           type: resolvedType,
           price: netPrice != null ? netPrice : undefined,
-          duration: (duration || 'gtc') as 'day' | 'gtc',
+          duration: (duration || 'day') as 'day' | 'gtc',
           legs: builtLegs,
         });
+
+        // Tradier sandbox multileg orders often land as 'pending' and never fill.
+        // If the order is pending, cancel it and fall through to single-leg fallback.
+        if (result.status === 'pending' || result.status === 'open') {
+          try {
+            const { cancelOrder } = await import('@/lib/providers/tradierPaper');
+            await cancelOrder(result.id);
+          } catch { /* best effort cancel */ }
+          throw new Error('Multileg order pending — using single-leg fallback');
+        }
       } catch {
-        // Multileg failed — decompose into individual single-leg market orders.
-        // This is the most reliable fallback for sandbox after-hours or edge cases.
+        // Multileg failed or pending — decompose into individual single-leg market orders.
+        // This is the most reliable approach for sandbox.
+        usedFallback = true;
         const legResults: { id: number; status: string }[] = [];
         for (const leg of builtLegs) {
           const legResult = await placeSingleOrder({
@@ -137,7 +149,7 @@ export async function POST(request: NextRequest) {
             side: leg.side,
             quantity: leg.quantity,
             type: 'market',
-            duration: 'gtc',
+            duration: 'day',
           });
           legResults.push(legResult);
         }
@@ -148,6 +160,7 @@ export async function POST(request: NextRequest) {
         success: true,
         orderId: result.id,
         status: result.status,
+        usedFallback,
         legs: legs.map((leg: { expiration: string; optionType: 'C' | 'P'; strike: number; side: string }) => ({
           ...leg,
           occSymbol: buildOCCSymbol(symbol, leg.expiration, leg.optionType, leg.strike),

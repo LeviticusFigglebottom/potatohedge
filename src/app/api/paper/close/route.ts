@@ -16,8 +16,8 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const { symbol, quantity, orderType, limitPrice } = body;
 
-    if (!symbol || !quantity) {
-      return NextResponse.json({ error: 'Missing required fields: symbol, quantity' }, { status: 400 });
+    if (!symbol || quantity == null || quantity === 0) {
+      return NextResponse.json({ error: 'Missing required fields: symbol, quantity (nonzero)' }, { status: 400 });
     }
 
     const parsed = parseOCCSymbol(symbol);
@@ -26,7 +26,7 @@ export async function POST(request: NextRequest) {
     const result = await closePosition(
       underlying,
       symbol,
-      quantity,
+      quantity, // positive = long position (sell_to_close), negative = short (buy_to_close)
       orderType || 'market',
       limitPrice,
     );
