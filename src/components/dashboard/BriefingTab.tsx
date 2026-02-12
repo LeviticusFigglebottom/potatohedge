@@ -248,7 +248,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
       const { quotes } = await fetchEntryPrices(occSymbols, idea.ticker);
       if (Object.keys(quotes).length > 0) {
         tracked.legs = fillEntryPrices(tracked.legs, quotes);
-        const hasRealPrices = tracked.legs.some(l => l.entryMid > 0);
+        const hasRealPrices = tracked.legs.length > 0 && tracked.legs.every(l => l.entryMid > 0);
         if (hasRealPrices) {
           // Reject penny options: if avg mid < $0.10, don't mark as entered
           const pricedLegs = tracked.legs.filter(l => l.entryMid > 0);
@@ -699,7 +699,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
       const { quotes } = await fetchEntryPrices(occSymbols, idea.ticker);
       if (Object.keys(quotes).length > 0) {
         tracked.legs = fillEntryPrices(tracked.legs, quotes);
-        const hasRealPrices = tracked.legs.some(l => l.entryMid > 0);
+        const hasRealPrices = tracked.legs.length > 0 && tracked.legs.every(l => l.entryMid > 0);
         if (hasRealPrices) {
           // Reject penny options: if avg mid < $0.10, don't mark as entered
           const pricedLegs = tracked.legs.filter(l => l.entryMid > 0);

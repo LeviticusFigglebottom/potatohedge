@@ -177,22 +177,68 @@ async function getHealth() {
 
   // Load tracked trades from server
   let trades = await loadTrackedTradesFromServer();
+  const originalCount = trades.length;
 
-  // Auto-expire stale trades on health check (server-side cleanup)
+  // ─── Comprehensive data integrity cleanup ──────────────
+
   const now = Date.now();
   let autoExpired = 0;
+  let cleaned = 0;
+
+  // 1. Remove trades with no legs or missing essential data
+  const beforeFilter = trades.length;
+  trades = trades.filter(t =>
+    t && t.id && t.symbol && t.strategy &&
+    t.legs && Array.isArray(t.legs) && t.legs.length > 0 &&
+    t.legs.some(l => l.optionSymbol) &&
+    t.expirationDate
+  );
+  cleaned += beforeFilter - trades.length;
+
+  // 2. Fix "entered" trades with zero-price legs → revert to "pending"
+  for (const t of trades) {
+    if (t.status === 'entered' && t.entryDebit === null) {
+      const hasAnyPrice = t.legs.some(l => l.entryMid > 0);
+      if (!hasAnyPrice) {
+        t.status = 'pending' as ServerTrade['status'];
+        t.enteredAt = null;
+        cleaned++;
+      }
+    }
+  }
+
+  // 3. Deduplicate: same symbol + strategy + expiration → keep newest open trade
+  const seenKeys = new Set<string>();
+  const deduped: ServerTrade[] = [];
+  // Process newest first (sorted by trackedAt desc)
+  trades.sort((a, b) => b.trackedAt - a.trackedAt);
+  for (const t of trades) {
+    const key = `${t.symbol}|${t.strategy}|${t.expirationDate}`;
+    const isOpen = t.status === 'pending' || t.status === 'entered';
+    if (isOpen && seenKeys.has(key)) {
+      cleaned++; // drop duplicate open trade
+      continue;
+    }
+    if (isOpen) seenKeys.add(key);
+    deduped.push(t);
+  }
+  trades = deduped;
+
+  // 4. Auto-expire stale trades past expiration
   for (const t of trades) {
     if (t.status === 'exited' || t.status === 'expired') continue;
     const expDate = new Date(t.expirationDate + 'T16:00:00-05:00').getTime();
     if (now > expDate + 3600000) { // 1 hour past expiration
-      t.status = 'expired';
+      t.status = 'expired' as ServerTrade['status'];
       t.exitedAt = now;
       t.exitReason = 'expiration';
       if (t.outcome === null) t.outcome = 'loss';
       autoExpired++;
     }
   }
-  if (autoExpired > 0) {
+
+  // Save if anything changed
+  if (cleaned > 0 || autoExpired > 0) {
     await saveTrackedTradesToServer(trades);
   }
 
@@ -232,6 +278,8 @@ async function getHealth() {
       unpriced: unpricedTrades.length,
       expiredNotClosed: expiredNotClosed.length,
       autoExpiredThisCheck: autoExpired,
+      autoCleaned: cleaned,
+      originalCount,
     },
     errors: errorSummary,
     issues,
@@ -580,14 +628,8 @@ async function fixTrade(id: string, fixes: Record<string, unknown>) {
 
   if (applied.length === 0) return { error: 'No valid fixes provided', allowedFields };
 
-  // Save back to server
-  const { saveHistoryBulk } = await import('@/lib/persistence');
-  const records = trades.map(t => ({
-    ...t,
-    date: t.id,
-    timestamp: t.trackedAt,
-  }));
-  await saveHistoryBulk('optix:tracked-trades:all', records);
+  // Save back to server using overwriteKey (not merge)
+  await saveTrackedTradesToServer(trades);
 
   return { ok: true, tradeId: id, applied, before: pick(original, applied), after: pick(trades[idx], applied) };
 }
@@ -621,14 +663,8 @@ async function clearExpiredTrades() {
     if (t.outcome === null) t.outcome = 'loss';
   }
 
-  // Save back
-  const { saveHistoryBulk } = await import('@/lib/persistence');
-  const records = trades.map(t => ({
-    ...t,
-    date: t.id,
-    timestamp: t.trackedAt,
-  }));
-  await saveHistoryBulk('optix:tracked-trades:all', records);
+  // Save back using overwriteKey (not merge)
+  await saveTrackedTradesToServer(trades);
 
   return { ok: true, expired: toExpire.length, total: trades.length, expiredIds: toExpire.map(t => t.id) };
 }
@@ -720,9 +756,12 @@ async function loadTrackedTradesFromServer(): Promise<ServerTrade[]> {
 }
 
 async function saveTrackedTradesToServer(trades: ServerTrade[]): Promise<void> {
-  const { saveHistoryBulk } = await import('@/lib/persistence');
+  // Use overwriteKey (not saveHistoryBulk) to REPLACE all server data.
+  // saveHistoryBulk merges with existing data, which means saving an empty array
+  // during a purge would still keep all the old trades (the merge re-adds them).
+  const { overwriteKey } = await import('@/lib/persistence');
   const records = trades.map(t => ({ ...t, date: t.id, timestamp: t.trackedAt }));
-  await saveHistoryBulk('optix:tracked-trades:all', records);
+  await overwriteKey('optix:tracked-trades:all', records);
 }
 
 // ─── Server-side price fetch ─────────────────────────────

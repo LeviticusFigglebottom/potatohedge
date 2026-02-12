@@ -195,6 +195,20 @@ export async function saveHistoryBulk<T extends HistoryRecord>(
 }
 
 /**
+ * Overwrite a key with the given data (NO merge with existing).
+ * Use this for purge operations where we need to replace, not merge.
+ */
+export async function overwriteKey<T>(key: string, data: T[]): Promise<void> {
+  try {
+    await redisSet(key, data);
+  } catch {
+    try {
+      await blobSet(key, data);
+    } catch { /* no persistence available */ }
+  }
+}
+
+/**
  * Check which persistence backends are available.
  */
 export function getPersistenceStatus(): { redis: boolean; blob: boolean } {

@@ -218,6 +218,9 @@ async function syncTrackedTradesToServer(trades: TrackedTrade[]): Promise<void> 
     date: t.id,  // unique per trade — prevents dedup from losing multi-trade-per-day data
     timestamp: t.trackedAt,
   }));
+  // Use overwrite mode so the server always matches the client exactly.
+  // This ensures deletions, purges, and dedup results propagate to the server.
+  // Without overwrite, the server merge re-adds deleted/purged trades.
   await fetch('/api/history', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -225,6 +228,7 @@ async function syncTrackedTradesToServer(trades: TrackedTrade[]): Promise<void> 
       type: 'tracked-trades',
       ticker: '_ALL',
       records,
+      mode: 'overwrite',
     }),
     signal: AbortSignal.timeout(5000),
   }).catch(() => {});
@@ -294,9 +298,19 @@ export async function loadTrackedTradesWithSync(): Promise<TrackedTrade[]> {
     }
 
     merged.sort((a, b) => b.trackedAt - a.trackedAt);
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(merged)); } catch {}
-    syncTrackedTradesToServer(merged).catch(() => {});
-    return merged;
+    // Deduplicate: if same symbol + strategy + expiration exists multiple times, keep newest
+    const seen = new Set<string>();
+    const deduped = merged.filter(t => {
+      const key = `${t.symbol}|${t.strategy}|${t.expirationDate}`;
+      // Allow multiple closed trades with the same key, only dedup open ones
+      if (t.status === 'exited' || t.status === 'expired') return true;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(deduped)); } catch {}
+    syncTrackedTradesToServer(deduped).catch(() => {});
+    return deduped;
   } catch {
     return local;
   }
@@ -708,9 +722,11 @@ export function buildTrackedTradeFromAlgo(params: {
   // Calculate max risk
   const maxRisk = calculateMaxRisk(parsedLegs, trade.strategy, spotPrice);
 
-  // If legs already have real entry prices, start as 'entered' immediately.
+  // If ALL legs have real entry prices, start as 'entered' immediately.
   // Otherwise start as 'pending' — TrackerMonitor will fill prices on first cycle.
-  const hasRealPrices = parsedLegs.some(l => l.entryMid > 0);
+  // This prevents "entered but zero-price legs" data quality issues.
+  const allLegsHavePrices = parsedLegs.length > 0 && parsedLegs.every(l => l.entryMid > 0);
+  const hasRealPrices = allLegsHavePrices;
   const entryValue = hasRealPrices ? calculatePositionValue(parsedLegs, 'entry') : null;
   const now = Date.now();
 

@@ -13,7 +13,7 @@ export const maxDuration = 15;
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { loadHistory, saveHistoryBulk, getPersistenceStatus, testConnection } from '@/lib/persistence';
+import { loadHistory, saveHistoryBulk, overwriteKey, getPersistenceStatus, testConnection } from '@/lib/persistence';
 
 function historyKey(type: string, ticker?: string): string {
   if (type === 'metrics' && ticker) return `optix:metrics:${ticker.toUpperCase()}`;
@@ -75,14 +75,21 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { type, ticker, records } = body as {
+    const { type, ticker, records, mode } = body as {
       type: string;
       ticker?: string;
       records: Array<Record<string, unknown> & { date: string; timestamp: number }>;
+      mode?: 'merge' | 'overwrite';
     };
 
-    if (!type || !records || !Array.isArray(records) || records.length === 0) {
+    if (!type || !records || !Array.isArray(records)) {
       return NextResponse.json({ error: 'type and records[] required' }, { status: 400 });
+    }
+
+    // In merge mode (default), empty records are a no-op.
+    // In overwrite mode, empty records = clear all data for this key.
+    if (mode !== 'overwrite' && records.length === 0) {
+      return NextResponse.json({ error: 'records[] must be non-empty (use mode:"overwrite" to clear)' }, { status: 400 });
     }
 
     if (type === 'metrics' && !ticker) {
@@ -92,6 +99,12 @@ export async function POST(request: NextRequest) {
     const key = historyKey(type, ticker);
     if (!key) {
       return NextResponse.json({ error: 'Invalid parameters' }, { status: 400 });
+    }
+
+    if (mode === 'overwrite') {
+      // Replace all data for this key — no merge with existing
+      await overwriteKey(key, records);
+      return NextResponse.json({ ok: true, key, replaced: records.length });
     }
 
     await saveHistoryBulk(key, records);
