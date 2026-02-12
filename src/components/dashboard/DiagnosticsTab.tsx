@@ -2,9 +2,10 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  HeartPulse, AlertTriangle, CheckCircle2, XCircle, Wifi, WifiOff,
+  HeartPulse, AlertTriangle, CheckCircle2, Wifi, WifiOff,
   Clock, RefreshCw, Trash2, ChevronDown, ChevronUp, Activity,
-  Server, Database, Zap, Bug, Shield, TrendingUp,
+  Server, Database, Zap, Bug, Shield, TrendingUp, Play,
+  XCircle, Sun, Moon, Square,
 } from 'lucide-react';
 
 // ─── Types ──────────────────────────────────────────────────
@@ -61,10 +62,18 @@ interface TradeSummary {
   outcome: string | null;
   legs: number;
   entryDebit: number | null;
+  maxRisk: number | null;
   realizedPL: number | null;
   realizedPLPct: number | null;
   trackedAt: string;
   expirationDate: string;
+}
+
+interface EvalResult {
+  tradeId: string;
+  symbol: string;
+  action: string;
+  detail: string;
 }
 
 // ─── Helpers ────────────────────────────────────────────────
@@ -75,6 +84,11 @@ function timeAgo(ts: number): string {
   if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
   if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
   return `${Math.floor(diff / 86400000)}d ago`;
+}
+
+function daysUntil(dateStr: string): number {
+  const exp = new Date(dateStr + 'T16:00:00-05:00').getTime();
+  return Math.ceil((exp - Date.now()) / 86400000);
 }
 
 const severityColor: Record<string, string> = {
@@ -90,6 +104,16 @@ const statusColor: Record<string, string> = {
   critical: 'text-accent-red',
 };
 
+async function diagPost(action: string, body: Record<string, unknown> = {}) {
+  const res = await fetch('/api/diagnostics', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, ...body }),
+    signal: AbortSignal.timeout(30000),
+  });
+  return res.json();
+}
+
 // ─── Health Status Indicator ────────────────────────────────
 
 function HealthIndicator({ status }: { status: string }) {
@@ -102,29 +126,64 @@ function HealthIndicator({ status }: { status: string }) {
   );
 }
 
+// ─── Market Hours Badge ─────────────────────────────────────
+
+function MarketHoursBadge({ marketInfo }: { marketInfo: ApiResult | undefined }) {
+  if (!marketInfo) return null;
+  const open = marketInfo.available;
+  return (
+    <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-mono ${
+      open ? 'bg-accent-green/10 text-accent-green border border-accent-green/20' : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+    }`}>
+      {open ? <Sun className="w-3 h-3" /> : <Moon className="w-3 h-3" />}
+      <span>{open ? 'Market Open' : 'Market Closed'}</span>
+    </div>
+  );
+}
+
 // ─── API Status Card ────────────────────────────────────────
 
-function ApiCard({ name, result, icon: Icon }: { name: string; result: ApiResult | undefined; icon: React.ElementType }) {
+function ApiCard({ name, result, icon: Icon, optional }: {
+  name: string;
+  result: ApiResult | undefined;
+  icon: React.ElementType;
+  optional?: boolean;
+}) {
   if (!result) return null;
+  const unavailableButOptional = !result.available && optional;
   return (
-    <div className={`panel px-4 py-3 border ${result.available ? 'border-green-500/20' : 'border-red-500/20'}`}>
+    <div className={`panel px-4 py-3 border ${
+      result.available ? 'border-green-500/20' :
+      unavailableButOptional ? 'border-border/30' : 'border-red-500/20'
+    }`}>
       <div className="flex items-center justify-between mb-1">
         <div className="flex items-center gap-2">
-          <Icon className={`w-3.5 h-3.5 ${result.available ? 'text-accent-green' : 'text-accent-red'}`} />
+          <Icon className={`w-3.5 h-3.5 ${
+            result.available ? 'text-accent-green' :
+            unavailableButOptional ? 'text-text-muted' : 'text-accent-red'
+          }`} />
           <span className="text-xs font-mono font-semibold text-text-primary">{name}</span>
+          {optional && !result.available && (
+            <span className="text-[8px] font-mono text-text-muted/50 uppercase">optional</span>
+          )}
         </div>
         {result.available ? (
           <Wifi className="w-3.5 h-3.5 text-accent-green" />
+        ) : unavailableButOptional ? (
+          <span className="text-[10px] text-text-muted">—</span>
         ) : (
           <WifiOff className="w-3.5 h-3.5 text-accent-red" />
         )}
       </div>
       <div className="flex items-center justify-between">
-        <span className={`text-[10px] font-mono ${result.available ? 'text-accent-green' : 'text-accent-red'}`}>
+        <span className={`text-[10px] font-mono break-all ${
+          result.available ? 'text-accent-green' :
+          unavailableButOptional ? 'text-text-muted/60' : 'text-accent-red'
+        }`}>
           {result.available ? 'Connected' : result.error || 'Unavailable'}
         </span>
         {result.latencyMs !== undefined && (
-          <span className={`text-[10px] font-mono ${result.latencyMs < 500 ? 'text-accent-green' : result.latencyMs < 2000 ? 'text-accent-amber' : 'text-accent-red'}`}>
+          <span className={`text-[10px] font-mono shrink-0 ml-2 ${result.latencyMs < 500 ? 'text-accent-green' : result.latencyMs < 2000 ? 'text-accent-amber' : 'text-accent-red'}`}>
             {result.latencyMs}ms
           </span>
         )}
@@ -194,6 +253,114 @@ function QualityIssueRow({ issue }: { issue: TradeQuality }) {
   );
 }
 
+// ─── Trade Row with Actions ─────────────────────────────────
+
+function TradeRow({ trade, onForceClose, closingId }: {
+  trade: TradeSummary;
+  onForceClose: (id: string, reason: string) => void;
+  closingId: string | null;
+}) {
+  const isOpen = trade.status === 'pending' || trade.status === 'entered';
+  const dte = daysUntil(trade.expirationDate);
+  const isExpired = dte < 0;
+  const closing = closingId === trade.id;
+
+  return (
+    <div className="px-3 py-2 flex items-center gap-3 text-xs font-mono group hover:bg-bg-tertiary/20 transition-colors">
+      <span className={`w-2 h-2 rounded-full shrink-0 ${
+        trade.status === 'entered' ? 'bg-accent-cyan' : trade.status === 'pending' ? 'bg-blue-400' :
+        trade.outcome === 'win' ? 'bg-accent-green' : trade.outcome === 'loss' ? 'bg-accent-red' : 'bg-text-muted'
+      }`} />
+      <span className="font-semibold text-text-primary w-12">{trade.symbol}</span>
+      <span className="text-text-muted truncate flex-1">{trade.strategy}</span>
+      <span className={`shrink-0 ${
+        trade.status === 'entered' ? 'text-accent-cyan' : trade.status === 'pending' ? 'text-blue-400' :
+        'text-text-muted'
+      }`}>{trade.status}</span>
+      {trade.realizedPL !== null ? (
+        <span className={`shrink-0 w-16 text-right ${trade.realizedPL >= 0 ? 'text-accent-green' : 'text-accent-red'}`}>
+          {trade.realizedPL >= 0 ? '+' : ''}${trade.realizedPL.toFixed(0)}
+        </span>
+      ) : (
+        <span className="shrink-0 w-16 text-right text-text-muted/30">—</span>
+      )}
+      <span className={`shrink-0 w-16 text-right ${isExpired ? 'text-accent-red' : dte <= 1 ? 'text-accent-amber' : 'text-text-muted/50'}`}>
+        {isExpired ? `${Math.abs(dte)}d ago` : `${dte}d`}
+      </span>
+      {/* Actions for open trades */}
+      {isOpen && (
+        <div className="shrink-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          {isExpired && (
+            <button
+              onClick={() => onForceClose(trade.id, 'expiration')}
+              disabled={closing}
+              className="flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] bg-accent-amber/15 text-accent-amber hover:bg-accent-amber/25 transition-colors disabled:opacity-50"
+              title="Close as expired with live pricing"
+            >
+              {closing ? <RefreshCw className="w-2.5 h-2.5 animate-spin" /> : <Clock className="w-2.5 h-2.5" />}
+              Expire
+            </button>
+          )}
+          <button
+            onClick={() => onForceClose(trade.id, 'manual-close')}
+            disabled={closing}
+            className="flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors disabled:opacity-50"
+            title="Force close with current market prices"
+          >
+            {closing ? <RefreshCw className="w-2.5 h-2.5 animate-spin" /> : <Square className="w-2.5 h-2.5" />}
+            Close
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Eval Results Display ───────────────────────────────────
+
+function EvalResults({ results, errors }: {
+  results: EvalResult[];
+  errors?: { tradeId: string; error: string }[];
+}) {
+  return (
+    <div className="panel border border-accent-cyan/20 bg-accent-cyan/5">
+      <div className="panel-header">
+        <div className="flex items-center gap-2">
+          <Play className="w-3.5 h-3.5 text-accent-cyan" />
+          <span className="panel-title text-xs">Evaluation Results</span>
+          <span className="text-[10px] font-mono text-text-muted">{results.length} trades processed</span>
+        </div>
+      </div>
+      <div className="max-h-48 overflow-y-auto divide-y divide-border/10">
+        {results.map((r, i) => (
+          <div key={i} className="px-3 py-2 flex items-center gap-2 text-xs font-mono">
+            <span className={`w-2 h-2 rounded-full shrink-0 ${
+              r.action === 'profit-target' ? 'bg-accent-green' :
+              r.action === 'stop-loss' || r.action === 'expired' ? 'bg-accent-red' :
+              r.action === 'entered' ? 'bg-accent-cyan' : 'bg-blue-400'
+            }`} />
+            <span className="font-semibold text-text-primary w-10">{r.symbol}</span>
+            <span className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded ${
+              r.action === 'profit-target' ? 'bg-accent-green/15 text-accent-green' :
+              r.action === 'stop-loss' ? 'bg-red-500/15 text-red-400' :
+              r.action === 'expired' ? 'bg-amber-500/15 text-amber-400' :
+              r.action === 'entered' ? 'bg-accent-cyan/15 text-accent-cyan' :
+              'bg-blue-400/15 text-blue-400'
+            }`}>{r.action}</span>
+            <span className="text-text-secondary truncate flex-1">{r.detail}</span>
+          </div>
+        ))}
+        {errors && errors.map((e, i) => (
+          <div key={`err-${i}`} className="px-3 py-2 flex items-center gap-2 text-xs font-mono">
+            <XCircle className="w-3 h-3 text-red-400 shrink-0" />
+            <span className="text-red-400 truncate">{e.tradeId}: {e.error}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ─── Main Component ─────────────────────────────────────────
 
 export default function DiagnosticsTab() {
@@ -207,6 +374,9 @@ export default function DiagnosticsTab() {
   const [errorFilter, setErrorFilter] = useState<string>('all');
   const [lastRefresh, setLastRefresh] = useState(0);
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const [evaluating, setEvaluating] = useState(false);
+  const [evalResults, setEvalResults] = useState<{ results: EvalResult[]; errors?: { tradeId: string; error: string }[] } | null>(null);
+  const [closingTradeId, setClosingTradeId] = useState<string | null>(null);
   const autoRefreshRef = useRef(autoRefresh);
   autoRefreshRef.current = autoRefresh;
 
@@ -254,26 +424,50 @@ export default function DiagnosticsTab() {
   }, [fetchAll]);
 
   const handleClearErrors = async () => {
-    await fetch('/api/diagnostics', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'clear-errors' }),
-    }).catch(() => {});
+    await diagPost('clear-errors').catch(() => {});
     setErrors([]);
   };
 
   const handleClearExpired = async () => {
-    await fetch('/api/diagnostics', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'clear-expired' }),
-    }).catch(() => {});
+    await diagPost('clear-expired').catch(() => {});
     fetchAll();
+  };
+
+  const handleForceEvaluate = async () => {
+    setEvaluating(true);
+    setEvalResults(null);
+    try {
+      const result = await diagPost('force-evaluate');
+      if (result.ok) {
+        setEvalResults({ results: result.results || [], errors: result.errors });
+      }
+      await fetchAll(false);
+    } catch {
+      // handled by error log
+    } finally {
+      setEvaluating(false);
+    }
+  };
+
+  const handleForceClose = async (tradeId: string, reason: string) => {
+    setClosingTradeId(tradeId);
+    try {
+      await diagPost('force-close', { id: tradeId, reason });
+      await fetchAll(false);
+    } catch {
+      // handled by error log
+    } finally {
+      setClosingTradeId(null);
+    }
   };
 
   const filteredErrors = errorFilter === 'all'
     ? errors
     : errors.filter(e => e.severity === errorFilter);
+
+  const openTrades = trades.filter(t => t.status === 'pending' || t.status === 'entered');
+  const closedTrades = trades.filter(t => t.status === 'exited' || t.status === 'expired');
+  const isMarketOpen = apis?._marketHours?.available ?? false;
 
   if (loading) {
     return (
@@ -295,6 +489,7 @@ export default function DiagnosticsTab() {
             <HeartPulse className="w-4 h-4 text-accent-cyan" />
             <span className="panel-title">System Diagnostics</span>
             {health && <HealthIndicator status={health.status} />}
+            <MarketHoursBadge marketInfo={apis?._marketHours} />
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -316,6 +511,20 @@ export default function DiagnosticsTab() {
             )}
           </div>
         </div>
+        {/* Market hours explanation when closed */}
+        {!isMarketOpen && apis?._marketHours?.error && (
+          <div className="px-4 pb-3 -mt-1">
+            <div className="flex items-start gap-2 text-[10px] font-mono text-amber-400/70 bg-amber-500/5 rounded px-3 py-2 border border-amber-500/10">
+              <Moon className="w-3 h-3 mt-0.5 shrink-0" />
+              <div>
+                <span>{apis._marketHours.error}</span>
+                <span className="text-text-muted/50 ml-1">
+                  Use Force Evaluate below to run server-side evaluation and close trades outside market hours.
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Issues Banner */}
@@ -336,16 +545,54 @@ export default function DiagnosticsTab() {
                 </div>
               ))}
             </div>
-            {health.trades.expiredNotClosed > 0 && (
-              <button
-                onClick={handleClearExpired}
-                className="mt-2 px-3 py-1 rounded text-[10px] font-mono bg-accent-amber/15 text-accent-amber hover:bg-accent-amber/25 transition-colors"
-              >
-                Close {health.trades.expiredNotClosed} expired trades
-              </button>
-            )}
+            <div className="flex items-center gap-2 mt-3">
+              {health.trades.expiredNotClosed > 0 && (
+                <button
+                  onClick={handleClearExpired}
+                  className="px-3 py-1 rounded text-[10px] font-mono bg-accent-amber/15 text-accent-amber hover:bg-accent-amber/25 transition-colors"
+                >
+                  Close {health.trades.expiredNotClosed} expired (no pricing)
+                </button>
+              )}
+              {openTrades.length > 0 && (
+                <button
+                  onClick={handleForceEvaluate}
+                  disabled={evaluating}
+                  className="flex items-center gap-1 px-3 py-1 rounded text-[10px] font-mono bg-accent-cyan/15 text-accent-cyan hover:bg-accent-cyan/25 transition-colors disabled:opacity-50"
+                >
+                  {evaluating ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+                  Force Evaluate All ({openTrades.length} open)
+                </button>
+              )}
+            </div>
           </div>
         </div>
+      )}
+
+      {/* Force Evaluate bar — always visible when there are open trades */}
+      {openTrades.length > 0 && (!health || health.issues.length === 0) && (
+        <div className="panel border border-accent-cyan/20">
+          <div className="px-4 py-3 flex items-center justify-between">
+            <div className="flex items-center gap-2 text-xs font-mono text-text-secondary">
+              <Activity className="w-3.5 h-3.5 text-accent-cyan" />
+              <span>{openTrades.length} open trade{openTrades.length !== 1 ? 's' : ''}</span>
+              {!isMarketOpen && <span className="text-amber-400/70">— TrackerMonitor dormant</span>}
+            </div>
+            <button
+              onClick={handleForceEvaluate}
+              disabled={evaluating}
+              className="flex items-center gap-1 px-3 py-1 rounded text-[10px] font-mono bg-accent-cyan/15 text-accent-cyan hover:bg-accent-cyan/25 transition-colors disabled:opacity-50"
+            >
+              {evaluating ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+              Force Evaluate
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Eval Results */}
+      {evalResults && evalResults.results.length > 0 && (
+        <EvalResults results={evalResults.results} errors={evalResults.errors} />
       )}
 
       {/* Top Row: API Status + Trade Summary */}
@@ -362,14 +609,27 @@ export default function DiagnosticsTab() {
             <ApiCard name="Tradier" result={apis?.tradier} icon={Activity} />
             <ApiCard name="Polygon.io" result={apis?.polygon} icon={TrendingUp} />
             <ApiCard name="Claude AI" result={apis?.anthropic} icon={Zap} />
-            <ApiCard name="Persistence" result={apis?.persistence} icon={Database} />
+            <ApiCard name="Overall Storage" result={apis?.persistence} icon={Database} />
           </div>
-          {apis && (
-            <div className="px-3 pb-2 grid grid-cols-2 gap-2">
-              {apis.redis && <ApiCard name="Redis" result={apis.redis} icon={Server} />}
-              {apis.blob && <ApiCard name="Blob Store" result={apis.blob} icon={Database} />}
+          <div className="px-3 pb-3">
+            <div className="text-[9px] font-mono text-text-muted/50 mb-2 uppercase tracking-wider">Storage Backends</div>
+            <div className="grid grid-cols-2 gap-2">
+              <ApiCard name="Redis (primary)" result={apis?.redis} icon={Server} />
+              <ApiCard name="Blob (fallback)" result={apis?.blob} icon={Database} optional={apis?.redis?.available} />
             </div>
-          )}
+            {apis?.redis?.available && !apis?.blob?.available && (
+              <div className="mt-2 text-[10px] font-mono text-text-muted/50 flex items-start gap-1.5">
+                <CheckCircle2 className="w-3 h-3 text-accent-green/50 mt-0.5 shrink-0" />
+                <span>Redis is active — Blob Store is optional and not needed. Data persists via Redis.</span>
+              </div>
+            )}
+            {!apis?.redis?.available && !apis?.blob?.available && (
+              <div className="mt-2 text-[10px] font-mono text-accent-red/80 flex items-start gap-1.5">
+                <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+                <span>No storage backend connected. Trade data is only in localStorage and will not survive browser clears.</span>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Trade Stats */}
@@ -433,6 +693,35 @@ export default function DiagnosticsTab() {
           <div className="max-h-64 overflow-y-auto">
             {qualityIssues.map(issue => (
               <QualityIssueRow key={issue.tradeId} issue={issue} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Open Trades with Actions */}
+      {openTrades.length > 0 && (
+        <div className="panel border border-accent-cyan/20">
+          <div className="panel-header">
+            <div className="flex items-center gap-2">
+              <Activity className="w-3.5 h-3.5 text-accent-cyan" />
+              <span className="panel-title text-xs">Open Trades</span>
+              <span className="text-[10px] font-mono text-accent-cyan">{openTrades.length} active</span>
+            </div>
+            <div className="text-[9px] font-mono text-text-muted/50">hover to close</div>
+          </div>
+          <div className="divide-y divide-border/10 max-h-64 overflow-y-auto">
+            {/* Header */}
+            <div className="px-3 py-1.5 flex items-center gap-3 text-[9px] font-mono text-text-muted/50 uppercase tracking-wider">
+              <span className="w-2 shrink-0" />
+              <span className="w-12">Sym</span>
+              <span className="flex-1">Strategy</span>
+              <span className="shrink-0">Status</span>
+              <span className="shrink-0 w-16 text-right">P/L</span>
+              <span className="shrink-0 w-16 text-right">DTE</span>
+              <span className="shrink-0 w-24" />
+            </div>
+            {openTrades.map(t => (
+              <TradeRow key={t.id} trade={t} onForceClose={handleForceClose} closingId={closingTradeId} />
             ))}
           </div>
         </div>
@@ -508,32 +797,32 @@ export default function DiagnosticsTab() {
         </div>
       )}
 
-      {/* Recent Trades Activity */}
-      {trades.length > 0 && (
+      {/* Recently Closed Trades */}
+      {closedTrades.length > 0 && (
         <div className="panel">
           <div className="panel-header">
             <div className="flex items-center gap-2">
               <Clock className="w-3.5 h-3.5 text-accent-cyan" />
-              <span className="panel-title text-xs">Recent Trade Activity</span>
+              <span className="panel-title text-xs">Closed Trades</span>
+              <span className="text-[10px] font-mono text-text-muted">{closedTrades.length} trades</span>
             </div>
           </div>
-          <div className="divide-y divide-border/10 max-h-64 overflow-y-auto">
-            {trades.slice(0, 20).map(t => (
+          <div className="divide-y divide-border/10 max-h-48 overflow-y-auto">
+            {closedTrades.slice(0, 20).map(t => (
               <div key={t.id} className="px-3 py-2 flex items-center gap-3 text-xs font-mono">
                 <span className={`w-2 h-2 rounded-full shrink-0 ${
-                  t.status === 'entered' ? 'bg-accent-cyan' : t.status === 'pending' ? 'bg-blue-400' :
                   t.outcome === 'win' ? 'bg-accent-green' : t.outcome === 'loss' ? 'bg-accent-red' : 'bg-text-muted'
                 }`} />
                 <span className="font-semibold text-text-primary w-12">{t.symbol}</span>
                 <span className="text-text-muted truncate flex-1">{t.strategy}</span>
-                <span className={`shrink-0 ${
-                  t.status === 'entered' ? 'text-accent-cyan' : t.status === 'pending' ? 'text-blue-400' :
-                  'text-text-muted'
-                }`}>{t.status}</span>
-                {t.realizedPL !== null && (
+                <span className={`shrink-0 text-[10px] ${t.status === 'expired' ? 'text-amber-400' : 'text-text-muted'}`}>{t.status}</span>
+                {t.realizedPL !== null ? (
                   <span className={`shrink-0 ${t.realizedPL >= 0 ? 'text-accent-green' : 'text-accent-red'}`}>
                     {t.realizedPL >= 0 ? '+' : ''}${t.realizedPL.toFixed(0)}
+                    {t.realizedPLPct !== null && <span className="text-text-muted/50 ml-1">({t.realizedPLPct.toFixed(0)}%)</span>}
                   </span>
+                ) : (
+                  <span className="shrink-0 text-text-muted/30">—</span>
                 )}
                 <span className="text-text-muted/50 shrink-0">{t.expirationDate}</span>
               </div>

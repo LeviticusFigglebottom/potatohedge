@@ -111,6 +111,15 @@ export async function POST(request: NextRequest) {
         return NextResponse.json(await fixTrade(id, fixes));
       }
 
+      case 'force-evaluate':
+        return NextResponse.json(await forceEvaluateTrades());
+
+      case 'force-close': {
+        const { id: closeId, reason } = body;
+        if (!closeId) return NextResponse.json({ error: 'id required' }, { status: 400 });
+        return NextResponse.json(await forceCloseTrade(closeId, reason || 'manual-close'));
+      }
+
       default:
         return NextResponse.json({ error: `Unknown action: ${action}` }, { status: 400 });
     }
@@ -394,17 +403,53 @@ async function testApis() {
     error: process.env.ANTHROPIC_API_KEY ? undefined : 'ANTHROPIC_API_KEY not set',
   };
 
-  // Persistence
+  // Persistence — test each backend individually with detail
   const persistence = getPersistenceStatus();
-  results.redis = { available: persistence.redis };
-  results.blob = { available: persistence.blob };
-  if (persistence.redis || persistence.blob) {
+
+  // Redis
+  if (persistence.redis) {
     const start = Date.now();
-    const connected = await testConnection();
-    results.persistence = { available: connected, latencyMs: Date.now() - start };
+    try {
+      const redis = await import('@/lib/persistence').then(m => m.testConnection());
+      results.redis = { available: redis, latencyMs: Date.now() - start };
+      if (!redis) results.redis.error = 'Ping failed — check UPSTASH_REDIS_REST_URL/TOKEN';
+    } catch (e) {
+      results.redis = { available: false, latencyMs: Date.now() - start, error: e instanceof Error ? e.message : 'Unknown' };
+    }
   } else {
-    results.persistence = { available: false, error: 'No persistence backend configured' };
+    results.redis = { available: false, error: 'Not configured (set UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN)' };
   }
+
+  // Blob
+  if (persistence.blob) {
+    const start = Date.now();
+    try {
+      const { list } = await import('@vercel/blob');
+      await list({ prefix: 'optix-history/', limit: 1 });
+      results.blob = { available: true, latencyMs: Date.now() - start };
+    } catch (e) {
+      results.blob = { available: false, latencyMs: Date.now() - start, error: e instanceof Error ? e.message : 'Unknown' };
+    }
+  } else {
+    results.blob = { available: false, error: 'Not configured (set BLOB_READ_WRITE_TOKEN). Optional if Redis is active.' };
+  }
+
+  // Overall persistence
+  results.persistence = {
+    available: (results.redis?.available || results.blob?.available) ?? false,
+    error: (!results.redis?.available && !results.blob?.available) ? 'No persistence backend reachable' : undefined,
+  };
+
+  // Market hours status
+  const now = new Date();
+  const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const day = et.getDay();
+  const time = et.getHours() * 60 + et.getMinutes();
+  const marketOpen = day >= 1 && day <= 5 && time >= 570 && time <= 975;
+  results._marketHours = {
+    available: marketOpen,
+    error: marketOpen ? undefined : `Market closed (ET: ${et.toLocaleTimeString('en-US', { timeZone: 'America/New_York' })} ${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][day]}). TrackerMonitor is dormant.`,
+  };
 
   return results;
 }
@@ -589,4 +634,303 @@ async function loadTrackedTradesFromServer(): Promise<ServerTrade[]> {
   } catch {
     return [];
   }
+}
+
+async function saveTrackedTradesToServer(trades: ServerTrade[]): Promise<void> {
+  const { saveHistoryBulk } = await import('@/lib/persistence');
+  const records = trades.map(t => ({ ...t, date: t.id, timestamp: t.trackedAt }));
+  await saveHistoryBulk('optix:tracked-trades:all', records);
+}
+
+// ─── Server-side price fetch ─────────────────────────────
+
+async function fetchLivePrices(
+  occSymbols: string[],
+  underlying: string
+): Promise<{
+  quotes: Record<string, { bid: number; ask: number; mid: number }>;
+  spot: number | null;
+}> {
+  const token = process.env.TRADIER_API_KEY;
+  if (!token) return { quotes: {}, spot: null };
+
+  const baseUrl = process.env.TRADIER_SANDBOX === 'true'
+    ? 'https://sandbox.tradier.com/v1'
+    : 'https://api.tradier.com/v1';
+
+  const allSymbols = [...occSymbols, underlying].join(',');
+  const res = await fetch(
+    `${baseUrl}/markets/quotes?symbols=${encodeURIComponent(allSymbols)}&greeks=false`,
+    {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(10000),
+    }
+  );
+  if (!res.ok) throw new Error(`Tradier HTTP ${res.status}`);
+
+  const data = await res.json();
+  const rawQuotes = data.quotes?.quote;
+  if (!rawQuotes) return { quotes: {}, spot: null };
+
+  const arr = Array.isArray(rawQuotes) ? rawQuotes : [rawQuotes];
+  const quotes: Record<string, { bid: number; ask: number; mid: number }> = {};
+  let spot: number | null = null;
+
+  for (const q of arr) {
+    if (!q.symbol) continue;
+    if (q.symbol.toUpperCase() === underlying.toUpperCase()) {
+      spot = q.last ?? q.bid ?? 0;
+      continue;
+    }
+    const bid = q.bid ?? 0;
+    const ask = q.ask ?? 0;
+    const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : q.last ?? 0;
+    quotes[q.symbol] = { bid, ask, mid };
+  }
+  return { quotes, spot };
+}
+
+// ─── Server-side position math ───────────────────────────
+
+function calcPositionValue(
+  legs: ServerTrade['legs'],
+  mode: 'entry' | 'exit'
+): number {
+  let value = 0;
+  for (const leg of legs) {
+    const mid = mode === 'entry' ? leg.entryMid : (leg.exitMid ?? leg.entryMid);
+    const multiplier = leg.side === 'long' ? 1 : -1;
+    value += mid * multiplier * leg.quantity * 100;
+  }
+  return value;
+}
+
+// ─── Force-evaluate all open trades (works outside market hours) ──
+
+async function forceEvaluateTrades() {
+  const trades = await loadTrackedTradesFromServer();
+  const openTrades = trades.filter(t => t.status === 'pending' || t.status === 'entered');
+  if (openTrades.length === 0) return { ok: true, message: 'No open trades to evaluate', total: trades.length };
+
+  const results: { tradeId: string; symbol: string; action: string; detail: string }[] = [];
+  const errors: { tradeId: string; error: string }[] = [];
+
+  // Group by underlying
+  const byUnderlying = new Map<string, ServerTrade[]>();
+  for (const t of openTrades) {
+    const arr = byUnderlying.get(t.symbol) || [];
+    arr.push(t);
+    byUnderlying.set(t.symbol, arr);
+  }
+
+  for (const [underlying, underlyingTrades] of byUnderlying) {
+    const occSymbols = new Set<string>();
+    for (const t of underlyingTrades) {
+      for (const leg of t.legs) {
+        if (leg.optionSymbol) occSymbols.add(leg.optionSymbol);
+      }
+    }
+    if (occSymbols.size === 0) continue;
+
+    let quotes: Record<string, { bid: number; ask: number; mid: number }>;
+    let spot: number | null;
+    try {
+      ({ quotes, spot } = await fetchLivePrices([...occSymbols], underlying));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Unknown';
+      for (const t of underlyingTrades) errors.push({ tradeId: t.id, error: `Price fetch failed: ${msg}` });
+      continue;
+    }
+
+    const currentSpot = spot ?? 0;
+
+    for (const trade of underlyingTrades) {
+      try {
+        const idx = trades.findIndex(t => t.id === trade.id);
+        if (idx === -1) continue;
+        const now = Date.now();
+
+        // Check expiration
+        const expDate = new Date(trade.expirationDate + 'T16:00:00-05:00').getTime();
+        if (now >= expDate) {
+          const exitLegs = trade.legs.map(leg => {
+            const price = quotes[leg.optionSymbol];
+            return { ...leg, exitBid: price?.bid ?? 0, exitAsk: price?.ask ?? 0, exitMid: price?.mid ?? 0 };
+          });
+          const exitValue = calcPositionValue(exitLegs, 'exit');
+          const entryValue = trade.entryDebit ?? calcPositionValue(trade.legs, 'entry');
+          const pl = exitValue - entryValue;
+          const plPct = trade.maxRisk && trade.maxRisk !== 0 ? (pl / Math.abs(trade.maxRisk)) * 100 : 0;
+
+          trades[idx] = {
+            ...trades[idx],
+            status: 'expired',
+            exitedAt: now,
+            spotAtExit: currentSpot,
+            legs: exitLegs,
+            exitValue,
+            realizedPL: pl,
+            realizedPLPct: plPct,
+            exitReason: 'expiration',
+            outcome: pl > 0.5 ? 'win' : pl < -0.5 ? 'loss' : 'breakeven',
+          };
+          results.push({
+            tradeId: trade.id, symbol: underlying, action: 'expired',
+            detail: `Expired with P/L $${pl.toFixed(2)} (${plPct.toFixed(1)}%)`,
+          });
+          continue;
+        }
+
+        // Pending → entered
+        if (trade.status === 'pending') {
+          const entryLegs = trade.legs.map(leg => {
+            const price = quotes[leg.optionSymbol];
+            if (price && price.mid > 0) {
+              return { ...leg, entryBid: price.bid, entryAsk: price.ask, entryMid: price.mid };
+            }
+            return leg;
+          });
+          const entryValue = calcPositionValue(entryLegs, 'entry');
+          trades[idx] = {
+            ...trades[idx],
+            status: 'entered',
+            enteredAt: now,
+            legs: entryLegs,
+            entryDebit: entryValue,
+          };
+          results.push({
+            tradeId: trade.id, symbol: underlying, action: 'entered',
+            detail: `Filled entry at $${entryValue.toFixed(2)}`,
+          });
+        }
+
+        // Evaluate entered trades for profit/stop
+        const activeTrade = trades[idx];
+        if (activeTrade.status === 'entered') {
+          const currentLegs = activeTrade.legs.map(leg => {
+            const price = quotes[leg.optionSymbol];
+            return { ...leg, exitBid: price?.bid ?? 0, exitAsk: price?.ask ?? 0, exitMid: price?.mid ?? 0 };
+          });
+          const currentValue = calcPositionValue(currentLegs, 'exit');
+          const entryValue = activeTrade.entryDebit ?? calcPositionValue(activeTrade.legs, 'entry');
+          const unrealizedPL = currentValue - entryValue;
+          const plPct = activeTrade.maxRisk && activeTrade.maxRisk !== 0
+            ? (unrealizedPL / Math.abs(activeTrade.maxRisk)) * 100 : 0;
+
+          // Price snapshot
+          const snapshot = { timestamp: now, spotPrice: currentSpot, positionValue: currentValue };
+          const priceHistory = [...(activeTrade.priceHistory || []), snapshot].slice(-100);
+
+          const profitTarget = (activeTrade as Record<string, unknown>).profitTargetPct as number ?? 50;
+          const stopLoss = (activeTrade as Record<string, unknown>).stopLossPct as number ?? 100;
+
+          if (plPct >= profitTarget) {
+            trades[idx] = {
+              ...trades[idx], status: 'exited', exitedAt: now, spotAtExit: currentSpot,
+              legs: currentLegs, exitValue: currentValue, realizedPL: unrealizedPL,
+              realizedPLPct: plPct, exitReason: 'profit-target', outcome: 'win', priceHistory,
+            };
+            results.push({
+              tradeId: trade.id, symbol: underlying, action: 'profit-target',
+              detail: `Hit profit target: $${unrealizedPL.toFixed(2)} (${plPct.toFixed(1)}%)`,
+            });
+          } else if (plPct <= -stopLoss) {
+            trades[idx] = {
+              ...trades[idx], status: 'exited', exitedAt: now, spotAtExit: currentSpot,
+              legs: currentLegs, exitValue: currentValue, realizedPL: unrealizedPL,
+              realizedPLPct: plPct, exitReason: 'stop-loss', outcome: 'loss', priceHistory,
+            };
+            results.push({
+              tradeId: trade.id, symbol: underlying, action: 'stop-loss',
+              detail: `Hit stop loss: $${unrealizedPL.toFixed(2)} (${plPct.toFixed(1)}%)`,
+            });
+          } else {
+            trades[idx] = { ...trades[idx], priceHistory };
+            results.push({
+              tradeId: trade.id, symbol: underlying, action: 'priced',
+              detail: `Unrealized P/L: $${unrealizedPL.toFixed(2)} (${plPct.toFixed(1)}%) — no exit trigger`,
+            });
+          }
+        }
+      } catch (e) {
+        errors.push({ tradeId: trade.id, error: e instanceof Error ? e.message : 'Unknown' });
+      }
+    }
+  }
+
+  await saveTrackedTradesToServer(trades);
+
+  return {
+    ok: true,
+    evaluated: openTrades.length,
+    total: trades.length,
+    results,
+    errors: errors.length > 0 ? errors : undefined,
+  };
+}
+
+// ─── Force-close a single trade with live pricing ────────
+
+async function forceCloseTrade(id: string, reason: string) {
+  const trades = await loadTrackedTradesFromServer();
+  const idx = trades.findIndex(t => t.id === id);
+  if (idx === -1) return { error: 'Trade not found' };
+
+  const trade = trades[idx];
+  if (trade.status === 'exited' || trade.status === 'expired') {
+    return { error: `Trade already ${trade.status}` };
+  }
+
+  const now = Date.now();
+
+  // Try to get live prices for proper exit
+  const occSymbols = trade.legs.map(l => l.optionSymbol).filter(Boolean);
+  let exitLegs = trade.legs;
+  let currentSpot = 0;
+
+  if (occSymbols.length > 0) {
+    try {
+      const { quotes, spot } = await fetchLivePrices(occSymbols, trade.symbol);
+      currentSpot = spot ?? 0;
+      exitLegs = trade.legs.map(leg => {
+        const price = quotes[leg.optionSymbol];
+        return { ...leg, exitBid: price?.bid ?? 0, exitAsk: price?.ask ?? 0, exitMid: price?.mid ?? 0 };
+      });
+    } catch {
+      // Use zero exit prices — better than staying stuck open
+      exitLegs = trade.legs.map(leg => ({ ...leg, exitBid: 0, exitAsk: 0, exitMid: 0 }));
+    }
+  }
+
+  const exitValue = calcPositionValue(exitLegs, 'exit');
+  const entryValue = trade.entryDebit ?? calcPositionValue(trade.legs, 'entry');
+  const pl = exitValue - entryValue;
+  const plPct = trade.maxRisk && trade.maxRisk !== 0 ? (pl / Math.abs(trade.maxRisk)) * 100 : 0;
+
+  const isExpiration = reason === 'expiration';
+  trades[idx] = {
+    ...trades[idx],
+    status: isExpiration ? 'expired' : 'exited',
+    exitedAt: now,
+    spotAtExit: currentSpot,
+    legs: exitLegs,
+    exitValue,
+    realizedPL: pl,
+    realizedPLPct: plPct,
+    exitReason: reason,
+    outcome: pl > 0.5 ? 'win' : pl < -0.5 ? 'loss' : 'breakeven',
+  };
+
+  await saveTrackedTradesToServer(trades);
+
+  return {
+    ok: true,
+    tradeId: id,
+    status: trades[idx].status,
+    outcome: trades[idx].outcome,
+    realizedPL: pl,
+    realizedPLPct: plPct,
+    exitValue,
+    priced: currentSpot > 0,
+  };
 }
