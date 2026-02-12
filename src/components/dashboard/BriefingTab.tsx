@@ -871,10 +871,12 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
 }
 
 export default function BriefingTab() {
-  const [data, setData] = useState<BriefingResponse | null>(null);
+  const { briefingCache, setBriefingCache } = useDashboardStore();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [phase, setPhase] = useState('');
+
+  const data = briefingCache as BriefingResponse | null;
 
   const fetchBriefing = useCallback(async () => {
     setLoading(true);
@@ -903,14 +905,14 @@ export default function BriefingTab() {
       }
 
       const json = await res.json();
-      setData(json);
+      setBriefingCache(json);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to generate briefing');
     } finally {
       setLoading(false);
       setPhase('');
     }
-  }, []);
+  }, [setBriefingCache]);
 
   // Empty state
   if (!data && !loading && !error) {

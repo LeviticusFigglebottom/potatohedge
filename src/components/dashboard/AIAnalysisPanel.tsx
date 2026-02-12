@@ -22,27 +22,43 @@ interface AITradeIdea {
 export default function AIAnalysisPanel() {
   const {
     symbol, quote, multiGEX, snapshot, recommendations, correlations, expirations,
+    aiAnalysisCache, setAiAnalysisCache,
   } = useDashboardStore();
 
-  const [analysis, setAnalysis] = useState<string | null>(null);
-  const [tradeIdeas, setTradeIdeas] = useState<AITradeIdea[]>([]);
+  // Restore from store cache (survives tab switches; cleared on symbol change by loadSymbol)
+  const [analysis, setAnalysisLocal] = useState<string | null>(aiAnalysisCache?.analysis ?? null);
+  const [tradeIdeas, setTradeIdeasLocal] = useState<AITradeIdea[]>(aiAnalysisCache?.tradeIdeas ?? []);
   const [trackedIds, setTrackedIds] = useState<Set<number>>(new Set());
-  const [analysisMode, setAnalysisMode] = useState<'trade' | 'fundamental'>('trade');
+  const [analysisMode, setAnalysisModeLocal] = useState<'trade' | 'fundamental'>(aiAnalysisCache?.mode ?? 'trade');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [model, setModel] = useState<string>('');
-  const [tokens, setTokens] = useState<{ input: number; output: number } | null>(null);
+  const [model, setModelLocal] = useState<string>(aiAnalysisCache?.model ?? '');
+  const [tokens, setTokensLocal] = useState<{ input: number; output: number } | null>(aiAnalysisCache?.tokens ?? null);
 
-  // Reset when ticker changes
+  // Wrap setters to sync to store
+  const setAnalysis = useCallback((val: string | null) => {
+    setAnalysisLocal(val);
+    if (val === null) {
+      setAiAnalysisCache(null);
+    }
+  }, [setAiAnalysisCache]);
+  const setTradeIdeas = useCallback((val: AITradeIdea[]) => setTradeIdeasLocal(val), []);
+  const setModel = useCallback((val: string) => setModelLocal(val), []);
+  const setTokens = useCallback((val: { input: number; output: number } | null) => setTokensLocal(val), []);
+  const setAnalysisMode = useCallback((val: 'trade' | 'fundamental') => setAnalysisModeLocal(val), []);
+
+  // Sync cache when store clears it (symbol change)
   useEffect(() => {
-    setAnalysis(null);
-    setTradeIdeas([]);
-    setTrackedIds(new Set());
-    setAnalysisMode('trade');
-    setError(null);
-    setModel('');
-    setTokens(null);
-  }, [symbol]);
+    if (!aiAnalysisCache) {
+      setAnalysisLocal(null);
+      setTradeIdeasLocal([]);
+      setTrackedIds(new Set());
+      setAnalysisModeLocal('trade');
+      setError(null);
+      setModelLocal('');
+      setTokensLocal(null);
+    }
+  }, [aiAnalysisCache]);
 
   const runAnalysis = useCallback(async (mode: 'trade' | 'fundamental' = 'trade') => {
     if (!quote || !multiGEX) {
@@ -226,17 +242,27 @@ export default function AIAnalysisPanel() {
       }
 
       const result = await res.json();
+      const ideas = result.tradeIdeas || [];
+      const resultModel = result.model || '';
+      const resultTokens = result.usage ? { input: result.usage.input_tokens, output: result.usage.output_tokens } : null;
       setAnalysis(result.analysis);
-      setTradeIdeas(result.tradeIdeas || []);
+      setTradeIdeas(ideas);
       setTrackedIds(new Set());
-      setModel(result.model || '');
-      setTokens(result.usage ? { input: result.usage.input_tokens, output: result.usage.output_tokens } : null);
+      setModel(resultModel);
+      setTokens(resultTokens);
+      setAiAnalysisCache({
+        analysis: result.analysis,
+        tradeIdeas: ideas,
+        mode: analysisMode,
+        model: resultModel,
+        tokens: resultTokens,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Analysis failed');
     } finally {
       setLoading(false);
     }
-  }, [symbol, quote, multiGEX, snapshot, recommendations, correlations]);
+  }, [symbol, quote, multiGEX, snapshot, recommendations, correlations, analysisMode, setAnalysis, setTradeIdeas, setModel, setTokens, setAiAnalysisCache]);
 
   // Don't show if no data
   if (!quote) return null;
@@ -398,6 +424,7 @@ export default function AIAnalysisPanel() {
                   setError(null);
                   setModel('');
                   setTokens(null);
+                  setAiAnalysisCache(null);
                 }}
                 className="text-xs font-mono text-text-muted hover:text-text-secondary transition-colors"
               >
