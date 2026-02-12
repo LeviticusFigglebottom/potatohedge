@@ -111,6 +111,39 @@ export async function POST(request: NextRequest) {
       case 'purge-all':
         return NextResponse.json(await purgeAllFromServer());
 
+      case 'nuke-everything': {
+        // Nuclear option: clear ALL tracked trades + error log + paper positions
+        const tradeResult = await purgeAllFromServer();
+        clearErrors();
+        let paperResult = { ordersCancelled: 0, positionsClosed: 0 };
+        if (process.env.TRADIER_SANDBOX_KEY) {
+          try {
+            const { getOrders: getOrd, cancelOrder: cancelOrd, getPositions: getPos, closePosition: closePos, parseOCCSymbol: parseOCC } = await import('@/lib/providers/tradierPaper');
+            const orders = await getOrd();
+            for (const o of orders.filter(o => o.status === 'pending' || o.status === 'open' || o.status === 'partially_filled')) {
+              try { await cancelOrd(o.id); paperResult.ordersCancelled++; } catch {}
+            }
+            const positions = await getPos();
+            for (const p of positions) {
+              if (p.quantity === 0) continue;
+              try {
+                const parsed = parseOCC(p.symbol);
+                const underlying = parsed?.underlying || p.symbol.replace(/\d.*/, '');
+                await closePos(underlying, p.symbol, p.quantity, 'market');
+                paperResult.positionsClosed++;
+              } catch {}
+            }
+          } catch {}
+        }
+        return NextResponse.json({
+          ok: true,
+          trades: tradeResult,
+          errorsCleared: true,
+          paper: paperResult,
+          message: `Nuked: ${tradeResult.purged} trades, ${paperResult.ordersCancelled} orders cancelled, ${paperResult.positionsClosed} positions closed`,
+        });
+      }
+
       case 'fix-trade': {
         const { id, fixes } = body;
         if (!id) return NextResponse.json({ error: 'id required' }, { status: 400 });

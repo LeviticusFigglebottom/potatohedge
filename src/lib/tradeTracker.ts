@@ -232,10 +232,22 @@ async function syncTrackedTradesToServer(trades: TrackedTrade[]): Promise<void> 
 
 export async function loadTrackedTradesWithSync(): Promise<TrackedTrade[]> {
   const local = loadTrackedTrades(); // already auto-expires stale + validates
-  const localIds = new Set(local.map(t => t.id));
 
-  // If we saved locally very recently (within 10s), skip server fetch entirely —
-  // the server can't possibly have newer data than what we just wrote.
+  // If a purge happened recently, local is [] and we must NOT resurrect from server.
+  // The purgedAt flag stays for 10 minutes to cover any server-sync race conditions.
+  const purgedAtStr = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY + ':purgedAt') : null;
+  const purgedAt = purgedAtStr ? parseInt(purgedAtStr, 10) : 0;
+  if (purgedAt > 0 && Date.now() - purgedAt < 600000) {
+    // Within 10 minutes of a purge — local is authoritative (empty), push to server
+    syncTrackedTradesToServer(local).catch(() => {});
+    return local;
+  }
+  // Clear stale purge flag
+  if (purgedAt > 0) {
+    try { localStorage.removeItem(STORAGE_KEY + ':purgedAt'); } catch {}
+  }
+
+  // If we saved locally very recently (within 10s), skip server fetch entirely
   const lastSaveStr = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY + ':lastSave') : null;
   const lastSave = lastSaveStr ? parseInt(lastSaveStr, 10) : 0;
   if (Date.now() - lastSave < 10000) {
@@ -249,58 +261,40 @@ export async function loadTrackedTradesWithSync(): Promise<TrackedTrade[]> {
     if (!res.ok) return local;
     const { records: server } = await res.json() as { records: TrackedTrade[] };
     if (!server || !Array.isArray(server) || server.length === 0) {
-      // Push local to server if we have data
       if (local.length > 0) syncTrackedTradesToServer(local).catch(() => {});
       return local;
     }
 
-    // Merge strategy: LOCAL IS AUTHORITATIVE for trades it knows about.
-    // Server can only ADD trades that local doesn't have (e.g., from diagnostics force-evaluate).
-    // This prevents deletions from reverting and stale server data from overwriting local.
-    const freshness = (t: TrackedTrade): number =>
-      Math.max(t.trackedAt || 0, t.enteredAt || 0, t.exitedAt || 0,
-        t.priceHistory && t.priceHistory.length > 0 ? t.priceHistory[t.priceHistory.length - 1].timestamp : 0);
+    // If local is empty and there was a recent save (within 5 min), don't adopt server data.
+    // The user explicitly cleared it.
+    if (local.length === 0 && lastSave > 0 && Date.now() - lastSave < 300000) {
+      syncTrackedTradesToServer([]).catch(() => {});
+      return local;
+    }
 
-    const merged = [...local]; // start with local as base
+    const localIds = new Set(local.map(t => t.id));
+    const merged = [...local];
 
-    // Add server-only trades (trades that don't exist locally)
     for (const serverTrade of server) {
-      if (!isValidTrade(serverTrade)) continue; // skip invalid
+      if (!isValidTrade(serverTrade)) continue;
       if (!localIds.has(serverTrade.id)) {
-        // Server has a trade local doesn't — adopt it UNLESS it was recently deleted
-        // (We can't know if it was deleted, so we just check: if local had a recent save
-        // and doesn't have this trade, the user likely removed it.)
-        if (lastSave > 0 && Date.now() - lastSave < 300000) {
-          // Within 5 minutes of a local save — respect local as authoritative
-          continue;
-        }
+        // Server has a trade local doesn't — only adopt if local hasn't been saved recently
+        if (lastSave > 0 && Date.now() - lastSave < 300000) continue;
         merged.push(serverTrade);
       } else {
-        // Trade exists in both — prefer local version, but adopt server priceHistory
-        // if server has more data points (from diagnostics force-evaluate)
         const localTrade = merged.find(t => t.id === serverTrade.id)!;
+        // Adopt server priceHistory if it has more data points
         if (serverTrade.priceHistory && serverTrade.priceHistory.length > (localTrade.priceHistory?.length || 0)) {
-          // Server has more price history — merge it in without overwriting local status
           const localIdx = merged.findIndex(t => t.id === serverTrade.id);
           if (localIdx !== -1) {
             merged[localIdx] = { ...localTrade, priceHistory: serverTrade.priceHistory };
           }
         }
-        // If server has the trade exited but local still shows it open, and the server
-        // version was updated more recently (from diagnostics), adopt the server version
-        if ((serverTrade.status === 'exited' || serverTrade.status === 'expired') &&
-            (localTrade.status === 'pending' || localTrade.status === 'entered') &&
-            freshness(serverTrade) > freshness(localTrade)) {
-          const localIdx = merged.findIndex(t => t.id === serverTrade.id);
-          if (localIdx !== -1) merged[localIdx] = serverTrade;
-        }
       }
     }
 
     merged.sort((a, b) => b.trackedAt - a.trackedAt);
-    // Update localStorage with merged data
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(merged)); } catch {}
-    // Push merged back to server to reconcile
     syncTrackedTradesToServer(merged).catch(() => {});
     return merged;
   } catch {
@@ -1234,11 +1228,15 @@ export function purgeClosedTrades(): TrackedTrade[] {
 
 /**
  * Remove ALL tracked trades (full reset).
+ * Sets a purge timestamp so loadTrackedTradesWithSync won't resurrect server data.
  */
 export function purgeAllTrades(): TrackedTrade[] {
   if (typeof window === 'undefined') return [];
-  localStorage.removeItem(STORAGE_KEY);
-  localStorage.removeItem(STORAGE_KEY + ':lastSave');
+  localStorage.setItem(STORAGE_KEY, '[]');
+  // Set lastSave to NOW so the 10s skip + 5-minute protection both apply
+  localStorage.setItem(STORAGE_KEY + ':lastSave', String(Date.now()));
+  // Record that a purge happened — loadTrackedTradesWithSync will respect this
+  localStorage.setItem(STORAGE_KEY + ':purgedAt', String(Date.now()));
   localStorage.removeItem(STORAGE_KEY + ':deletedIds');
   syncTrackedTradesToServer([]).catch(() => {});
   return [];

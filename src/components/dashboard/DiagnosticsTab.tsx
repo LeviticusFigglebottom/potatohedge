@@ -440,12 +440,15 @@ export default function DiagnosticsTab() {
   };
 
   const handlePurgeAll = async () => {
-    await diagPost('purge-all').catch(() => {});
-    // Also clear localStorage to prevent stale data from re-syncing
+    // Server-side: purge tracked trades + clear errors + close paper positions
+    await diagPost('nuke-everything').catch(() => {});
+    // Client-side: clear all localStorage
     if (typeof window !== 'undefined') {
-      localStorage.removeItem('optix_tracked_trades');
-      localStorage.removeItem('optix_tracked_trades:lastSave');
+      localStorage.setItem('optix_tracked_trades', '[]');
+      localStorage.setItem('optix_tracked_trades:lastSave', String(Date.now()));
+      localStorage.setItem('optix_tracked_trades:purgedAt', String(Date.now()));
       localStorage.removeItem('optix_tracked_trades:deletedIds');
+      localStorage.removeItem('optix-paper-rules');
     }
     fetchAll();
   };

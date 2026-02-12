@@ -470,15 +470,18 @@ export default function TrackedTradesTab() {
     refreshTrades();
     setLoading(false);
 
-    // Background server sync — only adopts server-only trades or server-exited trades
-    loadTrackedTradesWithSync().then(synced => {
-      setTrades(synced);
-      setAnalytics(computeAnalytics(synced));
-    }).catch(() => {});
+    // Background server sync — respects purgedAt flag so it won't resurrect purged data.
+    // Small delay to ensure any in-flight purge operations have landed.
+    const syncTimer = setTimeout(() => {
+      loadTrackedTradesWithSync().then(synced => {
+        setTrades(synced);
+        setAnalytics(computeAnalytics(synced));
+      }).catch(() => {});
+    }, 500);
 
     // Refresh every 15s to pick up TrackerMonitor background updates from localStorage
     const interval = setInterval(refreshTrades, 15000);
-    return () => clearInterval(interval);
+    return () => { clearTimeout(syncTimer); clearInterval(interval); };
   }, [refreshTrades]);
 
   const handleRemove = useCallback((id: string) => {
@@ -488,19 +491,20 @@ export default function TrackedTradesTab() {
   }, []);
 
   const handleRemoveAll = useCallback(async () => {
-    const remaining = purgeAllTrades();
-    setTrades(remaining);
-    setAnalytics(computeAnalytics(remaining));
-    setConfirmRemoveAll(false);
-    // Also purge server-side to prevent resurrection on next sync
+    // 1. Purge server FIRST (synchronous) so loadTrackedTradesWithSync can't resurrect
     try {
       await fetch('/api/diagnostics', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'purge-all' }),
-        signal: AbortSignal.timeout(5000),
+        body: JSON.stringify({ action: 'nuke-everything' }),
+        signal: AbortSignal.timeout(15000),
       });
     } catch { /* best effort */ }
+    // 2. Then purge local (sets purgedAt flag to prevent resurrection)
+    const remaining = purgeAllTrades();
+    setTrades(remaining);
+    setAnalytics(computeAnalytics(remaining));
+    setConfirmRemoveAll(false);
   }, []);
 
   const handlePurgeClosed = useCallback(() => {
