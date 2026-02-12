@@ -105,6 +105,9 @@ export async function POST(request: NextRequest) {
       case 'clear-expired':
         return NextResponse.json(await clearExpiredTrades());
 
+      case 'purge-closed':
+        return NextResponse.json(await purgeClosedFromServer());
+
       case 'fix-trade': {
         const { id, fixes } = body;
         if (!id) return NextResponse.json({ error: 'id required' }, { status: 400 });
@@ -574,6 +577,19 @@ async function clearExpiredTrades() {
   return { ok: true, expired: toExpire.length, total: trades.length, expiredIds: toExpire.map(t => t.id) };
 }
 
+// ─── Purge Closed Trades from Server ─────────────────────
+
+async function purgeClosedFromServer() {
+  const trades = await loadTrackedTradesFromServer();
+  const open = trades.filter(t => t.status === 'pending' || t.status === 'entered');
+  const removed = trades.length - open.length;
+
+  if (removed === 0) return { ok: true, message: 'No closed trades to purge', total: trades.length };
+
+  await saveTrackedTradesToServer(open);
+  return { ok: true, purged: removed, remaining: open.length, message: `Removed ${removed} closed/expired trades from server` };
+}
+
 // ─── Helpers ──────────────────────────────────────────────
 
 interface ServerTrade {
@@ -651,10 +667,13 @@ async function fetchLivePrices(
   quotes: Record<string, { bid: number; ask: number; mid: number }>;
   spot: number | null;
 }> {
-  const token = process.env.TRADIER_API_KEY;
+  const isSandbox = process.env.TRADIER_SANDBOX === 'true';
+  const token = isSandbox
+    ? (process.env.TRADIER_SANDBOX_KEY || process.env.TRADIER_API_KEY)
+    : process.env.TRADIER_API_KEY;
   if (!token) return { quotes: {}, spot: null };
 
-  const baseUrl = process.env.TRADIER_SANDBOX === 'true'
+  const baseUrl = isSandbox
     ? 'https://sandbox.tradier.com/v1'
     : 'https://api.tradier.com/v1';
 
@@ -705,6 +724,37 @@ function calcPositionValue(
   return value;
 }
 
+/**
+ * Server-side max risk calculation (mirrors client-side calculateMaxRisk).
+ * Accounts for leg quantity — returns TOTAL position risk.
+ */
+function calcMaxRisk(legs: ServerTrade['legs'], strategy: string, spotPrice: number): number {
+  const stratLow = strategy.toLowerCase();
+  const qty = Math.max(1, ...legs.map(l => l.quantity));
+  const strikes = legs.map(l => l.strike).sort((a, b) => a - b);
+  const hasMultipleLegs = legs.length >= 2;
+
+  if (stratLow.includes('iron condor') || stratLow.includes('iron butterfly') || stratLow.includes('iron fly')) {
+    if (strikes.length >= 4) {
+      const putWingWidth = strikes[1] - strikes[0];
+      const callWingWidth = strikes[3] - strikes[2];
+      return Math.max(putWingWidth, callWingWidth) * 100 * qty;
+    }
+  }
+  if (hasMultipleLegs && strikes.length >= 2) {
+    const width = strikes[strikes.length - 1] - strikes[0];
+    if (width > 0 && width <= 100) return width * 100 * qty;
+  }
+  if ((stratLow.includes('cash') || stratLow.includes('naked') || stratLow.includes('short')) && stratLow.includes('put')) {
+    return (strikes[0] || spotPrice) * 100 * qty;
+  }
+  if (legs.length === 1 && legs[0].side === 'long') return spotPrice * 0.03 * 100 * qty;
+  if ((stratLow.includes('straddle') || stratLow.includes('strangle')) && legs.every(l => l.side === 'long')) {
+    return spotPrice * 0.04 * 100 * qty;
+  }
+  return spotPrice * 0.05 * 100 * qty;
+}
+
 // ─── Force-evaluate all open trades (works outside market hours) ──
 
 async function forceEvaluateTrades() {
@@ -750,6 +800,9 @@ async function forceEvaluateTrades() {
         if (idx === -1) continue;
         const now = Date.now();
 
+        // Corrected maxRisk accounting for leg quantity
+        const correctedMaxRisk = calcMaxRisk(trade.legs, trade.strategy, currentSpot > 0 ? currentSpot : trade.spotAtEntry);
+
         // Check expiration
         const expDate = new Date(trade.expirationDate + 'T16:00:00-05:00').getTime();
         if (now >= expDate) {
@@ -760,7 +813,7 @@ async function forceEvaluateTrades() {
           const exitValue = calcPositionValue(exitLegs, 'exit');
           const entryValue = trade.entryDebit ?? calcPositionValue(trade.legs, 'entry');
           const pl = exitValue - entryValue;
-          const plPct = trade.maxRisk && trade.maxRisk !== 0 ? (pl / Math.abs(trade.maxRisk)) * 100 : 0;
+          const plPct = correctedMaxRisk !== 0 ? (pl / Math.abs(correctedMaxRisk)) * 100 : 0;
 
           trades[idx] = {
             ...trades[idx],
@@ -771,6 +824,7 @@ async function forceEvaluateTrades() {
             exitValue,
             realizedPL: pl,
             realizedPLPct: plPct,
+            maxRisk: correctedMaxRisk,
             exitReason: 'expiration',
             outcome: pl > 0.5 ? 'win' : pl < -0.5 ? 'loss' : 'breakeven',
           };
@@ -781,7 +835,7 @@ async function forceEvaluateTrades() {
           continue;
         }
 
-        // Pending → entered
+        // Pending → entered: only enter if ALL legs have valid prices
         let justEntered = false;
         if (trade.status === 'pending') {
           const entryLegs = trade.legs.map(leg => {
@@ -791,6 +845,15 @@ async function forceEvaluateTrades() {
             }
             return leg;
           });
+          const allPriced = entryLegs.every(l => l.entryMid > 0);
+          if (!allPriced) {
+            const missing = entryLegs.filter(l => l.entryMid <= 0).length;
+            results.push({
+              tradeId: trade.id, symbol: underlying, action: 'awaiting-prices',
+              detail: `${trade.strategy} — ${missing} leg(s) still awaiting quotes, staying pending`,
+            });
+            continue;
+          }
           const entryValue = calcPositionValue(entryLegs, 'entry');
           trades[idx] = {
             ...trades[idx],
@@ -798,6 +861,7 @@ async function forceEvaluateTrades() {
             enteredAt: now,
             legs: entryLegs,
             entryDebit: entryValue,
+            maxRisk: correctedMaxRisk,
           };
           justEntered = true;
         }
@@ -809,11 +873,24 @@ async function forceEvaluateTrades() {
             const price = quotes[leg.optionSymbol];
             return { ...leg, exitBid: price?.bid ?? 0, exitAsk: price?.ask ?? 0, exitMid: price?.mid ?? 0 };
           });
+
+          // Only calculate P/L if ALL legs have current prices
+          const allCurrentPriced = currentLegs.every(l => (l.exitMid ?? 0) > 0);
+          if (!allCurrentPriced) {
+            results.push({
+              tradeId: trade.id, symbol: underlying,
+              action: justEntered ? 'entered' : 'awaiting-prices',
+              detail: `${trade.strategy} — some legs missing current quotes`,
+            });
+            continue;
+          }
+
           const currentValue = calcPositionValue(currentLegs, 'exit');
           const entryValue = activeTrade.entryDebit ?? calcPositionValue(activeTrade.legs, 'entry');
           const unrealizedPL = currentValue - entryValue;
-          const plPct = activeTrade.maxRisk && activeTrade.maxRisk !== 0
-            ? (unrealizedPL / Math.abs(activeTrade.maxRisk)) * 100 : 0;
+          const effectiveMaxRisk = correctedMaxRisk > 0 ? correctedMaxRisk : (activeTrade.maxRisk ?? correctedMaxRisk);
+          const plPct = effectiveMaxRisk !== 0
+            ? (unrealizedPL / Math.abs(effectiveMaxRisk)) * 100 : 0;
 
           // Price snapshot
           const snapshot = { timestamp: now, spotPrice: currentSpot, positionValue: currentValue };
@@ -824,11 +901,15 @@ async function forceEvaluateTrades() {
 
           const label = `${trade.strategy}${trade.expirationDate ? ` (${trade.expirationDate})` : ''}`;
 
+          // Update maxRisk on server if it changed
+          const maxRiskUpdate = effectiveMaxRisk !== activeTrade.maxRisk ? { maxRisk: effectiveMaxRisk } : {};
+
           if (plPct >= profitTarget) {
             trades[idx] = {
               ...trades[idx], status: 'exited', exitedAt: now, spotAtExit: currentSpot,
               legs: currentLegs, exitValue: currentValue, realizedPL: unrealizedPL,
               realizedPLPct: plPct, exitReason: 'profit-target', outcome: 'win', priceHistory,
+              ...maxRiskUpdate,
             };
             results.push({
               tradeId: trade.id, symbol: underlying, action: 'profit-target',
@@ -839,13 +920,14 @@ async function forceEvaluateTrades() {
               ...trades[idx], status: 'exited', exitedAt: now, spotAtExit: currentSpot,
               legs: currentLegs, exitValue: currentValue, realizedPL: unrealizedPL,
               realizedPLPct: plPct, exitReason: 'stop-loss', outcome: 'loss', priceHistory,
+              ...maxRiskUpdate,
             };
             results.push({
               tradeId: trade.id, symbol: underlying, action: 'stop-loss',
               detail: `${label} — hit stop loss: $${unrealizedPL.toFixed(2)} (${plPct.toFixed(1)}%)`,
             });
           } else {
-            trades[idx] = { ...trades[idx], priceHistory };
+            trades[idx] = { ...trades[idx], priceHistory, ...maxRiskUpdate };
             results.push({
               tradeId: trade.id, symbol: underlying,
               action: justEntered ? 'entered' : 'priced',
@@ -942,7 +1024,8 @@ async function forceCloseTrade(id: string, reason: string) {
   const exitValue = calcPositionValue(exitLegs, 'exit');
   const entryValue = trade.entryDebit ?? calcPositionValue(trade.legs, 'entry');
   const pl = exitValue - entryValue;
-  const plPct = trade.maxRisk && trade.maxRisk !== 0 ? (pl / Math.abs(trade.maxRisk)) * 100 : 0;
+  const correctedMaxRisk = calcMaxRisk(trade.legs, trade.strategy, currentSpot > 0 ? currentSpot : trade.spotAtEntry);
+  const plPct = correctedMaxRisk !== 0 ? (pl / Math.abs(correctedMaxRisk)) * 100 : 0;
 
   const isExpiration = reason === 'expiration';
   trades[idx] = {
@@ -954,6 +1037,7 @@ async function forceCloseTrade(id: string, reason: string) {
     exitValue,
     realizedPL: pl,
     realizedPLPct: plPct,
+    maxRisk: correctedMaxRisk,
     exitReason: reason,
     outcome: pl > 0.5 ? 'win' : pl < -0.5 ? 'loss' : 'breakeven',
   };

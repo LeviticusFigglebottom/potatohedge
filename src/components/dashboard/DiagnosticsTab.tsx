@@ -433,6 +433,11 @@ export default function DiagnosticsTab() {
     fetchAll();
   };
 
+  const handlePurgeClosed = async () => {
+    await diagPost('purge-closed').catch(() => {});
+    fetchAll();
+  };
+
   const handleForceEvaluate = async () => {
     setEvaluating(true);
     setEvalResults(null);
@@ -552,6 +557,14 @@ export default function DiagnosticsTab() {
                   className="px-3 py-1 rounded text-[10px] font-mono bg-accent-amber/15 text-accent-amber hover:bg-accent-amber/25 transition-colors"
                 >
                   Close {health.trades.expiredNotClosed} expired (no pricing)
+                </button>
+              )}
+              {(health.trades.exited > 0 || health.trades.expired > 0) && (
+                <button
+                  onClick={handlePurgeClosed}
+                  className="px-3 py-1 rounded text-[10px] font-mono bg-red-500/15 text-red-400 hover:bg-red-500/25 transition-colors"
+                >
+                  Purge {health.trades.exited + health.trades.expired} closed/expired from server
                 </button>
               )}
               {openTrades.length > 0 && (
