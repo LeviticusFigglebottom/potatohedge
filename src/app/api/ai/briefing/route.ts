@@ -479,7 +479,7 @@ ${flowData.flow.tickersScanned > 0 ? '4. **OPTIONS FLOW ANALYSIS** — Analyze t
 | **Ticker** | Stock symbol |
 | **Direction** | Bullish / Bearish / Neutral |
 | **Strategy** | e.g., "Buy 605C weeklies", "Bear put spread 590/580", "Sell iron condor 595/600/610/615" |
-| **Strike(s)** | Exact strike price(s) |
+| **Strike(s)** | Exact strike price(s) — MUST follow strike rules below |
 | **Expiration** | Specific date and DTE |
 | **Entry** | Price target or condition for entry |
 | **Target** | Profit target price/level |
@@ -487,7 +487,15 @@ ${flowData.flow.tickersScanned > 0 ? '4. **OPTIONS FLOW ANALYSIS** — Analyze t
 | **Thesis** | 2-3 sentences: what Greek/flow/level drives this, what catalyst or positioning supports it |
 | **Invalidation** | What specific level or event kills the trade |
 
-Prioritize trades where multiple signals converge: gamma positioning + flow direction + key level proximity + IV regime. Prefer defined-risk strategies (spreads) over naked options. Reference the algorithm trade ideas data above but apply your own judgment — you may modify strikes, expirations, or strategies based on the full market context.
+**MANDATORY STRIKE SELECTION RULES — FOLLOW THESE EXACTLY:**
+1. **Near-the-money only**: All strikes MUST be within 2 ATR of the current spot price. For SPY at $605 with 1% ATR (~$6), that means strikes between ~$593 and ~$617. NEVER pick strikes like $700C or $250P — those are far OTM penny options worth $0.01 with zero edge.
+2. **Minimum premium**: Every individual option leg must have an estimated market value of at least $0.10 per contract. If a strike would trade for pennies, move it closer to the money. A $5-wide spread should cost at least $0.50-1.50 in premium, NOT $0.01.
+3. **Use key levels for strike placement**: Place short strikes near gamma flip, put wall, or call wall levels. Place long strikes 1 ATR beyond the short strikes. The algorithm's ATR-based strikes above are good starting points.
+4. **Credit spreads**: Short strike should be ~0.5-1 ATR from spot (near a support/resistance level). The premium collected should be 20-40% of the spread width.
+5. **Debit spreads**: Long strike should be ATM or slightly ITM. Short strike should be 1-2 ATR away. The debit paid should be 30-60% of the spread width.
+6. **Position value floor**: Each contract in the position must have a notional value of at least $100 (i.e., option mid price × 100 shares ≥ $100, so mid ≥ $1.00 per leg for single-leg trades, or net spread premium ≥ $0.50).
+
+Prioritize trades where multiple signals converge: gamma positioning + flow direction + key level proximity + IV regime. Prefer defined-risk strategies (spreads) over naked options. Reference the algorithm trade ideas data above — use their ATR-derived strikes as the foundation, then adjust based on key levels and flow data.
 
 CRITICAL FORMAT REQUIREMENT: Start each trade idea with "TRADE N:" (e.g., "TRADE 1: SPY BULL PUT SPREAD") followed by the fields in either table or colon format. This exact prefix is required for the UI to parse and display your trade ideas. Example:
 

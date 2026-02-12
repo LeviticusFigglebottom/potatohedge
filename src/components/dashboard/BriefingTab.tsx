@@ -6,7 +6,7 @@ import {
   Newspaper, Loader2, AlertTriangle, TrendingUp, TrendingDown, Minus,
   Wallet, ChevronDown, ChevronUp, CheckCircle2, Sparkles, Eye,
 } from 'lucide-react';
-import { buildTrackedTradeFromAlgo, addTrackedTrade, sizePosition, fetchEntryPrices, fillEntryPrices, calculatePositionValue, type TrackedLeg } from '@/lib/tradeTracker';
+import { buildTrackedTradeFromAlgo, addTrackedTrade, sizePosition, fetchEntryPrices, fillEntryPrices, calculatePositionValue, validateAndClampStrikes, type TrackedLeg } from '@/lib/tradeTracker';
 
 // ─── Trade rule storage (shared with PaperTradingTab + PaperMonitor) ───
 interface TradeRule {
@@ -43,6 +43,20 @@ function saveGroupRule(rule: TradeRule) {
 function parseQuantity(strikesText: string): number {
   const m = strikesText.match(/^(\d+)\s*x\s/i) || strikesText.match(/×\s*(\d+)/);
   return m ? Math.max(1, Math.min(10, parseInt(m[1]))) : 1;
+}
+
+/** Validate and clamp a strike to be within 2 ATR of spot. Returns clamped strike. */
+function clampStrike(strike: number, spot: number, type: 'C' | 'P'): number {
+  const atr = spot * 0.015; // 1.5% default ATR
+  const maxDist = atr * 2;
+  const step = spot > 200 ? 5 : spot > 50 ? 2.5 : 1;
+  if (type === 'C' && strike > spot + maxDist) {
+    return Math.round((spot + maxDist) / step) * step;
+  }
+  if (type === 'P' && strike < spot - maxDist) {
+    return Math.round((spot - maxDist) / step) * step;
+  }
+  return strike;
 }
 
 /** Calculate proper contract quantity using portfolio sizing (1-5% of $100K). */
@@ -236,10 +250,16 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
         tracked.legs = fillEntryPrices(tracked.legs, quotes);
         const hasRealPrices = tracked.legs.some(l => l.entryMid > 0);
         if (hasRealPrices) {
-          tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
-          tracked.status = 'entered';
-          tracked.enteredAt = Date.now();
-          tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
+          // Reject penny options: if avg mid < $0.10, don't mark as entered
+          const pricedLegs = tracked.legs.filter(l => l.entryMid > 0);
+          const avgMid = pricedLegs.reduce((s, l) => s + l.entryMid, 0) / pricedLegs.length;
+          if (avgMid >= 0.10) {
+            tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
+            tracked.status = 'entered';
+            tracked.enteredAt = Date.now();
+            tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
+          }
+          // If avgMid < $0.10, leave as pending — likely penny options that shouldn't be traded
         }
       }
     }
@@ -284,6 +304,9 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
         let sellPut = sellPutMatch ? parseFloat(sellPutMatch[1]) : allStrikes[1] || allStrikes[0] - 20;
         // Ensure call is above put
         if (sellCall < sellPut) [sellCall, sellPut] = [sellPut, sellCall];
+        // Clamp strikes to within 2 ATR of spot
+        sellCall = clampStrike(sellCall, idea.spot, 'C');
+        sellPut = clampStrike(sellPut, idea.spot, 'P');
 
         // Auto-size if no explicit qty in text
         if (qty === 1) {
@@ -339,32 +362,32 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
           // Bull put spread (credit): sell higher put, buy lower put
           optType = 'P';
           orderType = 'credit';
-          leg1Strike = sellStrikes[0] || Math.max(...allStrikes);
-          leg2Strike = buyStrikes[0] || Math.min(...allStrikes);
+          leg1Strike = clampStrike(sellStrikes[0] || Math.max(...allStrikes), idea.spot, 'P');
+          leg2Strike = clampStrike(buyStrikes[0] || Math.min(...allStrikes), idea.spot, 'P');
           leg1Side = 'sell_to_open';
           leg2Side = 'buy_to_open';
         } else if (isBearCall) {
           // Bear call spread (credit): sell lower call, buy higher call
           optType = 'C';
           orderType = 'credit';
-          leg1Strike = sellStrikes[0] || Math.min(...allStrikes);
-          leg2Strike = buyStrikes[0] || Math.max(...allStrikes);
+          leg1Strike = clampStrike(sellStrikes[0] || Math.min(...allStrikes), idea.spot, 'C');
+          leg2Strike = clampStrike(buyStrikes[0] || Math.max(...allStrikes), idea.spot, 'C');
           leg1Side = 'sell_to_open';
           leg2Side = 'buy_to_open';
         } else if (isBullCall) {
           // Bull call spread (debit): buy lower call, sell higher call
           optType = 'C';
           orderType = 'debit';
-          leg1Strike = buyStrikes[0] || Math.min(...allStrikes);
-          leg2Strike = sellStrikes[0] || Math.max(...allStrikes);
+          leg1Strike = clampStrike(buyStrikes[0] || Math.min(...allStrikes), idea.spot, 'C');
+          leg2Strike = clampStrike(sellStrikes[0] || Math.max(...allStrikes), idea.spot, 'C');
           leg1Side = 'buy_to_open';
           leg2Side = 'sell_to_open';
         } else {
           // Bear put spread (debit): buy higher put, sell lower put
           optType = 'P';
           orderType = 'debit';
-          leg1Strike = buyStrikes[0] || Math.max(...allStrikes);
-          leg2Strike = sellStrikes[0] || Math.min(...allStrikes);
+          leg1Strike = clampStrike(buyStrikes[0] || Math.max(...allStrikes), idea.spot, 'P');
+          leg2Strike = clampStrike(sellStrikes[0] || Math.min(...allStrikes), idea.spot, 'P');
           leg1Side = 'buy_to_open';
           leg2Side = 'sell_to_open';
         }
@@ -476,8 +499,8 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
 
       } else {
         // Fallback: single leg (directional call or put)
-        const strike = allStrikes[0] || Math.round(idea.spot);
         const optionType: 'C' | 'P' = /put|bear/i.test(idea.strategy) || idea.direction === 'bearish' ? 'P' : 'C';
+        const strike = clampStrike(allStrikes[0] || Math.round(idea.spot), idea.spot, optionType);
         if (qty === 1) {
           qty = calcQty(idea.spot, idea.strategy, [{ strike, type: optionType, side: 'long' }]);
         }
@@ -678,10 +701,15 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
         tracked.legs = fillEntryPrices(tracked.legs, quotes);
         const hasRealPrices = tracked.legs.some(l => l.entryMid > 0);
         if (hasRealPrices) {
-          tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
-          tracked.status = 'entered';
-          tracked.enteredAt = Date.now();
-          tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
+          // Reject penny options: if avg mid < $0.10, don't mark as entered
+          const pricedLegs = tracked.legs.filter(l => l.entryMid > 0);
+          const avgMid = pricedLegs.reduce((s, l) => s + l.entryMid, 0) / pricedLegs.length;
+          if (avgMid >= 0.10) {
+            tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
+            tracked.status = 'entered';
+            tracked.enteredAt = Date.now();
+            tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
+          }
         }
       }
     }
@@ -725,6 +753,9 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
         let sellCall = sellCallMatch ? parseFloat(sellCallMatch[1]) : Math.max(...allStrikes);
         let sellPut = sellPutMatch ? parseFloat(sellPutMatch[1]) : Math.min(...allStrikes);
         if (sellCall < sellPut) [sellCall, sellPut] = [sellPut, sellCall];
+        // Clamp strikes to within 2 ATR of spot
+        sellCall = clampStrike(sellCall, idea.spot, 'C');
+        sellPut = clampStrike(sellPut, idea.spot, 'P');
         const wingWidth = 5;
 
         // Auto-size: target 1-5% of portfolio
@@ -769,23 +800,23 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
 
         if (isBullPut) {
           optType = 'P'; orderType = 'credit';
-          leg1Strike = sellStrikes[0] || Math.max(...allStrikes);
-          leg2Strike = buyStrikes[0] || Math.min(...allStrikes);
+          leg1Strike = clampStrike(sellStrikes[0] || Math.max(...allStrikes), idea.spot, 'P');
+          leg2Strike = clampStrike(buyStrikes[0] || Math.min(...allStrikes), idea.spot, 'P');
           leg1Side = 'sell_to_open'; leg2Side = 'buy_to_open';
         } else if (isBearCall) {
           optType = 'C'; orderType = 'credit';
-          leg1Strike = sellStrikes[0] || Math.min(...allStrikes);
-          leg2Strike = buyStrikes[0] || Math.max(...allStrikes);
+          leg1Strike = clampStrike(sellStrikes[0] || Math.min(...allStrikes), idea.spot, 'C');
+          leg2Strike = clampStrike(buyStrikes[0] || Math.max(...allStrikes), idea.spot, 'C');
           leg1Side = 'sell_to_open'; leg2Side = 'buy_to_open';
         } else if (isBullCall) {
           optType = 'C'; orderType = 'debit';
-          leg1Strike = buyStrikes[0] || Math.min(...allStrikes);
-          leg2Strike = sellStrikes[0] || Math.max(...allStrikes);
+          leg1Strike = clampStrike(buyStrikes[0] || Math.min(...allStrikes), idea.spot, 'C');
+          leg2Strike = clampStrike(sellStrikes[0] || Math.max(...allStrikes), idea.spot, 'C');
           leg1Side = 'buy_to_open'; leg2Side = 'sell_to_open';
         } else {
           optType = 'P'; orderType = 'debit';
-          leg1Strike = buyStrikes[0] || Math.max(...allStrikes);
-          leg2Strike = sellStrikes[0] || Math.min(...allStrikes);
+          leg1Strike = clampStrike(buyStrikes[0] || Math.max(...allStrikes), idea.spot, 'P');
+          leg2Strike = clampStrike(sellStrikes[0] || Math.min(...allStrikes), idea.spot, 'P');
           leg1Side = 'buy_to_open'; leg2Side = 'sell_to_open';
         }
 
@@ -857,8 +888,8 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
 
       } else {
         // Fallback: single leg
-        const strike = allStrikes[0] || Math.round(idea.spot);
         const optionType: 'C' | 'P' = /put|bear/i.test(idea.strategy) || idea.direction.toLowerCase().includes('bear') ? 'P' : 'C';
+        const strike = clampStrike(allStrikes[0] || Math.round(idea.spot), idea.spot, optionType);
         // Auto-size
         if (qty === 1) {
           qty = calcQty(idea.spot, idea.strategy, [

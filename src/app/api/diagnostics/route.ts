@@ -176,7 +176,25 @@ async function getHealth() {
   const errorSummary = getErrorSummary();
 
   // Load tracked trades from server
-  const trades = await loadTrackedTradesFromServer();
+  let trades = await loadTrackedTradesFromServer();
+
+  // Auto-expire stale trades on health check (server-side cleanup)
+  const now = Date.now();
+  let autoExpired = 0;
+  for (const t of trades) {
+    if (t.status === 'exited' || t.status === 'expired') continue;
+    const expDate = new Date(t.expirationDate + 'T16:00:00-05:00').getTime();
+    if (now > expDate + 3600000) { // 1 hour past expiration
+      t.status = 'expired';
+      t.exitedAt = now;
+      t.exitReason = 'expiration';
+      if (t.outcome === null) t.outcome = 'loss';
+      autoExpired++;
+    }
+  }
+  if (autoExpired > 0) {
+    await saveTrackedTradesToServer(trades);
+  }
 
   const openTrades = trades.filter(t => t.status === 'pending' || t.status === 'entered');
   // entryDebit=0 is valid for credit spreads; only null means truly unpriced
@@ -213,6 +231,7 @@ async function getHealth() {
       expired: trades.filter(t => t.status === 'expired').length,
       unpriced: unpricedTrades.length,
       expiredNotClosed: expiredNotClosed.length,
+      autoExpiredThisCheck: autoExpired,
     },
     errors: errorSummary,
     issues,

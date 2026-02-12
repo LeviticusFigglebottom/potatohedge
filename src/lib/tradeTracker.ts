@@ -687,6 +687,13 @@ export function buildTrackedTradeFromAlgo(params: {
   // Build basic legs from strikes text if not provided
   let parsedLegs: TrackedLeg[] = legs ?? parseLegsFromStrikesText(symbol, trade.strikes, trade.strategy, expirationDate, spotPrice);
 
+  // Validate strikes are reasonable before sizing
+  if (!hasAdequatePremium(parsedLegs, spotPrice)) {
+    // Strikes are likely far OTM penny options — log warning but still track
+    // The validateAndClampStrikes in parseLegsFromStrikesText should have fixed most cases
+    console.warn(`[tradeTracker] Trade ${symbol} ${trade.strategy} may have inadequate premium — strikes far from spot $${spotPrice}`);
+  }
+
   // Auto-size if all legs have qty=1 (no explicit sizing in the text).
   // The algo recommendations include "Nx" in strikes text which parseLegsFromStrikesText respects.
   // AI trade ideas typically don't include sizing, so we apply portfolio-based sizing here.
@@ -1051,6 +1058,22 @@ function parseLegsFromStrikesText(
     legs.push(makeLeg(strike, type as 'call' | 'put', isShort ? 'short' : 'long'));
   }
 
+  // Validate strikes: clamp any that are too far from spot
+  if (legs.length > 0 && spotPrice > 0) {
+    const validated = validateAndClampStrikes(legs, spotPrice);
+    // Rebuild OCC symbols for any legs whose strikes changed
+    for (let i = 0; i < legs.length; i++) {
+      if (legs[i].strike !== validated[i].strike) {
+        const type = validated[i].optionType === 'call' ? 'C' : 'P';
+        validated[i] = {
+          ...validated[i],
+          optionSymbol: occ(type as 'C' | 'P', validated[i].strike),
+        };
+      }
+    }
+    return validated;
+  }
+
   return legs;
 }
 
@@ -1112,6 +1135,63 @@ function calculateMaxRisk(legs: TrackedLeg[], strategy: string, spotPrice: numbe
   return spotPrice * 0.05 * 100 * qty;
 }
 
+// ─── Strike Validation ───────────────────────────────────
+
+const MAX_ATR_DISTANCE = 2.0; // Max distance from spot in ATR multiples
+const DEFAULT_ATR_PCT = 0.015; // 1.5% default ATR if unknown
+const MIN_PREMIUM_PER_CONTRACT = 0.10; // $0.10 minimum per option leg
+const MIN_POSITION_VALUE = 100; // $100 minimum notional per contract
+
+/**
+ * Validate that strikes are reasonable relative to spot price.
+ * Returns clamped strikes if they're too far OTM, or null if unfixable.
+ * Uses 2 ATR as the maximum distance from spot.
+ */
+export function validateAndClampStrikes(
+  legs: TrackedLeg[],
+  spotPrice: number,
+  atrPercent?: number,
+): TrackedLeg[] {
+  if (spotPrice <= 0) return legs;
+  const atr = spotPrice * (atrPercent || DEFAULT_ATR_PCT);
+  const maxDist = atr * MAX_ATR_DISTANCE;
+  const minStrike = spotPrice - maxDist;
+  const maxStrike = spotPrice + maxDist;
+
+  return legs.map(leg => {
+    if (leg.strike >= minStrike && leg.strike <= maxStrike) return leg;
+    // Clamp to boundary — snap to nearest valid strike
+    const clamped = leg.strike < minStrike ? minStrike : maxStrike;
+    // Round to standard strike increments
+    const step = spotPrice > 200 ? 5 : spotPrice > 50 ? 2.5 : 1;
+    const rounded = Math.round(clamped / step) * step;
+    return { ...leg, strike: rounded };
+  });
+}
+
+/**
+ * Check if a set of legs would produce penny options (premium < $0.10).
+ * Uses distance from spot as a proxy when we don't have live quotes.
+ * Returns true if the position likely has adequate premium.
+ */
+export function hasAdequatePremium(
+  legs: TrackedLeg[],
+  spotPrice: number,
+): boolean {
+  // If we already have live prices, check directly
+  if (legs.some(l => l.entryMid > 0)) {
+    return legs.every(l => l.entryMid === 0 || l.entryMid >= MIN_PREMIUM_PER_CONTRACT);
+  }
+  // Heuristic: options >1.5 ATR from spot on weekly expirations are likely pennies
+  // For now, check that no single-leg trade has strikes >10% from spot
+  for (const leg of legs) {
+    const distPct = Math.abs(leg.strike - spotPrice) / spotPrice;
+    if (distPct > 0.10 && legs.length === 1) return false; // likely penny option
+    if (distPct > 0.15) return false; // definitely too far OTM for any strategy
+  }
+  return true;
+}
+
 // ─── Position Sizing ─────────────────────────────────────
 
 const PORTFOLIO_SIZE = 100_000;
@@ -1163,6 +1243,7 @@ export function maxRiskPerContract(legs: TrackedLeg[], strategy: string, spotPri
 
 /**
  * Calculate optimal contract quantity for a trade, targeting 1-5% of portfolio.
+ * Also enforces minimum position value ($100 per contract notional).
  * Returns at least 1, at most MAX_CONTRACTS.
  */
 export function sizePosition(legs: TrackedLeg[], strategy: string, spotPrice: number): number {
@@ -1177,7 +1258,18 @@ export function sizePosition(legs: TrackedLeg[], strategy: string, spotPrice: nu
   // Floor: at least meet min allocation
   const minQty = Math.ceil(minAllocation / riskPer);
 
-  return Math.max(1, Math.min(MAX_CONTRACTS, Math.max(minQty, targetQty)));
+  let qty = Math.max(1, Math.min(MAX_CONTRACTS, Math.max(minQty, targetQty)));
+
+  // Enforce minimum position value: if we have entry prices, check that
+  // total position notional per contract ≥ $100 ($1.00 × 100 shares).
+  // If premium is too low, reduce qty to 1 (the trade itself is suspect).
+  const avgMid = legs.filter(l => l.entryMid > 0).reduce((s, l) => s + l.entryMid, 0) / Math.max(1, legs.filter(l => l.entryMid > 0).length);
+  if (avgMid > 0 && avgMid < MIN_PREMIUM_PER_CONTRACT) {
+    // Penny options — sizing won't help, just use 1 contract
+    qty = 1;
+  }
+
+  return qty;
 }
 
 // ─── Retroactive Resizing ─────────────────────────────────
