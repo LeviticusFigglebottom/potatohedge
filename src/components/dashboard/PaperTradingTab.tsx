@@ -403,6 +403,8 @@ export default function PaperTradingTab() {
   const [showFills, setShowFills] = useState(false);
   const [cancellingAll, setCancellingAll] = useState(false);
   const [confirmPurgeRules, setConfirmPurgeRules] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const refresh = useCallback(async () => {
@@ -519,6 +521,17 @@ export default function PaperTradingTab() {
     refresh();
   };
 
+  const handleResetPaperTrading = async () => {
+    setResetting(true);
+    setConfirmReset(false);
+    try {
+      await fetch('/api/paper/reset', { method: 'POST', signal: AbortSignal.timeout(25000) });
+      localStorage.removeItem('optix-paper-rules');
+      setTimeout(refresh, 1000); // Wait for Tradier to process closes
+    } catch { /* best effort */ }
+    finally { setResetting(false); }
+  };
+
   if (notConfigured) {
     return (
       <div className="space-y-4 animate-fade-in">
@@ -566,6 +579,24 @@ export default function PaperTradingTab() {
             )}
           </div>
           <div className="flex items-center gap-2">
+            {/* Reset all paper trading: cancel orders + close positions + clear rules */}
+            {confirmReset ? (
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] text-red-400 font-mono">Close all positions & cancel orders?</span>
+                <button onClick={handleResetPaperTrading} className="px-2 py-0.5 rounded text-[10px] font-mono bg-red-500/15 text-red-400 hover:bg-red-500/25 transition-colors">Yes</button>
+                <button onClick={() => setConfirmReset(false)} className="px-2 py-0.5 rounded text-[10px] font-mono text-text-muted hover:text-text-secondary transition-colors">No</button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmReset(true)}
+                disabled={resetting}
+                className="px-2 py-1 rounded text-xs font-mono text-text-muted hover:text-red-400 transition-colors flex items-center gap-1 disabled:opacity-50"
+                title="Cancel all orders, close all positions, and clear exit rules"
+              >
+                {resetting ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                Reset All
+              </button>
+            )}
             {/* Purge trade rules */}
             {confirmPurgeRules ? (
               <div className="flex items-center gap-1.5">
