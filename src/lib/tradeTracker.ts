@@ -133,10 +133,50 @@ export function loadTrackedTrades(): TrackedTrade[] {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    return autoExpireStale(parsed);
   } catch {
     return [];
   }
+}
+
+/**
+ * Auto-expire trades that are past their expiration date but still open.
+ * This handles the case where TrackerMonitor didn't run during expiration
+ * (e.g., weekend expiration, after-hours, app not loaded).
+ */
+function autoExpireStale(trades: TrackedTrade[]): TrackedTrade[] {
+  const now = Date.now();
+  let changed = false;
+  for (const t of trades) {
+    if (t.status === 'exited' || t.status === 'expired') continue;
+    const expDate = new Date(t.expirationDate + 'T16:00:00-05:00').getTime();
+    // Auto-expire if more than 1 hour past expiration
+    if (now > expDate + 3600000) {
+      t.status = 'expired';
+      t.exitedAt = now;
+      t.exitReason = 'expiration';
+      if (t.outcome === null) {
+        // Best-effort outcome: if we have an entry value, use last price snapshot
+        const lastSnap = t.priceHistory.length > 0 ? t.priceHistory[t.priceHistory.length - 1] : null;
+        if (lastSnap && t.entryDebit !== null) {
+          const pl = lastSnap.positionValue - t.entryDebit;
+          t.exitValue = lastSnap.positionValue;
+          t.realizedPL = pl;
+          t.realizedPLPct = t.maxRisk && t.maxRisk !== 0 ? (pl / Math.abs(t.maxRisk)) * 100 : 0;
+          t.outcome = pl > 0.5 ? 'win' : pl < -0.5 ? 'loss' : 'breakeven';
+        } else {
+          t.outcome = 'loss';
+        }
+      }
+      changed = true;
+    }
+  }
+  if (changed) {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(trades)); } catch {}
+    syncTrackedTradesToServer(trades).catch(() => {});
+  }
+  return trades;
 }
 
 export function saveTrackedTrades(trades: TrackedTrade[]): void {
@@ -184,12 +224,15 @@ export async function loadTrackedTradesWithSync(): Promise<TrackedTrade[]> {
       if (local.length > 0) syncTrackedTradesToServer(local).catch(() => {});
       return local;
     }
-    // Merge by ID, prefer newer timestamp
+    // Merge by ID, prefer the version with the most recent activity
+    const freshness = (t: TrackedTrade): number =>
+      Math.max(t.trackedAt || 0, t.enteredAt || 0, t.exitedAt || 0,
+        t.priceHistory.length > 0 ? t.priceHistory[t.priceHistory.length - 1].timestamp : 0);
     const byId = new Map<string, TrackedTrade>();
     for (const t of server) byId.set(t.id, t);
     for (const t of local) {
       const existing = byId.get(t.id);
-      if (!existing || t.trackedAt >= existing.trackedAt) {
+      if (!existing || freshness(t) >= freshness(existing)) {
         byId.set(t.id, t);
       }
     }
@@ -207,11 +250,30 @@ export async function loadTrackedTradesWithSync(): Promise<TrackedTrade[]> {
 
 export function addTrackedTrade(trade: TrackedTrade): TrackedTrade[] {
   const trades = loadTrackedTrades();
-  // Don't add duplicates
+  // Don't add exact ID duplicates
   if (trades.some(t => t.id === trade.id)) return trades;
+  // Don't add functional duplicates (same symbol + strategy + expiration that are still open)
+  if (isDuplicateTrack(trades, trade.symbol, trade.strategy, trade.expirationDate)) return trades;
   trades.unshift(trade);
   saveTrackedTrades(trades);
   return trades;
+}
+
+/**
+ * Check if a functionally equivalent open trade already exists.
+ */
+export function isDuplicateTrack(
+  trades: TrackedTrade[],
+  symbol: string,
+  strategy: string,
+  expirationDate: string
+): boolean {
+  return trades.some(t =>
+    t.symbol === symbol &&
+    t.strategy === strategy &&
+    t.expirationDate === expirationDate &&
+    (t.status === 'pending' || t.status === 'entered')
+  );
 }
 
 export function updateTrackedTrade(id: string, updates: Partial<TrackedTrade>): TrackedTrade[] {
@@ -888,4 +950,54 @@ function calculateMaxRisk(legs: TrackedLeg[], strategy: string, spotPrice: numbe
 
   // Fallback: conservative estimate based on spot
   return spotPrice * 0.05 * 100;
+}
+
+// ─── Paper Position Close Helper ──────────────────────────
+
+/**
+ * Close all paper positions for a tracked trade's legs.
+ * Best-effort: silently ignores failures (position may not exist on Tradier).
+ */
+export async function closePaperPositions(trade: TrackedTrade): Promise<void> {
+  if (typeof window === 'undefined') return;
+  for (const leg of trade.legs) {
+    if (!leg.optionSymbol) continue;
+    const quantity = leg.quantity * (leg.side === 'long' ? 1 : -1);
+    try {
+      await fetch('/api/paper/close', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: leg.optionSymbol, quantity }),
+        signal: AbortSignal.timeout(5000),
+      });
+    } catch {
+      // Best effort — position may not exist, may be already closed, or sandbox may be down
+    }
+  }
+}
+
+/**
+ * Mark a paper trade rule as triggered (so PaperMonitor won't double-close).
+ */
+export function markPaperRuleTriggered(trade: TrackedTrade, trigger: 'target' | 'stop'): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const raw = localStorage.getItem('optix-paper-rules');
+    if (!raw) return;
+    const rules = JSON.parse(raw) as Array<{
+      id: string;
+      occSymbols?: string[];
+      exitTriggered?: string | null;
+      [key: string]: unknown;
+    }>;
+    // Find matching rule by OCC symbols overlap
+    const tradeOCCs = new Set(trade.legs.map(l => l.optionSymbol));
+    const idx = rules.findIndex(r =>
+      r.occSymbols?.some(s => tradeOCCs.has(s))
+    );
+    if (idx >= 0) {
+      rules[idx].exitTriggered = trigger;
+      localStorage.setItem('optix-paper-rules', JSON.stringify(rules));
+    }
+  } catch {}
 }

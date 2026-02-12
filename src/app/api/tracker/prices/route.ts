@@ -11,9 +11,12 @@ import { logErr, logWarn } from '@/lib/errorLogger';
 const FETCH_TIMEOUT = 8000;
 
 export async function GET(request: NextRequest) {
-  const token = process.env.TRADIER_API_KEY;
+  const isSandbox = process.env.TRADIER_SANDBOX === 'true';
+  const token = isSandbox
+    ? (process.env.TRADIER_SANDBOX_KEY || process.env.TRADIER_API_KEY)
+    : process.env.TRADIER_API_KEY;
   if (!token) {
-    return NextResponse.json({ error: 'TRADIER_API_KEY not configured' }, { status: 500 });
+    return NextResponse.json({ error: isSandbox ? 'TRADIER_SANDBOX_KEY not configured' : 'TRADIER_API_KEY not configured' }, { status: 500 });
   }
 
   const symbols = request.nextUrl.searchParams.get('symbols');
@@ -23,7 +26,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'symbols parameter required' }, { status: 400 });
   }
 
-  const baseUrl = process.env.TRADIER_SANDBOX === 'true'
+  const baseUrl = isSandbox
     ? 'https://sandbox.tradier.com/v1'
     : 'https://api.tradier.com/v1';
 

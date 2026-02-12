@@ -448,6 +448,8 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId} (TP: +${idea.profitTargetPct || 75}% / SL: -${idea.stopLossPct || 50}%)` }));
       }
+      // Auto-track the paper trade so TrackerMonitor monitors it
+      if (!trackedIdeas.has(idx)) handleTrack(idea, idx);
     } catch (err) {
       setPaperStatus(s => ({ ...s, [idx]: `Error: ${err instanceof Error ? err.message : 'Failed'}` }));
     }
@@ -572,6 +574,9 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
   const handleTrack = (idea: AITradeIdea, idx: number) => {
     const dirLow = idea.direction.toLowerCase();
     const direction = dirLow.includes('bull') ? 'bullish' : dirLow.includes('bear') ? 'bearish' : 'neutral';
+    // Parse profit target / stop loss from AI idea text (e.g. "50% of credit" or "$150")
+    const targetMatch = idea.target?.match(/(\d+)\s*%/);
+    const stopMatch = idea.stopMaxLoss?.match(/(\d+)\s*%/);
     const tracked = buildTrackedTradeFromAlgo({
       symbol: idea.ticker,
       spotPrice: idea.spot,
@@ -586,6 +591,8 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
         risk: idea.stopMaxLoss || 'See trade details',
         reasoning: [idea.thesis, idea.invalidation ? `Invalidation: ${idea.invalidation}` : ''].filter(Boolean),
         tags: ['ai-generated'],
+        profitTargetPct: targetMatch ? parseInt(targetMatch[1]) : 50,
+        stopLossPct: stopMatch ? parseInt(stopMatch[1]) : 100,
       },
       marketSnapshot: {
         ivRank: idea.ivRank,
@@ -600,7 +607,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
         volRegime: idea.ivRank > 60 ? 'high' : idea.ivRank < 30 ? 'low' : 'mid',
         gammaRegime: 'neutral',
       },
-      source: 'ai-briefing',
+      source: 'ai-analysis',
       nearestExp: idea.nearestExp,
     });
     addTrackedTrade(tracked);
@@ -767,6 +774,8 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId}` }));
       }
+      // Auto-track the paper trade so TrackerMonitor monitors it
+      if (!trackedIdeas.has(idx)) handleTrack(idea, idx);
     } catch (err) {
       setPaperStatus(s => ({ ...s, [idx]: `Error: ${err instanceof Error ? err.message : 'Failed'}` }));
     }

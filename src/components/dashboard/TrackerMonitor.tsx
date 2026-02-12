@@ -4,14 +4,24 @@ import { useEffect, useRef, useCallback } from 'react';
 import {
   loadTrackedTrades,
   evaluateTrade,
+  closePaperPositions,
+  markPaperRuleTriggered,
   type TrackedTrade,
 } from '@/lib/tradeTracker';
 
 /**
  * Background monitor for tracked AI/algo trade recommendations.
  * Runs at the app level (page.tsx) — checks tracked trades regardless of active tab.
- * Polls every 90s during market hours, fetches live option prices for all open tracked trades,
- * and evaluates them against profit targets, stop losses, and expiration.
+ *
+ * During market hours: polls every 90s, fetches live option prices for all open trades,
+ * evaluates against profit targets, stop losses, and expiration.
+ *
+ * Outside market hours: polls every 5 minutes, only checks for expired trades
+ * (no live price fetch — Tradier won't return real-time quotes).
+ *
+ * When a trade exits (profit target, stop loss, expiration), it also:
+ * 1. Closes the actual Tradier paper positions (best-effort)
+ * 2. Marks the corresponding TradeRule as triggered (prevents PaperMonitor double-close)
  */
 
 function isMarketHours(): boolean {
@@ -34,19 +44,55 @@ function logToServer(severity: string, message: string, context?: Record<string,
   }).catch(() => {});
 }
 
+/**
+ * When a tracked trade exits, close paper positions and mark TradeRule as triggered.
+ */
+async function handleTradeExit(trade: TrackedTrade, trigger: 'target' | 'stop') {
+  try {
+    await closePaperPositions(trade);
+    markPaperRuleTriggered(trade, trigger);
+    logToServer('info', `Auto-closed paper positions for ${trade.symbol} ${trade.strategy} — ${trigger}`, {
+      tradeId: trade.id, symbol: trade.symbol, strategy: trade.strategy, trigger,
+    });
+  } catch (e) {
+    logToServer('warn', `Failed to close paper positions for ${trade.symbol}: ${e instanceof Error ? e.message : 'Unknown'}`, {
+      tradeId: trade.id,
+    });
+  }
+}
+
 export default function TrackerMonitor() {
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const afterHoursRef = useRef<NodeJS.Timeout | null>(null);
   const runningRef = useRef(false);
 
   const evaluateTrackedTrades = useCallback(async () => {
     if (runningRef.current) return;
-    if (!isMarketHours()) return;
 
     const trades = loadTrackedTrades();
     const openTrades = trades.filter(
       (t) => t.status === 'pending' || t.status === 'entered'
     );
     if (openTrades.length === 0) return;
+
+    const marketOpen = isMarketHours();
+
+    // Outside market hours: only handle expired trades (no price fetching)
+    if (!marketOpen) {
+      const now = Date.now();
+      for (const trade of openTrades) {
+        const expDate = new Date(trade.expirationDate + 'T16:00:00-05:00').getTime();
+        if (now > expDate + 3600000) { // 1 hour past expiration
+          // autoExpireStale in loadTrackedTrades already handles marking — just close paper positions
+          const freshTrades = loadTrackedTrades();
+          const updated = freshTrades.find(t => t.id === trade.id);
+          if (updated && (updated.status === 'expired' || updated.status === 'exited')) {
+            await handleTradeExit(updated, 'stop');
+          }
+        }
+      }
+      return;
+    }
 
     runningRef.current = true;
     try {
@@ -116,7 +162,12 @@ export default function TrackerMonitor() {
           // Evaluate each trade
           for (const trade of underlyingTrades) {
             try {
-              evaluateTrade(trade, currentSpot, legPrices);
+              const updatedTrade = evaluateTrade(trade, currentSpot, legPrices);
+              // If trade was exited, close paper positions and mark rule
+              if (updatedTrade && (updatedTrade.status === 'exited' || updatedTrade.status === 'expired')) {
+                const trigger = updatedTrade.exitReason === 'profit-target' ? 'target' : 'stop';
+                await handleTradeExit(updatedTrade, trigger);
+              }
             } catch (e) {
               logToServer('error', `Evaluation failed for trade ${trade.id}`, { tradeId: trade.id, strategy: trade.strategy, error: String(e) });
             }
@@ -135,11 +186,19 @@ export default function TrackerMonitor() {
   useEffect(() => {
     // Initial check after 10s delay (let the app settle)
     const startDelay = setTimeout(evaluateTrackedTrades, 10000);
-    // Then check every 90s
+
+    // Market hours: check every 90s
     intervalRef.current = setInterval(evaluateTrackedTrades, 90000);
+
+    // After hours: check every 5 minutes for expiration handling
+    afterHoursRef.current = setInterval(() => {
+      if (!isMarketHours()) evaluateTrackedTrades();
+    }, 300000);
+
     return () => {
       clearTimeout(startDelay);
       if (intervalRef.current) clearInterval(intervalRef.current);
+      if (afterHoursRef.current) clearInterval(afterHoursRef.current);
     };
   }, [evaluateTrackedTrades]);
 

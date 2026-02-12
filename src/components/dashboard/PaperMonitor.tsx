@@ -1,12 +1,20 @@
 'use client';
 
 import { useEffect, useRef, useCallback } from 'react';
+import {
+  loadTrackedTrades,
+  updateTrackedTrade,
+  type TrackedTrade,
+} from '@/lib/tradeTracker';
 
 /**
  * Background monitor for paper trading positions.
  * Runs at the app level (page.tsx) — checks positions regardless of active tab.
  * Polls every 60s during market hours, checks grouped spread P&L against exit rules.
  * Supports both new grouped rules (spreads) and legacy single-symbol rules.
+ *
+ * When it closes a position, it also updates the corresponding TrackedTrade
+ * so both tracking systems stay in sync.
  */
 
 interface TradeRule {
@@ -53,6 +61,41 @@ function isMarketHours(): boolean {
   if (day === 0 || day === 6) return false;
   const time = et.getHours() * 60 + et.getMinutes();
   return time >= 480 && time <= 1080; // 8AM-6PM ET
+}
+
+/**
+ * When PaperMonitor closes positions, find the matching TrackedTrade and mark it exited.
+ */
+function syncTrackedTradeOnClose(
+  occSymbols: string[],
+  trigger: 'target' | 'stop',
+  matched: Position[]
+) {
+  try {
+    const trades = loadTrackedTrades();
+    const occSet = new Set(occSymbols);
+    // Find TrackedTrade whose legs overlap with closed positions
+    const match = trades.find(t =>
+      (t.status === 'pending' || t.status === 'entered') &&
+      t.legs.some(l => occSet.has(l.optionSymbol))
+    );
+    if (!match) return;
+
+    const now = Date.now();
+    const totalPL = matched.reduce((s, p) => s + p.unrealizedPL, 0);
+    const plPct = match.maxRisk && match.maxRisk !== 0 ? (totalPL / Math.abs(match.maxRisk)) * 100 : 0;
+
+    updateTrackedTrade(match.id, {
+      status: 'exited',
+      exitedAt: now,
+      exitReason: trigger === 'target' ? 'profit-target' : 'stop-loss',
+      outcome: trigger === 'target' ? 'win' : 'loss',
+      realizedPL: totalPL,
+      realizedPLPct: plPct,
+    } as Partial<TrackedTrade>);
+  } catch {
+    // Best effort sync
+  }
 }
 
 export default function PaperMonitor() {
@@ -153,6 +196,9 @@ export default function PaperMonitor() {
             allRules[idx].exitOrderId = firstOrderId;
             saveRules(allRules);
           }
+
+          // Sync: mark corresponding TrackedTrade as exited too
+          syncTrackedTradeOnClose(ruleSymbols, triggered, matched);
         }
       }
     } catch {

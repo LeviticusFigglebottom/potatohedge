@@ -863,13 +863,47 @@ async function forceEvaluateTrades() {
 
   await saveTrackedTradesToServer(trades);
 
+  // Close paper positions for any trades that just exited (profit target, stop loss, expiration)
+  const exitedTradeIds = results.filter(r =>
+    r.action === 'profit-target' || r.action === 'stop-loss' || r.action === 'expired'
+  ).map(r => r.tradeId);
+  const paperCloseCount = await closePaperPositionsForTrades(trades, exitedTradeIds);
+
   return {
     ok: true,
     evaluated: openTrades.length,
     total: trades.length,
     results,
     errors: errors.length > 0 ? errors : undefined,
+    paperPositionsClosed: paperCloseCount > 0 ? paperCloseCount : undefined,
   };
+}
+
+async function closePaperPositionsForTrades(trades: ServerTrade[], tradeIds: string[]): Promise<number> {
+  if (tradeIds.length === 0 || !process.env.TRADIER_SANDBOX_KEY) return 0;
+  let closed = 0;
+  try {
+    const { closePosition, parseOCCSymbol } = await import('@/lib/providers/tradierPaper');
+    for (const tradeId of tradeIds) {
+      const trade = trades.find(t => t.id === tradeId);
+      if (!trade) continue;
+      for (const leg of trade.legs) {
+        if (!leg.optionSymbol) continue;
+        const parsed = parseOCCSymbol(leg.optionSymbol);
+        const underlying = parsed?.underlying || trade.symbol;
+        const qty = leg.quantity * (leg.side === 'long' ? 1 : -1);
+        try {
+          await closePosition(underlying, leg.optionSymbol, qty);
+          closed++;
+        } catch {
+          // Best effort — position may not exist
+        }
+      }
+    }
+  } catch {
+    // Import or general error
+  }
+  return closed;
 }
 
 // ─── Force-close a single trade with live pricing ────────
@@ -926,6 +960,29 @@ async function forceCloseTrade(id: string, reason: string) {
 
   await saveTrackedTradesToServer(trades);
 
+  // Also close paper positions on Tradier sandbox (best-effort, server-side)
+  const paperCloseResults: { symbol: string; ok: boolean; error?: string }[] = [];
+  const sandboxKey = process.env.TRADIER_SANDBOX_KEY;
+  if (sandboxKey) {
+    try {
+      const { closePosition, parseOCCSymbol } = await import('@/lib/providers/tradierPaper');
+      for (const leg of trade.legs) {
+        if (!leg.optionSymbol) continue;
+        const parsed = parseOCCSymbol(leg.optionSymbol);
+        const underlying = parsed?.underlying || trade.symbol;
+        const qty = leg.quantity * (leg.side === 'long' ? 1 : -1);
+        try {
+          await closePosition(underlying, leg.optionSymbol, qty);
+          paperCloseResults.push({ symbol: leg.optionSymbol, ok: true });
+        } catch (e) {
+          paperCloseResults.push({ symbol: leg.optionSymbol, ok: false, error: e instanceof Error ? e.message : 'Unknown' });
+        }
+      }
+    } catch (e) {
+      paperCloseResults.push({ symbol: '*', ok: false, error: `Import error: ${e instanceof Error ? e.message : 'Unknown'}` });
+    }
+  }
+
   return {
     ok: true,
     tradeId: id,
@@ -935,5 +992,6 @@ async function forceCloseTrade(id: string, reason: string) {
     realizedPLPct: plPct,
     exitValue,
     priced: currentSpot > 0,
+    paperPositionsClosed: paperCloseResults.length > 0 ? paperCloseResults : undefined,
   };
 }
