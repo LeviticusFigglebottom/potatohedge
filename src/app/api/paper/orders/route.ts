@@ -15,7 +15,7 @@ export async function GET() {
     const orders = await getOrders();
 
     // Auto-cancel stale pending/open orders older than 5 minutes
-    // These are typically from multileg orders that Tradier sandbox never fills
+    // Sandbox orders outside market hours sometimes stay pending indefinitely
     const now = Date.now();
     const cancelledIds: number[] = [];
     for (const o of orders) {

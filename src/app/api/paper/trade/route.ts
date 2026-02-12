@@ -4,7 +4,6 @@ export const maxDuration = 15;
 
 import {
   placeSingleOrder,
-  placeMultiLegOrder,
   buildOCCSymbol,
   type SingleLegOrder,
 } from '@/lib/providers/tradierPaper';
@@ -96,7 +95,7 @@ export async function POST(request: NextRequest) {
         },
       });
     } else if (body.type === 'spread') {
-      const { symbol, orderType, netPrice, duration, legs } = body;
+      const { symbol, duration, legs } = body;
 
       if (!symbol || !legs || !Array.isArray(legs) || legs.length < 2) {
         return NextResponse.json({ error: 'Missing required fields: symbol, legs (array of 2+ legs)' }, { status: 400 });
@@ -109,58 +108,35 @@ export async function POST(request: NextRequest) {
         quantity: leg.quantity || 1,
       }));
 
-      // For paper trading: try multileg market order first.
-      // If explicit netPrice provided with debit/credit type, use that.
-      // Otherwise always use market type — no price resolution needed for sandbox.
-      const resolvedType = (netPrice != null && orderType && orderType !== 'market')
-        ? orderType as 'debit' | 'credit' | 'even'
-        : 'market' as const;
-
-      let result: { id: number; status: string };
-      let usedFallback = false;
-
-      try {
-        result = await placeMultiLegOrder({
+      // Tradier sandbox multileg orders almost never fill — they return 'ok' (accepted)
+      // or 'pending' but the order never transitions to 'filled'. This is a known sandbox
+      // limitation, especially with 4-leg iron condors.
+      //
+      // Strategy: ALWAYS decompose into individual single-leg market orders.
+      // Single-leg market orders fill instantly and reliably on the sandbox.
+      const legResults: { id: number; status: string; optionSymbol: string }[] = [];
+      for (const leg of builtLegs) {
+        const legResult = await placeSingleOrder({
           symbol,
-          type: resolvedType,
-          price: netPrice != null ? netPrice : undefined,
+          optionSymbol: leg.optionSymbol,
+          side: leg.side,
+          quantity: leg.quantity,
+          type: 'market',
           duration: (duration || 'day') as 'day' | 'gtc',
-          legs: builtLegs,
         });
-
-        // Tradier sandbox multileg orders often land as 'pending' and never fill.
-        // If the order is pending, cancel it and fall through to single-leg fallback.
-        if (result.status === 'pending' || result.status === 'open') {
-          try {
-            const { cancelOrder } = await import('@/lib/providers/tradierPaper');
-            await cancelOrder(result.id);
-          } catch { /* best effort cancel */ }
-          throw new Error('Multileg order pending — using single-leg fallback');
-        }
-      } catch {
-        // Multileg failed or pending — decompose into individual single-leg market orders.
-        // This is the most reliable approach for sandbox.
-        usedFallback = true;
-        const legResults: { id: number; status: string }[] = [];
-        for (const leg of builtLegs) {
-          const legResult = await placeSingleOrder({
-            symbol,
-            optionSymbol: leg.optionSymbol,
-            side: leg.side,
-            quantity: leg.quantity,
-            type: 'market',
-            duration: 'day',
-          });
-          legResults.push(legResult);
-        }
-        result = { id: legResults[0].id, status: `${legResults.length} legs filled individually` };
+        legResults.push({ ...legResult, optionSymbol: leg.optionSymbol });
       }
+      const result = {
+        id: legResults[0].id,
+        status: `${legResults.length} legs filled individually`,
+      };
 
       return NextResponse.json({
         success: true,
         orderId: result.id,
         status: result.status,
-        usedFallback,
+        legCount: legResults.length,
+        legOrderIds: legResults.map(r => r.id),
         legs: legs.map((leg: { expiration: string; optionType: 'C' | 'P'; strike: number; side: string }) => ({
           ...leg,
           occSymbol: buildOCCSymbol(symbol, leg.expiration, leg.optionType, leg.strike),
