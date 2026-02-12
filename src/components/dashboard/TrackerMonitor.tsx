@@ -145,12 +145,13 @@ export default function TrackerMonitor() {
             continue;
           }
 
-          // Build leg prices array
+          // Build leg prices array (include last as fallback for illiquid options)
           const legPrices = Object.entries(data.quotes).map(([symbol, q]) => ({
             symbol,
             bid: q.bid,
             ask: q.ask,
             mid: q.mid,
+            last: q.last,
           }));
 
           // Log pricing gaps

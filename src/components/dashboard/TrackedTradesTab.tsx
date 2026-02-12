@@ -8,7 +8,7 @@ import {
 } from 'lucide-react';
 import {
   loadTrackedTrades, loadTrackedTradesWithSync, removeTrackedTrade,
-  purgeClosedTrades, purgeAllTrades,
+  purgeClosedTrades, purgeAllTrades, resizeExistingTrades,
   computeAnalytics, type TrackedTrade, type TradeAnalytics, type TradeStatus,
 } from '@/lib/tradeTracker';
 
@@ -209,7 +209,8 @@ function TradeRow({ trade, onRemove }: { trade: TrackedTrade; onRemove: (id: str
 
   // Calculate unrealized P/L for open trades using last price history entry
   const lastSnapshot = trade.priceHistory[trade.priceHistory.length - 1];
-  const hasPricingData = trade.entryDebit !== null && trade.entryDebit !== 0 && trade.priceHistory.length > 0;
+  // entryDebit can be 0 or negative (credit spreads) — only treat null as "unpriced"
+  const hasPricingData = trade.entryDebit !== null && trade.priceHistory.length > 0;
   let unrealizedPL: number | null = null;
   let unrealizedPLPct: number | null = null;
 
@@ -222,7 +223,7 @@ function TradeRow({ trade, onRemove }: { trade: TrackedTrade; onRemove: (id: str
   const displayPL = isOpen ? unrealizedPL : trade.realizedPL;
   const displayPLPct = isOpen ? unrealizedPLPct : trade.realizedPLPct;
   const plColor = (displayPL ?? 0) >= 0 ? 'text-accent-green' : 'text-accent-red';
-  const awaitingPrices = isOpen && !hasPricingData;
+  const awaitingPrices = isOpen && (trade.entryDebit === null || trade.priceHistory.length === 0);
 
   const holdDays = trade.enteredAt
     ? ((trade.exitedAt ?? Date.now()) - trade.enteredAt) / (1000 * 60 * 60 * 24)
@@ -454,6 +455,7 @@ export default function TrackedTradesTab() {
   const [showAnalytics, setShowAnalytics] = useState(true);
   const [confirmRemoveAll, setConfirmRemoveAll] = useState(false);
   const [confirmPurgeClosed, setConfirmPurgeClosed] = useState(false);
+  const [resizeResult, setResizeResult] = useState<number | null>(null);
 
   // Load trades on mount — use localStorage first (instant, always fresh),
   // then sync with server in background to pick up diagnostics changes.
@@ -497,6 +499,17 @@ export default function TrackedTradesTab() {
     setTrades(remaining);
     setAnalytics(computeAnalytics(remaining));
     setConfirmPurgeClosed(false);
+  }, []);
+
+  const handleResizeAll = useCallback(() => {
+    const count = resizeExistingTrades();
+    if (count > 0) {
+      const updated = loadTrackedTrades();
+      setTrades(updated);
+      setAnalytics(computeAnalytics(updated));
+    }
+    setResizeResult(count);
+    setTimeout(() => setResizeResult(null), 3000);
   }, []);
 
   // Apply filters and sorting
@@ -577,6 +590,18 @@ export default function TrackedTradesTab() {
             >
               <BarChart3 className="w-3.5 h-3.5 inline mr-1" />Analytics
             </button>
+            {/* Resize open trades to portfolio-sized quantities */}
+            {resizeResult !== null ? (
+              <span className="text-[10px] font-mono text-accent-green">{resizeResult > 0 ? `Resized ${resizeResult} trades` : 'All sized'}</span>
+            ) : (
+              <button
+                onClick={handleResizeAll}
+                className="px-2 py-1 rounded text-xs font-mono text-text-muted hover:text-accent-cyan transition-colors flex items-center gap-1"
+                title="Resize all qty=1 open trades to portfolio-appropriate sizes (1-5% allocation)"
+              >
+                <TrendingUp className="w-3.5 h-3.5" />Resize
+              </button>
+            )}
             {/* Purge closed/expired trades */}
             {confirmPurgeClosed ? (
               <div className="flex items-center gap-1.5">

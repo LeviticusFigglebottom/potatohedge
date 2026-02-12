@@ -379,7 +379,7 @@ export function calculatePositionValue(legs: TrackedLeg[], useMid: 'entry' | 'ex
 export function evaluateTrade(
   trade: TrackedTrade,
   currentSpot: number,
-  currentLegPrices: { symbol: string; bid: number; ask: number; mid: number }[]
+  currentLegPrices: { symbol: string; bid: number; ask: number; mid: number; last?: number }[]
 ): TrackedTrade | null {
   // Skip already closed trades
   if (trade.status === 'exited' || trade.status === 'expired') return null;
@@ -420,24 +420,29 @@ export function evaluateTrade(
   // If pending, capture entry prices and transition to entered
   if (trade.status === 'pending') {
     // Fill entry prices from current market data (first observation = entry)
+    // Use mid price preferentially; fall back to last price or (bid+ask)/2
     const entryLegs = trade.legs.map(leg => {
       const price = currentLegPrices.find(p => p.symbol === leg.optionSymbol);
-      if (price && price.mid > 0) {
-        return { ...leg, entryBid: price.bid, entryAsk: price.ask, entryMid: price.mid };
+      if (price) {
+        const bestMid = price.mid > 0 ? price.mid : (price.last ?? 0);
+        if (bestMid > 0) {
+          return { ...leg, entryBid: price.bid, entryAsk: price.ask, entryMid: bestMid };
+        }
       }
       return leg;
     });
 
-    // Only enter if ALL legs got valid prices (prevents partial-price distortion)
-    const allPriced = entryLegs.every(l => l.entryMid > 0);
-    if (!allPriced) {
-      // Can't enter yet — wait for all legs to have real quotes
+    const pricedCount = entryLegs.filter(l => l.entryMid > 0).length;
+    const totalLegs = entryLegs.length;
+
+    // Enter if MOST legs have prices (≥50%) — don't wait forever for illiquid legs.
+    // For single-leg trades, still require the leg to be priced.
+    const minRequired = totalLegs <= 2 ? totalLegs : Math.ceil(totalLegs * 0.5);
+    if (pricedCount < minRequired) {
       return null;
     }
 
     const entryValue = calculatePositionValue(entryLegs, 'entry');
-
-    // Recalculate maxRisk now that we have real entry prices
     const recalcMaxRisk = calculateMaxRisk(entryLegs, trade.strategy, currentSpot);
 
     updates.status = 'entered';
@@ -449,32 +454,31 @@ export function evaluateTrade(
 
   // Calculate current position value for entered trades
   if (trade.status === 'entered' || updates.status === 'entered') {
-    // Use updated legs if we just entered, otherwise use existing legs
     const activeLeg = updates.legs ?? trade.legs;
     const currentLegs = activeLeg.map(leg => {
       const price = currentLegPrices.find(p => p.symbol === leg.optionSymbol);
-      return { ...leg, exitBid: price?.bid ?? 0, exitAsk: price?.ask ?? 0, exitMid: price?.mid ?? 0 };
+      // Use mid > last > 0 as fallback chain
+      const bestMid = price ? (price.mid > 0 ? price.mid : (price.last ?? price.mid)) : 0;
+      return {
+        ...leg,
+        exitBid: price?.bid ?? 0,
+        exitAsk: price?.ask ?? 0,
+        exitMid: bestMid,
+      };
     });
 
-    // Only calculate P/L if ALL legs have current prices (prevents distorted numbers)
-    const allCurrentPriced = currentLegs.every(l => (l.exitMid ?? 0) > 0);
-    if (!allCurrentPriced) {
-      // Still update the snapshot with what we have but don't trigger exits
-      return null;
-    }
+    const pricedLegs = currentLegs.filter(l => (l.exitMid ?? 0) > 0).length;
+    const allCurrentPriced = pricedLegs === currentLegs.length;
 
+    // Always compute position value (even with partial data) so we can add a snapshot
     const currentValue = calculatePositionValue(currentLegs, 'exit');
     const entryValue = updates.entryDebit ?? trade.entryDebit ?? calculatePositionValue(activeLeg, 'entry');
 
     // Fix maxRisk for existing trades that were calculated without quantity
-    // If maxRisk looks like single-contract but legs have qty > 1, recalculate
     const effectiveMaxRisk = updates.maxRisk ?? trade.maxRisk ?? calculateMaxRisk(activeLeg, trade.strategy, currentSpot);
     const qty = Math.max(1, ...activeLeg.map(l => l.quantity));
     let correctedMaxRisk = effectiveMaxRisk;
     if (qty > 1 && effectiveMaxRisk > 0) {
-      // Detect if maxRisk was calculated without quantity (legacy bug):
-      // For a $5 spread with qty=2, wrong maxRisk=$500, correct=$1000.
-      // Heuristic: if maxRisk / (width * 100) ≈ 1, it's the old per-contract calculation.
       const strikes = activeLeg.map(l => l.strike).sort((a, b) => a - b);
       const width = strikes.length >= 2 ? strikes[strikes.length - 1] - strikes[0] : 0;
       if (width > 0 && Math.abs(effectiveMaxRisk - width * 100) < 1) {
@@ -486,33 +490,35 @@ export function evaluateTrade(
     const unrealizedPL = currentValue - entryValue;
     const plPct = correctedMaxRisk !== 0 ? (unrealizedPL / Math.abs(correctedMaxRisk)) * 100 : 0;
 
-    // Add price snapshot
+    // Always add a price snapshot — even with partial pricing.
+    // This ensures P/L shows something rather than perpetual "—".
     const snapshot = { timestamp: now, spotPrice: currentSpot, positionValue: currentValue };
-    updates.priceHistory = [...(trade.priceHistory || []), snapshot].slice(-100); // keep last 100 points
+    updates.priceHistory = [...(trade.priceHistory || []), snapshot].slice(-100);
 
-    // Check profit target
-    if (plPct >= trade.profitTargetPct) {
-      updates.status = 'exited';
-      updates.exitedAt = now;
-      updates.spotAtExit = currentSpot;
-      updates.legs = currentLegs;
-      updates.exitValue = currentValue;
-      updates.realizedPL = unrealizedPL;
-      updates.realizedPLPct = plPct;
-      updates.exitReason = 'profit-target';
-      updates.outcome = 'win';
-    }
-    // Check stop loss
-    else if (plPct <= -trade.stopLossPct) {
-      updates.status = 'exited';
-      updates.exitedAt = now;
-      updates.spotAtExit = currentSpot;
-      updates.legs = currentLegs;
-      updates.exitValue = currentValue;
-      updates.realizedPL = unrealizedPL;
-      updates.realizedPLPct = plPct;
-      updates.exitReason = 'stop-loss';
-      updates.outcome = 'loss';
+    // Only trigger exit conditions when ALL legs are fully priced
+    // (prevents false exits from partial/missing quotes)
+    if (allCurrentPriced) {
+      if (plPct >= trade.profitTargetPct) {
+        updates.status = 'exited';
+        updates.exitedAt = now;
+        updates.spotAtExit = currentSpot;
+        updates.legs = currentLegs;
+        updates.exitValue = currentValue;
+        updates.realizedPL = unrealizedPL;
+        updates.realizedPLPct = plPct;
+        updates.exitReason = 'profit-target';
+        updates.outcome = 'win';
+      } else if (plPct <= -trade.stopLossPct) {
+        updates.status = 'exited';
+        updates.exitedAt = now;
+        updates.spotAtExit = currentSpot;
+        updates.legs = currentLegs;
+        updates.exitValue = currentValue;
+        updates.realizedPL = unrealizedPL;
+        updates.realizedPLPct = plPct;
+        updates.exitReason = 'stop-loss';
+        updates.outcome = 'loss';
+      }
     }
   }
 
@@ -1135,6 +1141,39 @@ export function sizePosition(legs: TrackedLeg[], strategy: string, spotPrice: nu
   const minQty = Math.ceil(minAllocation / riskPer);
 
   return Math.max(1, Math.min(MAX_CONTRACTS, Math.max(minQty, targetQty)));
+}
+
+// ─── Retroactive Resizing ─────────────────────────────────
+
+/**
+ * Resize all open trades that still have qty=1 to portfolio-appropriate sizes.
+ * Returns the number of trades resized.
+ */
+export function resizeExistingTrades(): number {
+  const trades = loadTrackedTrades();
+  let resized = 0;
+  for (const t of trades) {
+    if (t.status !== 'pending' && t.status !== 'entered') continue;
+    const allQtyOne = t.legs.length > 0 && t.legs.every(l => l.quantity === 1);
+    if (!allQtyOne) continue;
+
+    const optimalQty = sizePosition(t.legs, t.strategy, t.spotAtEntry);
+    if (optimalQty > 1) {
+      t.legs = t.legs.map(l => ({ ...l, quantity: optimalQty }));
+      // Recalculate maxRisk and entryDebit with new quantity
+      t.maxRisk = calculateMaxRisk(t.legs, t.strategy, t.spotAtEntry);
+      if (t.entryDebit !== null) {
+        t.entryDebit = calculatePositionValue(t.legs, 'entry');
+      }
+      // Clear stale price history (values were for qty=1)
+      t.priceHistory = [];
+      resized++;
+    }
+  }
+  if (resized > 0) {
+    saveTrackedTrades(trades);
+  }
+  return resized;
 }
 
 // ─── Purge Helpers ────────────────────────────────────────
