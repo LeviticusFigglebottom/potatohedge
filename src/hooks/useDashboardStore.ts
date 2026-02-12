@@ -47,7 +47,30 @@ export interface SnapshotData {
   snapshotCount: number;
 }
 
-export type TabId = 'overview' | 'chain' | 'dealer' | 'volatility' | 'analytics' | 'screener' | 'institutional' | 'briefing' | 'paper';
+export type TabId = 'overview' | 'chain' | 'dealer' | 'volatility' | 'analytics' | 'screener' | 'institutional' | 'briefing' | 'paper' | 'tracker' | 'diagnostics';
+
+// ─── AI-generated content cache (survives tab switches) ───
+
+export interface BriefingCache {
+  analysis: string;
+  stocksScanned: number;
+  timestamp: number;
+  indices: {
+    symbol: string; price: number; changePct: number; bias: string;
+    biasScore: number; gammaRegime: string; volRegime: string; ivRank: number;
+  }[];
+  vix: number;
+  tradeIdeas?: unknown[];
+  aiTradeIdeas?: unknown[];
+}
+
+export interface AIAnalysisCache {
+  analysis: string;
+  tradeIdeas: { strategy: string; direction: string; confidence: string; strikes: string; expiration: string; entry: string; profitTargetPct: number; stopLossPct: number; risk: string; reasoning: string[]; tags: string[] }[];
+  mode: 'trade' | 'fundamental';
+  model: string;
+  tokens: { input: number; output: number } | null;
+}
 
 export interface RecommendationData {
   symbol: string;
@@ -88,6 +111,12 @@ interface DashboardStore {
   diagnostics: { debug?: unknown; health?: unknown; ranAt?: string } | null;
   lastUpdate: number;
 
+  // AI-generated content cache
+  briefingCache: BriefingCache | null;
+  setBriefingCache: (data: BriefingCache | null) => void;
+  aiAnalysisCache: AIAnalysisCache | null;
+  setAiAnalysisCache: (data: AIAnalysisCache | null) => void;
+
   setSymbol: (s: string) => void;
   setInterval: (i: Interval) => void;
   setSelectedExpiration: (e: string) => void;
@@ -113,7 +142,11 @@ const api = async (path: string) => {
     const truncated = isHtml ? `[HTML error page - serverless function crashed]` : (body.length > 300 ? body.slice(0, 200) + '...' : body);
     throw new Error(`[${path}] ${res.status}: ${truncated}`);
   }
-  return res.json();
+  try {
+    return await res.json();
+  } catch (e) {
+    throw new Error(`[${path}] JSON parse error: ${e instanceof Error ? e.message : 'malformed response'}`);
+  }
 };
 
 export const useDashboardStore = create<DashboardStore>((set, get) => ({
@@ -125,6 +158,12 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
   multiGEX: null, snapshot: null, recommendations: null, correlations: null,
   metricHistory: [],
   loading: {}, error: null, errors: [], diagnostics: null, lastUpdate: 0,
+
+  // AI-generated content cache — persists across tab switches
+  briefingCache: null,
+  setBriefingCache: (data) => set({ briefingCache: data }),
+  aiAnalysisCache: null,
+  setAiAnalysisCache: (data) => set({ aiAnalysisCache: data }),
 
   setSymbol: (symbol) => set({ symbol: symbol.toUpperCase() }),
   setInterval: (interval) => { set({ interval }); get().fetchHistory(); },
@@ -301,7 +340,8 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     set({
       symbol: symbol.toUpperCase(), quote: null, history: [], chain: null,
       expirations: [], selectedExpiration: null, multiGEX: null, snapshot: null,
-      recommendations: null, correlations: null, metricHistory: [], error: null, errors: [],
+      recommendations: null, correlations: null, metricHistory: [],
+      aiAnalysisCache: null, error: null, errors: [],
     });
     const existing = loadMetricHistory(symbol.toUpperCase());
     if (existing.length > 0) set({ metricHistory: existing });

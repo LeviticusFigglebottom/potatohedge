@@ -19,7 +19,10 @@ import ScreenerTab from '@/components/dashboard/ScreenerTab';
 import BriefingTab from '@/components/dashboard/BriefingTab';
 import InstitutionalTab from '@/components/dashboard/InstitutionalTab';
 import PaperTradingTab from '@/components/dashboard/PaperTradingTab';
+import TrackedTradesTab from '@/components/dashboard/TrackedTradesTab';
+import DiagnosticsTab from '@/components/dashboard/DiagnosticsTab';
 import PaperMonitor from '@/components/dashboard/PaperMonitor';
+import TrackerMonitor from '@/components/dashboard/TrackerMonitor';
 import CorrelationPanel from '@/components/dashboard/CorrelationPanel';
 import { Activity, Zap, AlertTriangle, X } from 'lucide-react';
 
@@ -137,13 +140,18 @@ export default function DashboardPage() {
           {activeTab === 'screener' && <ScreenerTab />}
           {activeTab === 'institutional' && <InstitutionalTab />}
           {activeTab === 'briefing' && <BriefingTab />}
+          {activeTab === 'tracker' && <TrackedTradesTab />}
           {activeTab === 'paper' && <PaperTradingTab />}
+          {activeTab === 'diagnostics' && <DiagnosticsTab />}
           {activeTab === 'chain' && <ChainTab />}
         </div>
       </main>
 
       {/* Background paper trading monitor — checks exit rules every 60s during market hours */}
       <PaperMonitor />
+
+      {/* Background tracker monitor — evaluates tracked AI/algo trades every 90s during market hours */}
+      <TrackerMonitor />
 
       {/* Footer */}
       <footer className="border-t border-border mt-8">

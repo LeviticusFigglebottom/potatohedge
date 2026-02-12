@@ -4,7 +4,7 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import {
   Wallet, RefreshCw, TrendingUp, TrendingDown, X, Clock,
   CheckCircle2, AlertTriangle, DollarSign, Plus, Target, ShieldAlert,
-  Activity,
+  Activity, Trash2, ChevronDown, ChevronUp, Eraser,
 } from 'lucide-react';
 
 interface ParsedOCC {
@@ -388,6 +388,101 @@ function QuickTradeForm({ onSubmit, onClose }: {
   );
 }
 
+// ─── Spread Grouping Helper ─────────────────────────────────
+
+interface SpreadGroup {
+  id: string;
+  strategy: string;
+  thesis: string;
+  underlying: string;
+  legs: Position[];
+  netCostBasis: number;
+  netCurrentValue: number;
+  netPL: number;
+  netPLPct: number;
+  rule: TradeRule | undefined;
+  spreadLabel: string;
+}
+
+/** Group positions into spreads using trade rules. Ungrouped positions stay as single-leg groups. */
+function groupPositionsIntoSpreads(positions: Position[]): SpreadGroup[] {
+  const rules = loadRules();
+  const assigned = new Set<number>(); // position IDs already assigned to a group
+  const groups: SpreadGroup[] = [];
+
+  // First pass: group by trade rules
+  for (const rule of rules) {
+    const ruleSymbols = new Set(rule.occSymbols || (rule.occSymbol ? [rule.occSymbol] : []));
+    if (ruleSymbols.size === 0) continue;
+
+    const matched = positions.filter(p => ruleSymbols.has(p.symbol) && !assigned.has(p.id));
+    if (matched.length === 0) continue;
+
+    for (const p of matched) assigned.add(p.id);
+
+    const netCost = matched.reduce((s, p) => s + p.cost_basis, 0);
+    const netCurrentValue = matched.reduce((s, p) => {
+      const sign = p.quantity > 0 ? 1 : -1;
+      return s + p.currentPrice * Math.abs(p.quantity) * 100 * sign;
+    }, 0);
+    const netPL = matched.reduce((s, p) => s + p.unrealizedPL, 0);
+    const absNetCost = Math.abs(netCost);
+    const netPLPct = absNetCost > 0 ? (netPL / absNetCost) * 100 : 0;
+
+    // Build spread label like "AAPL Bull Call $260/$265 ×10"
+    const underlying = rule.underlying || matched[0]?.parsed?.underlying || '';
+    const strikes = matched
+      .map(p => p.parsed?.strike)
+      .filter((s): s is number => s !== undefined)
+      .sort((a, b) => a - b);
+    const qty = Math.max(...matched.map(p => Math.abs(p.quantity)));
+    const strikesStr = strikes.map(s => `$${s}`).join('/');
+    const strategyClean = rule.strategy.replace(/^\[AI\]\s*/, '');
+    const spreadLabel = `${underlying} ${strategyClean} ${strikesStr} ×${qty}`;
+
+    groups.push({
+      id: rule.id,
+      strategy: rule.strategy,
+      thesis: rule.thesis,
+      underlying,
+      legs: matched,
+      netCostBasis: netCost,
+      netCurrentValue,
+      netPL,
+      netPLPct,
+      rule,
+      spreadLabel,
+    });
+  }
+
+  // Second pass: ungrouped positions become single-leg groups
+  for (const p of positions) {
+    if (assigned.has(p.id)) continue;
+    const rule = getRuleForSymbol(p.symbol);
+    const underlying = p.parsed?.underlying || '';
+    const strike = p.parsed?.strike || 0;
+    const type = p.parsed?.type === 'C' ? 'Call' : 'Put';
+    const side = p.quantity > 0 ? 'Long' : 'Short';
+    const spreadLabel = `${underlying} ${side} $${strike} ${type} ×${Math.abs(p.quantity)}`;
+
+    groups.push({
+      id: `single-${p.id}`,
+      strategy: rule?.strategy || 'Single',
+      thesis: rule?.thesis || '',
+      underlying,
+      legs: [p],
+      netCostBasis: p.cost_basis,
+      netCurrentValue: p.currentValue * (p.quantity > 0 ? 1 : -1),
+      netPL: p.unrealizedPL,
+      netPLPct: p.unrealizedPLPct,
+      rule,
+      spreadLabel,
+    });
+  }
+
+  return groups;
+}
+
 // ─── Main Component ─────────────────────────────────────────
 
 export default function PaperTradingTab() {
@@ -399,6 +494,12 @@ export default function PaperTradingTab() {
   const [tradeStatus, setTradeStatus] = useState<string | null>(null);
   const [notConfigured, setNotConfigured] = useState(false);
   const [editingRule, setEditingRule] = useState<string | null>(null); // OCC symbol being edited
+  const [showHistory, setShowHistory] = useState(false);
+  const [showFills, setShowFills] = useState(false);
+  const [cancellingAll, setCancellingAll] = useState(false);
+  const [confirmPurgeRules, setConfirmPurgeRules] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const refresh = useCallback(async () => {
@@ -497,6 +598,35 @@ export default function PaperTradingTab() {
     }
   };
 
+  const handleCancelAllOrders = async () => {
+    setCancellingAll(true);
+    try {
+      for (const o of orders.filter(o => o.status === 'pending' || o.status === 'open' || o.status === 'partially_filled')) {
+        try { await fetch(`/api/paper/orders?id=${o.id}`, { method: 'DELETE' }); } catch {}
+      }
+      setTimeout(refresh, 500);
+    } finally {
+      setCancellingAll(false);
+    }
+  };
+
+  const handlePurgeRules = () => {
+    localStorage.removeItem('optix-paper-rules');
+    setConfirmPurgeRules(false);
+    refresh();
+  };
+
+  const handleResetPaperTrading = async () => {
+    setResetting(true);
+    setConfirmReset(false);
+    try {
+      await fetch('/api/paper/reset', { method: 'POST', signal: AbortSignal.timeout(25000) });
+      localStorage.removeItem('optix-paper-rules');
+      setTimeout(refresh, 1000); // Wait for Tradier to process closes
+    } catch { /* best effort */ }
+    finally { setResetting(false); }
+  };
+
   if (notConfigured) {
     return (
       <div className="space-y-4 animate-fade-in">
@@ -544,6 +674,40 @@ export default function PaperTradingTab() {
             )}
           </div>
           <div className="flex items-center gap-2">
+            {/* Reset all paper trading: cancel orders + close positions + clear rules */}
+            {confirmReset ? (
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] text-red-400 font-mono">Close all positions & cancel orders?</span>
+                <button onClick={handleResetPaperTrading} className="px-2 py-0.5 rounded text-[10px] font-mono bg-red-500/15 text-red-400 hover:bg-red-500/25 transition-colors">Yes</button>
+                <button onClick={() => setConfirmReset(false)} className="px-2 py-0.5 rounded text-[10px] font-mono text-text-muted hover:text-text-secondary transition-colors">No</button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmReset(true)}
+                disabled={resetting}
+                className="px-2 py-1 rounded text-xs font-mono text-text-muted hover:text-red-400 transition-colors flex items-center gap-1 disabled:opacity-50"
+                title="Cancel all orders, close all positions, and clear exit rules"
+              >
+                {resetting ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                Reset All
+              </button>
+            )}
+            {/* Purge trade rules */}
+            {confirmPurgeRules ? (
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] text-amber-400 font-mono">Clear rules?</span>
+                <button onClick={handlePurgeRules} className="px-2 py-0.5 rounded text-[10px] font-mono bg-amber-500/15 text-amber-400 hover:bg-amber-500/25 transition-colors">Yes</button>
+                <button onClick={() => setConfirmPurgeRules(false)} className="px-2 py-0.5 rounded text-[10px] font-mono text-text-muted hover:text-text-secondary transition-colors">No</button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmPurgeRules(true)}
+                className="px-2 py-1 rounded text-xs font-mono text-text-muted hover:text-amber-400 transition-colors flex items-center gap-1"
+                title="Purge all trade rules"
+              >
+                <Eraser className="w-3.5 h-3.5" />Rules
+              </button>
+            )}
             <button onClick={() => setShowForm(!showForm)} className="px-3 py-1.5 rounded-md text-xs font-medium bg-accent-cyan/20 text-accent-cyan border border-accent-cyan/30 hover:bg-accent-cyan/30 transition-all flex items-center gap-1.5">
               <Plus className="w-3.5 h-3.5" />
               New Trade
@@ -602,95 +766,143 @@ export default function PaperTradingTab() {
       {/* Quick Trade Form */}
       {showForm && <QuickTradeForm onSubmit={handleTrade} onClose={() => setShowForm(false)} />}
 
-      {/* Open Positions */}
-      <div className="panel">
-        <div className="panel-header">
-          <span className="panel-title flex items-center gap-2">
-            <DollarSign className="w-4 h-4 text-accent-cyan" />
-            Open Positions ({positions.length})
-          </span>
-        </div>
-        {positions.length === 0 ? (
-          <div className="px-4 pb-4 text-sm text-text-muted font-mono">No open positions</div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-border/30">
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Contract</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Qty</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Entry</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Current</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">P&L</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Target / Stop</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {positions.map(p => {
-                  const rule = getRuleForSymbol(p.symbol);
+      {/* Open Positions — grouped by spread */}
+      {(() => {
+        const spreadGroups = groupPositionsIntoSpreads(positions);
+        return (
+          <div className="panel">
+            <div className="panel-header">
+              <span className="panel-title flex items-center gap-2">
+                <DollarSign className="w-4 h-4 text-accent-cyan" />
+                Open Positions ({spreadGroups.length} spread{spreadGroups.length !== 1 ? 's' : ''}, {positions.length} leg{positions.length !== 1 ? 's' : ''})
+              </span>
+            </div>
+            {spreadGroups.length === 0 ? (
+              <div className="px-4 pb-4 text-sm text-text-muted font-mono">No open positions</div>
+            ) : (
+              <div className="space-y-0">
+                {spreadGroups.map(group => {
+                  const isMultiLeg = group.legs.length > 1;
                   return (
-                    <tr key={p.id} className="border-b border-border/10 hover:bg-bg-hover/50">
-                      <td className="px-3 py-2">
-                        <div className="font-mono text-text-primary font-semibold">{fmtOCC(p.parsed, p.symbol)}</div>
-                        {rule?.strategy && rule.strategy !== 'Manual' && <div className="text-[10px] text-accent-cyan/60 font-mono">{rule.strategy}</div>}
-                        {rule?.thesis && <div className="text-[10px] text-text-muted truncate max-w-[200px]">{rule.thesis}</div>}
-                      </td>
-                      <td className={`px-3 py-2 font-mono ${p.quantity > 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {p.quantity > 0 ? '+' : ''}{p.quantity}
-                      </td>
-                      <td className="px-3 py-2 font-mono text-text-secondary">{fmtMoney(p.costPerContract)}</td>
-                      <td className="px-3 py-2 font-mono text-text-primary">
-                        {p.currentPrice > 0 ? fmtMoney(p.currentPrice) : '—'}
-                        <div className="text-[10px] text-text-muted">{p.bid > 0 ? `${fmtMoney(p.bid)}/${fmtMoney(p.ask)}` : ''}</div>
-                      </td>
-                      <td className="px-3 py-2">
-                        {p.currentPrice > 0 ? (
-                          <PLBadge value={p.unrealizedPL} pct={p.unrealizedPLPct} />
-                        ) : (
-                          <span className="text-text-muted text-xs">—</span>
-                        )}
-                      </td>
-                      <td className="px-3 py-2">
-                        <ExitProgress
-                          rule={rule}
-                          plPct={p.unrealizedPLPct}
-                        />
-                      </td>
-                      <td className="px-3 py-2">
-                        <div className="flex items-center gap-1">
-                          <button
-                            onClick={() => setEditingRule(editingRule === p.symbol ? null : p.symbol)}
-                            className="text-xs font-mono text-accent-cyan hover:text-accent-cyan/80 px-1.5 py-0.5"
-                            title="Set exit rules"
-                          >
-                            <Target className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            onClick={() => handleManualClose(p)}
-                            className="text-xs text-red-400 hover:text-red-300 font-mono px-1.5 py-0.5"
-                            title="Close position"
-                          >
-                            Close
-                          </button>
+                    <div key={group.id} className="border-b border-border/10 hover:bg-bg-hover/30 transition-colors">
+                      {/* Spread summary row */}
+                      <div className="px-4 py-3 flex items-center justify-between gap-4">
+                        <div className="flex-1 min-w-0">
+                          <div className="font-mono text-text-primary font-semibold text-sm">
+                            {group.spreadLabel}
+                          </div>
+                          {group.strategy && group.strategy !== 'Single' && group.strategy !== 'Manual' && (
+                            <div className="text-[10px] text-accent-cyan/70 font-mono mt-0.5">{group.strategy}</div>
+                          )}
+                          {group.thesis && <div className="text-[10px] text-text-muted truncate max-w-[300px] mt-0.5">{group.thesis}</div>}
                         </div>
-                        {editingRule === p.symbol && (
+
+                        <div className="flex items-center gap-4 flex-shrink-0">
+                          {/* Net cost basis */}
+                          <div className="text-right">
+                            <div className="text-[10px] text-text-muted font-mono">Net Cost</div>
+                            <div className={`text-xs font-mono font-semibold ${group.netCostBasis >= 0 ? 'text-text-secondary' : 'text-green-400'}`}>
+                              {group.netCostBasis >= 0 ? fmtMoney(group.netCostBasis) : `${fmtMoney(Math.abs(group.netCostBasis))} cr`}
+                            </div>
+                          </div>
+
+                          {/* Net P/L */}
+                          <div className="text-right min-w-[120px]">
+                            <div className="text-[10px] text-text-muted font-mono">Net P&L</div>
+                            <PLBadge value={group.netPL} pct={group.netPLPct} />
+                          </div>
+
+                          {/* Exit progress */}
+                          <div className="min-w-[130px]">
+                            <ExitProgress rule={group.rule} plPct={group.netPLPct} />
+                          </div>
+
+                          {/* Actions */}
+                          <div className="flex items-center gap-1">
+                            {group.legs.length > 0 && (
+                              <>
+                                <button
+                                  onClick={() => setEditingRule(editingRule === group.id ? null : group.id)}
+                                  className="text-xs font-mono text-accent-cyan hover:text-accent-cyan/80 px-1.5 py-0.5"
+                                  title="Edit exit rules"
+                                >
+                                  <Target className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  onClick={async () => {
+                                    for (const leg of group.legs) {
+                                      await handleManualClose(leg);
+                                    }
+                                  }}
+                                  className="text-xs text-red-400 hover:text-red-300 font-mono px-1.5 py-0.5"
+                                  title="Close all legs"
+                                >
+                                  Close
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Individual leg details (shown for multi-leg spreads) */}
+                      {isMultiLeg && (
+                        <div className="px-4 pb-2">
+                          <table className="w-full text-xs">
+                            <tbody>
+                              {group.legs.map(p => (
+                                <tr key={p.id} className="text-text-muted">
+                                  <td className="py-0.5 font-mono w-1/3">
+                                    <span className={p.quantity > 0 ? 'text-green-400/70' : 'text-red-400/70'}>
+                                      {p.quantity > 0 ? 'BUY' : 'SELL'}
+                                    </span>
+                                    {' '}{fmtOCC(p.parsed, p.symbol)}
+                                  </td>
+                                  <td className="py-0.5 font-mono text-center">
+                                    <span className={p.quantity > 0 ? 'text-green-400/60' : 'text-red-400/60'}>
+                                      {p.quantity > 0 ? '+' : ''}{p.quantity}
+                                    </span>
+                                  </td>
+                                  <td className="py-0.5 font-mono text-right">
+                                    Entry: {fmtMoney(p.costPerContract)}
+                                  </td>
+                                  <td className="py-0.5 font-mono text-right">
+                                    Now: {p.currentPrice > 0 ? fmtMoney(p.currentPrice) : '—'}
+                                    {p.bid > 0 && <span className="text-text-muted/50"> ({fmtMoney(p.bid)}/{fmtMoney(p.ask)})</span>}
+                                  </td>
+                                  <td className="py-0.5 font-mono text-right">
+                                    {p.currentPrice > 0 ? (
+                                      <span className={p.unrealizedPL >= 0 ? 'text-green-400/60' : 'text-red-400/60'}>
+                                        {p.unrealizedPL >= 0 ? '+' : ''}{fmtMoney(p.unrealizedPL)}
+                                      </span>
+                                    ) : '—'}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+
+                      {/* Inline edit rule form */}
+                      {editingRule === group.id && group.legs.length > 0 && (
+                        <div className="px-4 pb-3">
                           <EditRuleForm
-                            position={p}
-                            rule={rule}
+                            position={group.legs[0]}
+                            rule={group.rule}
                             onSave={saveRule}
                             onClose={() => setEditingRule(null)}
                           />
-                        )}
-                      </td>
-                    </tr>
+                        </div>
+                      )}
+                    </div>
                   );
                 })}
-              </tbody>
-            </table>
+              </div>
+            )}
           </div>
-        )}
-      </div>
+        );
+      })()}
 
       {/* Open Orders */}
       {openOrders.length > 0 && (
@@ -700,6 +912,14 @@ export default function PaperTradingTab() {
               <Clock className="w-4 h-4 text-yellow-400" />
               Open Orders ({openOrders.length})
             </span>
+            <button
+              onClick={handleCancelAllOrders}
+              disabled={cancellingAll}
+              className="px-2 py-1 rounded text-xs font-mono text-red-400/60 hover:text-red-400 hover:bg-red-500/10 transition-colors flex items-center gap-1"
+            >
+              <Trash2 className="w-3 h-3" />
+              {cancellingAll ? 'Cancelling...' : 'Cancel All'}
+            </button>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -755,89 +975,95 @@ export default function PaperTradingTab() {
         </div>
       )}
 
-      {/* Recent Fills */}
+      {/* Recent Fills (collapsible) */}
       {recentFills.length > 0 && (
         <div className="panel">
-          <div className="panel-header">
+          <div className="panel-header cursor-pointer" onClick={() => setShowFills(!showFills)}>
             <span className="panel-title flex items-center gap-2">
               <CheckCircle2 className="w-4 h-4 text-green-400" />
-              Recent Fills
+              Recent Fills ({recentFills.length})
             </span>
+            {showFills ? <ChevronUp className="w-4 h-4 text-text-muted" /> : <ChevronDown className="w-4 h-4 text-text-muted" />}
           </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-border/30">
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Contract</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Side</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Qty</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Fill Price</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Date</th>
-                </tr>
-              </thead>
-              <tbody>
-                {recentFills.map(o => (
-                  <tr key={o.id} className="border-b border-border/10 hover:bg-bg-hover/50">
-                    <td className="px-3 py-2 font-mono text-text-primary">{fmtOCC(o.parsed || null, o.option_symbol || o.symbol)}</td>
-                    <td className="px-3 py-2 font-mono text-text-secondary text-xs">{o.side?.replace(/_/g, ' ')}</td>
-                    <td className="px-3 py-2 font-mono text-text-secondary">{o.exec_quantity || o.quantity}</td>
-                    <td className="px-3 py-2 font-mono text-text-secondary">{o.avg_fill_price ? fmtMoney(o.avg_fill_price) : '—'}</td>
-                    <td className="px-3 py-2 font-mono text-text-muted text-xs">{o.create_date?.split('T')[0]}</td>
+          {showFills && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-border/30">
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Contract</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Side</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Qty</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Fill Price</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Date</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {recentFills.map(o => (
+                    <tr key={o.id} className="border-b border-border/10 hover:bg-bg-hover/50">
+                      <td className="px-3 py-2 font-mono text-text-primary">{fmtOCC(o.parsed || null, o.option_symbol || o.symbol)}</td>
+                      <td className="px-3 py-2 font-mono text-text-secondary text-xs">{o.side?.replace(/_/g, ' ')}</td>
+                      <td className="px-3 py-2 font-mono text-text-secondary">{o.exec_quantity || o.quantity}</td>
+                      <td className="px-3 py-2 font-mono text-text-secondary">{o.avg_fill_price ? fmtMoney(o.avg_fill_price) : '—'}</td>
+                      <td className="px-3 py-2 font-mono text-text-muted text-xs">{o.create_date?.split('T')[0]}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
 
-      {/* Trade History (Closed Positions) */}
+      {/* Trade History (Closed Positions - collapsible) */}
       {history.length > 0 && (
         <div className="panel">
-          <div className="panel-header">
+          <div className="panel-header cursor-pointer" onClick={() => setShowHistory(!showHistory)}>
             <span className="panel-title flex items-center gap-2">
               {history.reduce((s, h) => s + h.gain_loss, 0) >= 0
                 ? <TrendingUp className="w-4 h-4 text-green-400" />
                 : <TrendingDown className="w-4 h-4 text-red-400" />
               }
               Closed Trades ({history.length})
+              <span className={`text-sm font-mono font-semibold ${history.reduce((s, h) => s + h.gain_loss, 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                {fmtMoney(history.reduce((s, h) => s + h.gain_loss, 0))}
+              </span>
             </span>
-            <span className={`text-sm font-mono font-semibold ${history.reduce((s, h) => s + h.gain_loss, 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              Total: {fmtMoney(history.reduce((s, h) => s + h.gain_loss, 0))}
-            </span>
+            {showHistory ? <ChevronUp className="w-4 h-4 text-text-muted" /> : <ChevronDown className="w-4 h-4 text-text-muted" />}
           </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-border/30">
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Contract</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Qty</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Cost</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Proceeds</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">P&L</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">%</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Closed</th>
-                </tr>
-              </thead>
-              <tbody>
-                {history.map((h, i) => (
-                  <tr key={i} className="border-b border-border/10 hover:bg-bg-hover/50">
-                    <td className="px-3 py-2 font-mono text-text-primary">{fmtOCC(h.parsed, h.symbol)}</td>
-                    <td className="px-3 py-2 font-mono text-text-secondary">{h.quantity}</td>
-                    <td className="px-3 py-2 font-mono text-text-muted">{fmtMoney(h.cost)}</td>
-                    <td className="px-3 py-2 font-mono text-text-secondary">{fmtMoney(h.proceeds)}</td>
-                    <td className={`px-3 py-2 font-mono font-semibold ${h.gain_loss >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                      {h.gain_loss >= 0 ? '+' : ''}{fmtMoney(h.gain_loss)}
-                    </td>
-                    <td className={`px-3 py-2 font-mono text-xs ${h.gain_loss_percent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                      {h.gain_loss_percent >= 0 ? '+' : ''}{h.gain_loss_percent?.toFixed(1)}%
-                    </td>
-                    <td className="px-3 py-2 font-mono text-text-muted text-xs">{h.close_date?.split('T')[0]}</td>
+          {showHistory && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-border/30">
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Contract</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Qty</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Cost</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Proceeds</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">P&L</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">%</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Closed</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {history.map((h, i) => (
+                    <tr key={i} className="border-b border-border/10 hover:bg-bg-hover/50">
+                      <td className="px-3 py-2 font-mono text-text-primary">{fmtOCC(h.parsed, h.symbol)}</td>
+                      <td className="px-3 py-2 font-mono text-text-secondary">{h.quantity}</td>
+                      <td className="px-3 py-2 font-mono text-text-muted">{fmtMoney(h.cost)}</td>
+                      <td className="px-3 py-2 font-mono text-text-secondary">{fmtMoney(h.proceeds)}</td>
+                      <td className={`px-3 py-2 font-mono font-semibold ${h.gain_loss >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {h.gain_loss >= 0 ? '+' : ''}{fmtMoney(h.gain_loss)}
+                      </td>
+                      <td className={`px-3 py-2 font-mono text-xs ${h.gain_loss_percent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {h.gain_loss_percent >= 0 ? '+' : ''}{h.gain_loss_percent?.toFixed(1)}%
+                      </td>
+                      <td className="px-3 py-2 font-mono text-text-muted text-xs">{h.close_date?.split('T')[0]}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
     </div>

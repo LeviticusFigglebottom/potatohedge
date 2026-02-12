@@ -35,6 +35,8 @@ export interface TradeIdea {
   tags: string[];
   profitTargetPct: number;  // take profit at +X% of cost (e.g. 50 = +50%)
   stopLossPct: number;      // stop loss at -X% of cost (e.g. 50 = -50%)
+  quantity: number;          // recommended contracts (based on 5% max allocation)
+  maxRiskPerContract: number; // max loss per contract in dollars (for sizing)
 }
 
 export interface RecommendationOutput {
@@ -610,6 +612,16 @@ function generateTrades(
   const spreadWidth = Math.max(1, Math.round(atr14));
   const strikeStep = spotPrice > 200 ? 5 : spotPrice > 50 ? 2.5 : 1;
 
+  // Position sizing: max 5% of portfolio per trade, minimum 1 contract
+  // Paper accounts typically start at $100K; use $100K as default
+  const PORTFOLIO_SIZE = 100_000;
+  const MAX_ALLOCATION_PCT = 0.05; // 5%
+  const maxAllocation = PORTFOLIO_SIZE * MAX_ALLOCATION_PCT; // $5,000
+  const sizeContracts = (maxRiskPerContract: number): number => {
+    if (maxRiskPerContract <= 0) return 1;
+    return Math.max(1, Math.min(10, Math.floor(maxAllocation / maxRiskPerContract)));
+  };
+
   const shortDTE = input.nearestDTE <= 5 ? `${input.nearestDTE}d (${input.nearestExp})` : `3-7 DTE`;
   const medDTE = '14-21 DTE';
   const longDTE = '30-45 DTE';
@@ -617,17 +629,20 @@ function generateTrades(
   // ─── HIGH IV: Sell Premium ───
   if (volRegime === 'high') {
     if (bias === 'bullish' || bias === 'neutral') {
-      const sellStrike = putWall ? Math.round(putWall / strikeStep) * strikeStep : Math.round((spotPrice - atr14 * 1.5) / strikeStep) * strikeStep;
+      // Short strike: 1 ATR below spot (tighter = more premium), or put wall
+      const sellStrike = putWall ? Math.round(putWall / strikeStep) * strikeStep : Math.round((spotPrice - atr14) / strikeStep) * strikeStep;
       const buyStrike = Math.round((sellStrike - spreadWidth) / strikeStep) * strikeStep;
+      const maxRiskPer = (sellStrike - buyStrike) * 100;
+      const qty = sizeContracts(maxRiskPer);
       trades.push({
         strategy: 'Bull Put Spread (Credit)',
         direction: 'bullish',
         confidence: bias === 'bullish' ? 'high' : 'medium',
         score: bias === 'bullish' ? 80 : 65,
         expiration: longDTE,
-        strikes: `Sell $${sellStrike} put, buy $${buyStrike} put — ${putWall ? `anchored to put wall support` : `~1.5 ATR below spot`}`,
+        strikes: `${qty}x Sell $${sellStrike} put, buy $${buyStrike} put — ${putWall ? `anchored to put wall support` : `~1 ATR below spot`}`,
         entry: 'Enter on up days when IV is still elevated. Target ~1/3 width of spread in credit.',
-        risk: `Max loss $${(sellStrike - buyStrike).toFixed(0)} per share minus credit. Close at 50% profit or if short strike breached.`,
+        risk: `Max loss $${(maxRiskPer * qty).toFixed(0)} (${qty} × $${maxRiskPer.toFixed(0)}) minus credit received.`,
         reasoning: [
           `IV Rank ${input.ivRank} — options overpriced (IV ${(input.currentIV * 100).toFixed(0)}% vs HV ${(input.hvCurrent * 100).toFixed(0)}%), edge in selling`,
           bias === 'bullish' ? 'Directional signals lean bullish' : 'Neutral bias allows defined-risk credit',
@@ -637,21 +652,25 @@ function generateTrades(
         tags: ['premium-selling', 'defined-risk', 'theta-positive'],
         profitTargetPct: 50,
         stopLossPct: 100,
+        quantity: qty,
+        maxRiskPerContract: maxRiskPer,
       });
     }
 
     if (bias === 'bearish' || bias === 'neutral') {
-      const sellStrike = callWall ? Math.round(callWall / strikeStep) * strikeStep : Math.round((spotPrice + atr14 * 1.5) / strikeStep) * strikeStep;
+      const sellStrike = callWall ? Math.round(callWall / strikeStep) * strikeStep : Math.round((spotPrice + atr14) / strikeStep) * strikeStep;
       const buyStrike = Math.round((sellStrike + spreadWidth) / strikeStep) * strikeStep;
+      const maxRiskPer = (buyStrike - sellStrike) * 100;
+      const qty = sizeContracts(maxRiskPer);
       trades.push({
         strategy: 'Bear Call Spread (Credit)',
         direction: 'bearish',
         confidence: bias === 'bearish' ? 'high' : 'medium',
         score: bias === 'bearish' ? 80 : 65,
         expiration: longDTE,
-        strikes: `Sell $${sellStrike} call, buy $${buyStrike} call — ${callWall ? `anchored to call wall resistance` : `~1.5 ATR above spot`}`,
+        strikes: `${qty}x Sell $${sellStrike} call, buy $${buyStrike} call — ${callWall ? `anchored to call wall resistance` : `~1 ATR above spot`}`,
         entry: 'Enter on down days when IV pops. Target ~1/3 width in credit.',
-        risk: `Max loss $${(buyStrike - sellStrike).toFixed(0)} per share minus credit. Close at 50% profit.`,
+        risk: `Max loss $${(maxRiskPer * qty).toFixed(0)} (${qty} × $${maxRiskPer.toFixed(0)}) minus credit received.`,
         reasoning: [
           `IV Rank ${input.ivRank} — rich premium to sell`,
           bias === 'bearish' ? 'Directional signals lean bearish' : 'Neutral allows credit collection',
@@ -660,30 +679,44 @@ function generateTrades(
         tags: ['premium-selling', 'defined-risk', 'theta-positive'],
         profitTargetPct: 50,
         stopLossPct: 100,
+        quantity: qty,
+        maxRiskPerContract: maxRiskPer,
       });
     }
 
     if (bias === 'neutral' && gammaRegime === 'long') {
-      const sellCall = callWall ? Math.round(callWall / strikeStep) * strikeStep : Math.round((spotPrice + atr14 * 2) / strikeStep) * strikeStep;
-      const sellPut = putWall ? Math.round(putWall / strikeStep) * strikeStep : Math.round((spotPrice - atr14 * 2) / strikeStep) * strikeStep;
+      // Iron condor: short strikes at ~0.8-1 ATR (collect meaningful premium)
+      // Walls are used as caps but not stretched to 2 ATR away
+      const sellCall = callWall && callWall < spotPrice + atr14 * 1.5
+        ? Math.round(callWall / strikeStep) * strikeStep
+        : Math.round((spotPrice + atr14) / strikeStep) * strikeStep;
+      const sellPut = putWall && putWall > spotPrice - atr14 * 1.5
+        ? Math.round(putWall / strikeStep) * strikeStep
+        : Math.round((spotPrice - atr14) / strikeStep) * strikeStep;
+      const wingWidth = Math.max(spreadWidth, Math.round(atr14 * 0.5 / strikeStep) * strikeStep || strikeStep);
+      const maxRiskPer = wingWidth * 100; // max loss = wing width per side
+      const qty = sizeContracts(maxRiskPer);
       trades.push({
         strategy: 'Iron Condor',
         direction: 'neutral',
         confidence: 'high',
         score: 85,
         expiration: longDTE,
-        strikes: `Sell $${sellCall}C / $${sellPut}P. Wings ~$${spreadWidth} beyond. Range: $${sellPut} - $${sellCall} (${((sellCall - sellPut) / atr14).toFixed(1)} ATR wide).`,
+        strikes: `${qty}x Sell $${sellCall}C / $${sellPut}P. Wings ~$${wingWidth} beyond. Range: $${sellPut} - $${sellCall} (${((sellCall - sellPut) / atr14).toFixed(1)} ATR wide).`,
         entry: 'Enter when IV is above 30d MA. Collect both sides of credit.',
-        risk: `Max loss on either wing. Close at 50% profit. Roll tested side at 2x credit.`,
+        risk: `Max loss $${(maxRiskPer * qty).toFixed(0)} per side (${qty} × $${maxRiskPer.toFixed(0)}). Close at 50% profit. Roll tested side at 2x credit.`,
         reasoning: [
           `IV Rank ${input.ivRank} — premium-rich environment (IV/HV ${input.ivHvRatio.toFixed(2)})`,
           'Long gamma regime — dealers suppress breakouts, pinning action',
           callWall && putWall ? `GEX walls ($${putWall.toFixed(0)} - $${callWall.toFixed(0)}) define the expected range` : '',
+          `Short strikes at ~1 ATR away for meaningful premium instead of far OTM`,
           `Max Pain at $${maxPain} — gravitational pull strengthens into expiration`,
         ].filter(Boolean),
         tags: ['premium-selling', 'range-bound', 'theta-positive', 'highest-conviction'],
         profitTargetPct: 50,
         stopLossPct: 100,
+        quantity: qty,
+        maxRiskPerContract: maxRiskPer,
       });
     }
   }
@@ -693,15 +726,18 @@ function generateTrades(
     if (bias === 'bullish') {
       const buyStrike = Math.round(spotPrice / strikeStep) * strikeStep;
       const targetStrike = callWall ? Math.round(callWall / strikeStep) * strikeStep : Math.round((spotPrice + atr14 * 2) / strikeStep) * strikeStep;
+      const width = targetStrike - buyStrike;
+      const maxRiskPer = width * 100; // debit = max risk
+      const qty = sizeContracts(maxRiskPer);
       trades.push({
         strategy: 'Bull Call Debit Spread',
         direction: 'bullish',
         confidence: Math.abs(biasScore) > 30 ? 'high' : 'medium',
         score: Math.abs(biasScore) > 30 ? 75 : 60,
         expiration: medDTE,
-        strikes: `Buy $${buyStrike} call, sell $${targetStrike} call — ${callWall ? `targeting call wall` : `~2 ATR target`}. Spread width: $${(targetStrike - buyStrike).toFixed(0)}`,
+        strikes: `${qty}x Buy $${buyStrike} call, sell $${targetStrike} call — ${callWall ? `targeting call wall` : `~2 ATR target`}. Width: $${width.toFixed(0)}`,
         entry: 'Enter on pullbacks to support. IV is cheap — time decay less punishing.',
-        risk: 'Max risk = debit paid. Take profit at 50-100% of debit.',
+        risk: `Max risk $${(maxRiskPer * qty).toFixed(0)} (${qty} × $${maxRiskPer.toFixed(0)} debit). Take profit at 50-100%.`,
         reasoning: [
           `IV Rank ${input.ivRank} — options cheap (${(input.currentIV * 100).toFixed(0)}% IV, 52w low ${(input.hvCurrent * 100).toFixed(0)}%), good entry`,
           'Bullish directional signals support upside targeting',
@@ -711,21 +747,26 @@ function generateTrades(
         tags: ['premium-buying', 'defined-risk', 'directional'],
         profitTargetPct: 75,
         stopLossPct: 50,
+        quantity: qty,
+        maxRiskPerContract: maxRiskPer,
       });
     }
 
     if (bias === 'bearish') {
       const buyStrike = Math.round(spotPrice / strikeStep) * strikeStep;
       const targetStrike = putWall ? Math.round(putWall / strikeStep) * strikeStep : Math.round((spotPrice - atr14 * 2) / strikeStep) * strikeStep;
+      const width = buyStrike - targetStrike;
+      const maxRiskPer = width * 100;
+      const qty = sizeContracts(maxRiskPer);
       trades.push({
         strategy: 'Bear Put Debit Spread',
         direction: 'bearish',
         confidence: Math.abs(biasScore) > 30 ? 'high' : 'medium',
         score: Math.abs(biasScore) > 30 ? 75 : 60,
         expiration: medDTE,
-        strikes: `Buy $${buyStrike} put, sell $${targetStrike} put — ${putWall ? `targeting put wall` : `~2 ATR target`}. Spread width: $${(buyStrike - targetStrike).toFixed(0)}`,
+        strikes: `${qty}x Buy $${buyStrike} put, sell $${targetStrike} put — ${putWall ? `targeting put wall` : `~2 ATR target`}. Width: $${width.toFixed(0)}`,
         entry: 'Enter on failed rallies or rejection at resistance.',
-        risk: 'Max risk = debit paid. Take profit at 50-100%.',
+        risk: `Max risk $${(maxRiskPer * qty).toFixed(0)} (${qty} × $${maxRiskPer.toFixed(0)} debit). Take profit at 50-100%.`,
         reasoning: [
           `IV Rank ${input.ivRank} — cheap options, favorable for buying`,
           'Bearish signals support downside targeting',
@@ -735,21 +776,30 @@ function generateTrades(
         tags: ['premium-buying', 'defined-risk', 'directional'],
         profitTargetPct: 75,
         stopLossPct: 50,
+        quantity: qty,
+        maxRiskPerContract: maxRiskPer,
       });
     }
 
     if (gammaRegime === 'short') {
+      // Tighter strangle: 0.5 ATR wings instead of 1 ATR for meaningful premium
       const straddleStrike = Math.round(spotPrice / strikeStep) * strikeStep;
+      const stranglePut = Math.round((spotPrice - atr14 * 0.5) / strikeStep) * strikeStep;
+      const strangleCall = Math.round((spotPrice + atr14 * 0.5) / strikeStep) * strikeStep;
       const movePctNeeded = input.currentIV > 0 ? (input.currentIV / Math.sqrt(252)) * 100 : atrPercent;
+      // Estimate straddle cost ~= daily sigma * sqrt(DTE) * spot * 0.01 * 2
+      const estimatedCost = spotPrice * (input.currentIV > 0 ? input.currentIV : atrPercent / 100) * Math.sqrt(21 / 365) * 100;
+      const maxRiskPer = Math.max(estimatedCost, spotPrice * 0.03 * 100); // ~3% of spot as fallback
+      const qty = sizeContracts(maxRiskPer);
       trades.push({
         strategy: 'Long Straddle / Strangle',
         direction: 'neutral',
         confidence: input.ivHvRatio < 0.85 ? 'high' : 'medium',
         score: input.ivHvRatio < 0.85 ? 80 : 60,
         expiration: medDTE,
-        strikes: `ATM straddle at $${straddleStrike} or strangle $${Math.round((spotPrice - atr14) / strikeStep) * strikeStep}P / $${Math.round((spotPrice + atr14) / strikeStep) * strikeStep}C (1 ATR wings)`,
+        strikes: `${qty}x ATM straddle at $${straddleStrike} or strangle $${stranglePut}P / $${strangleCall}C (0.5 ATR wings)`,
         entry: `Enter when IV is near 52w lows. Need ~${movePctNeeded.toFixed(1)}% move to break even (~${(movePctNeeded / atrPercent).toFixed(1)} ATR).`,
-        risk: 'Max risk = premium paid. Close if IV compresses further. Manage at 21 DTE.',
+        risk: `Max risk $${(maxRiskPer * qty).toFixed(0)} (${qty} × ~$${maxRiskPer.toFixed(0)} premium). Close if IV compresses further. Manage at 21 DTE.`,
         reasoning: [
           `IV Rank ${input.ivRank} — vol is cheap, straddles underpriced`,
           input.ivHvRatio < 0.85 ? `IV/HV ${input.ivHvRatio.toFixed(2)} — implied ${((1 - input.ivHvRatio) * 100).toFixed(0)}% below realized, edge in buying vol` : '',
@@ -759,6 +809,8 @@ function generateTrades(
         tags: ['premium-buying', 'volatility-long', 'non-directional'],
         profitTargetPct: 50,
         stopLossPct: 40,
+        quantity: qty,
+        maxRiskPerContract: maxRiskPer,
       });
     }
   }
@@ -766,16 +818,20 @@ function generateTrades(
   // ─── MID IV: Context-Dependent ───
   if (volRegime === 'mid') {
     if (bias === 'bullish' && Math.abs(biasScore) > 20) {
+      const buyStrike = Math.round(spotPrice / strikeStep) * strikeStep; // ATM
       const targetStrike = callWall ? Math.round(callWall / strikeStep) * strikeStep : Math.round((spotPrice + atr14 * 1.5) / strikeStep) * strikeStep;
+      const width = targetStrike - buyStrike;
+      const maxRiskPer = width * 100;
+      const qty = sizeContracts(maxRiskPer);
       trades.push({
         strategy: 'Call Debit Spread',
         direction: 'bullish',
         confidence: Math.abs(biasScore) > 40 ? 'high' : 'medium',
         score: Math.min(75, 50 + Math.abs(biasScore)),
         expiration: medDTE,
-        strikes: `Buy slightly ITM call, sell $${targetStrike} — ${callWall ? `call wall target` : '1.5 ATR target'}`,
-        entry: `Enter on pullbacks. Risk 1-2% of account. Stock's daily range is ~${atrPercent.toFixed(1)}%.`,
-        risk: 'Max risk = debit. Target 50-100% return on debit.',
+        strikes: `${qty}x Buy $${buyStrike} call, sell $${targetStrike} call — ${callWall ? `call wall target` : '1.5 ATR target'}. Width: $${width.toFixed(0)}`,
+        entry: `Enter on pullbacks. Stock's daily range is ~${atrPercent.toFixed(1)}%.`,
+        risk: `Max risk $${(maxRiskPer * qty).toFixed(0)} (${qty} × $${maxRiskPer.toFixed(0)} debit). Target 50-100% return.`,
         reasoning: [
           `Mid-range IV (Rank ${input.ivRank}) — spreads offer best risk/reward`,
           `Bullish bias score: +${biasScore.toFixed(0)}`,
@@ -784,20 +840,26 @@ function generateTrades(
         tags: ['defined-risk', 'directional'],
         profitTargetPct: 75,
         stopLossPct: 50,
+        quantity: qty,
+        maxRiskPerContract: maxRiskPer,
       });
     }
 
     if (bias === 'bearish' && Math.abs(biasScore) > 20) {
+      const buyStrike = Math.round(spotPrice / strikeStep) * strikeStep; // ATM
       const targetStrike = putWall ? Math.round(putWall / strikeStep) * strikeStep : Math.round((spotPrice - atr14 * 1.5) / strikeStep) * strikeStep;
+      const width = buyStrike - targetStrike;
+      const maxRiskPer = width * 100;
+      const qty = sizeContracts(maxRiskPer);
       trades.push({
         strategy: 'Put Debit Spread',
         direction: 'bearish',
         confidence: Math.abs(biasScore) > 40 ? 'high' : 'medium',
         score: Math.min(75, 50 + Math.abs(biasScore)),
         expiration: medDTE,
-        strikes: `Buy slightly ITM put, sell $${targetStrike} — ${putWall ? `put wall target` : '1.5 ATR target'}`,
+        strikes: `${qty}x Buy $${buyStrike} put, sell $${targetStrike} put — ${putWall ? `put wall target` : '1.5 ATR target'}. Width: $${width.toFixed(0)}`,
         entry: 'Enter on failed rallies or breakdown below support.',
-        risk: 'Max risk = debit. Target 50-100% return.',
+        risk: `Max risk $${(maxRiskPer * qty).toFixed(0)} (${qty} × $${maxRiskPer.toFixed(0)} debit). Target 50-100% return.`,
         reasoning: [
           `Mid-range IV (Rank ${input.ivRank}) — spreads optimal`,
           `Bearish bias score: ${biasScore.toFixed(0)}`,
@@ -806,6 +868,8 @@ function generateTrades(
         tags: ['defined-risk', 'directional'],
         profitTargetPct: 75,
         stopLossPct: 50,
+        quantity: qty,
+        maxRiskPerContract: maxRiskPer,
       });
     }
   }
@@ -815,15 +879,18 @@ function generateTrades(
     const flipDistPct = Math.abs(spotPrice - gammaFlip) / spotPrice * 100;
     const flipDistATR = atrPercent > 0 ? flipDistPct / atrPercent : 99;
     if (flipDistATR < 0.5) { // within half an ATR of gamma flip
+      const gfStrike = Math.round(spotPrice / strikeStep) * strikeStep;
+      const gfMaxRisk = spotPrice * 0.03 * 100; // ~3% of spot for short-dated straddle
+      const gfQty = sizeContracts(gfMaxRisk);
       trades.push({
         strategy: 'Gamma Flip Straddle',
         direction: 'neutral',
         confidence: 'medium',
         score: 65,
         expiration: shortDTE,
-        strikes: `ATM straddle at $${Math.round(spotPrice / strikeStep) * strikeStep} — ${flipDistATR.toFixed(2)} ATR from gamma flip`,
+        strikes: `${gfQty}x ATM straddle at $${gfStrike} — ${flipDistATR.toFixed(2)} ATR from gamma flip`,
         entry: `Enter when spot is within 0.5 ATR ($${(atr14 * 0.5).toFixed(1)}) of gamma flip. Expect explosive move.`,
-        risk: `Short-dated = high theta ($${(spotPrice * input.currentIV / Math.sqrt(252) * 0.1).toFixed(2)}/day estimated). Close same/next day. Volatility scalp.`,
+        risk: `Max risk ~$${(gfMaxRisk * gfQty).toFixed(0)} (${gfQty} × ~$${gfMaxRisk.toFixed(0)} premium). Short-dated = high theta. Close same/next day.`,
         reasoning: [
           `Spot ${flipDistATR.toFixed(2)} ATR from gamma flip ($${gammaFlip.toFixed(0)}) — regime transition zone`,
           'Historically high volatility at the flip point',
@@ -832,6 +899,8 @@ function generateTrades(
         tags: ['event-driven', 'volatility-long', 'short-duration'],
         profitTargetPct: 40,
         stopLossPct: 30,
+        quantity: gfQty,
+        maxRiskPerContract: gfMaxRisk,
       });
     }
   }
@@ -842,6 +911,11 @@ function generateTrades(
     const mpDistATR = atrPercent > 0 ? mpDistPct / atrPercent : 0;
     if (mpDistATR > 0.3 && mpDistATR < 3) { // achievable but meaningful
       const mpDir = maxPain > spotPrice ? 'bullish' : 'bearish';
+      const mpBuyStrike = Math.round(spotPrice / strikeStep) * strikeStep;
+      const mpSellStrike = Math.round(maxPain / strikeStep) * strikeStep;
+      const mpWidth = Math.abs(mpSellStrike - mpBuyStrike);
+      const mpMaxRisk = mpWidth * 100;
+      const mpQty = sizeContracts(mpMaxRisk);
       trades.push({
         strategy: 'Max Pain Reversion',
         direction: mpDir,
@@ -849,10 +923,10 @@ function generateTrades(
         score: mpDistATR < 1.5 ? 60 : 45,
         expiration: shortDTE,
         strikes: mpDir === 'bullish'
-          ? `Buy call spread: $${Math.round(spotPrice / strikeStep) * strikeStep} / $${Math.round(maxPain / strikeStep) * strikeStep}`
-          : `Buy put spread: $${Math.round(spotPrice / strikeStep) * strikeStep} / $${Math.round(maxPain / strikeStep) * strikeStep}`,
+          ? `${mpQty}x Buy $${mpBuyStrike} call, sell $${mpSellStrike} call`
+          : `${mpQty}x Buy $${mpBuyStrike} put, sell $${mpSellStrike} put`,
         entry: `Target $${maxPain} by expiration — ${mpDistATR.toFixed(1)} ATR move needed (${input.nearestDTE}d to travel).`,
-        risk: 'Only works into expiration. Max risk = debit. Close by expiration day.',
+        risk: `Max risk $${(mpMaxRisk * mpQty).toFixed(0)} (${mpQty} × $${mpMaxRisk.toFixed(0)} debit). Only works into expiration.`,
         reasoning: [
           `Max Pain at $${maxPain} — ${mpDistATR.toFixed(1)} ATR from spot (${((maxPain - spotPrice) / spotPrice * 100).toFixed(1)}%)`,
           `${input.nearestDTE}d until expiration — pin effect strengthening`,
@@ -861,6 +935,8 @@ function generateTrades(
         tags: ['expiration-play', 'mean-reversion', 'short-duration'],
         profitTargetPct: 50,
         stopLossPct: 40,
+        quantity: mpQty,
+        maxRiskPerContract: mpMaxRisk,
       });
     }
   }

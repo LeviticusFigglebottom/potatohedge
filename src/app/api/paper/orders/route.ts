@@ -14,7 +14,26 @@ export async function GET() {
   try {
     const orders = await getOrders();
 
-    const enriched = orders.map(o => ({
+    // Auto-cancel stale pending/open orders older than 5 minutes
+    // Sandbox orders outside market hours sometimes stay pending indefinitely
+    const now = Date.now();
+    const cancelledIds: number[] = [];
+    for (const o of orders) {
+      if (o.status === 'pending' || o.status === 'open') {
+        const createdAt = o.create_date ? new Date(o.create_date).getTime() : 0;
+        if (createdAt > 0 && now - createdAt > 5 * 60 * 1000) {
+          try {
+            await cancelOrder(o.id);
+            cancelledIds.push(o.id);
+          } catch { /* best effort */ }
+        }
+      }
+    }
+
+    // Filter out cancelled orders from the response
+    const activeOrders = orders.filter(o => !cancelledIds.includes(o.id));
+
+    const enriched = activeOrders.map(o => ({
       ...o,
       parsed: o.option_symbol ? parseOCCSymbol(o.option_symbol) : null,
       legs: o.leg?.map(l => ({
@@ -23,7 +42,10 @@ export async function GET() {
       })),
     }));
 
-    return NextResponse.json({ orders: enriched });
+    return NextResponse.json({
+      orders: enriched,
+      ...(cancelledIds.length > 0 ? { autoCancelled: cancelledIds.length } : {}),
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     return NextResponse.json({ error: message }, { status: 500 });

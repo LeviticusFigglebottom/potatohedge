@@ -71,7 +71,11 @@ async function blobGet<T>(key: string): Promise<T[] | null> {
     signal: AbortSignal.timeout(5000),
   });
   if (!res.ok) return null;
-  return res.json();
+  try {
+    return await res.json();
+  } catch {
+    return null; // Malformed JSON from blob storage
+  }
 }
 
 async function blobSet<T>(key: string, data: T[]): Promise<void> {
@@ -186,6 +190,20 @@ export async function saveHistoryBulk<T extends HistoryRecord>(
   } catch {
     try {
       await blobSet(key, trimmed);
+    } catch { /* no persistence available */ }
+  }
+}
+
+/**
+ * Overwrite a key with the given data (NO merge with existing).
+ * Use this for purge operations where we need to replace, not merge.
+ */
+export async function overwriteKey<T>(key: string, data: T[]): Promise<void> {
+  try {
+    await redisSet(key, data);
+  } catch {
+    try {
+      await blobSet(key, data);
     } catch { /* no persistence available */ }
   }
 }

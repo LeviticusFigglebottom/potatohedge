@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { scanMarketFlow, type FlowResult } from '@/lib/providers/polygonFlow';
+import { logErr, logWarn } from '@/lib/errorLogger';
 
 export const maxDuration = 120; // Web search fundamental analysis can take longer
 
@@ -143,7 +144,13 @@ export async function POST(request: NextRequest) {
     flow: { netCallPremium: 0, netPutPremium: 0, netPremium: 0, totalCallVolume: 0, totalPutVolume: 0, putCallRatio: 0, sentiment: 'neutral', tickersScanned: 0, contractsAnalyzed: 0 },
     alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
   };
-  const flowResult = await scanMarketFlow().catch(() => emptyFlow);
+
+  // Fetch flow, VIX, and basic earnings data in parallel for trade mode
+  const [flowResult, vixData, earningsContext] = await Promise.all([
+    scanMarketFlow().catch(() => emptyFlow),
+    fetchVIXContext().catch(() => null),
+    data.mode !== 'fundamental' ? fetchEarningsContext(data.symbol).catch(() => null) : Promise.resolve(null),
+  ]);
 
   // For fundamental mode, fetch live financial data first
   let fundamentals: FundamentalData | null = null;
@@ -155,7 +162,7 @@ export async function POST(request: NextRequest) {
   const hasYahooData = !!(fundamentals && fundamentals.marketCap);
   const prompt = data.mode === 'fundamental'
     ? buildFundamentalPrompt(data, fundamentals)
-    : buildPrompt(data, flowResult);
+    : buildPrompt(data, flowResult, vixData, earningsContext);
 
   // Enable Claude web search when doing fundamental analysis without Yahoo data
   // This lets Claude search the web for current financial metrics itself
@@ -243,9 +250,21 @@ export async function POST(request: NextRequest) {
       result = await callClaude(false);
     }
 
-    return NextResponse.json({ analysis: result.text, model: result.model, usage: result.usage });
+    // Parse structured trade ideas from the JSON block in Claude's response
+    const tradeIdeas = parseTradeIdeasFromAnalysis(result.text);
+
+    // Strip the JSON block from the displayed analysis text
+    const cleanAnalysis = result.text.replace(/```json\s*\[[\s\S]*?\]\s*```\s*$/, '').trim();
+
+    return NextResponse.json({
+      analysis: cleanAnalysis,
+      tradeIdeas,
+      model: result.model,
+      usage: result.usage,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error ?? 'Unknown error');
+    logErr('claude-ai', `AI analysis failed: ${message}`, { symbol: data?.symbol, mode: data?.mode }, error);
     console.error('[ai/analyze] Error:', message);
     return NextResponse.json({ error: message }, { status: 500 });
   }
@@ -468,7 +487,99 @@ async function fetchYahooFinancials(symbol: string): Promise<FundamentalData | n
 
 // ─── Prompt Builders ──────────────────────────────────────────
 
-function buildPrompt(d: AnalysisRequest, flow?: FlowResult): string {
+// ─── VIX Context (quick Tradier quote) ─────────────────────
+
+interface VIXContext { price: number; changePct: number; level: string }
+
+async function fetchVIXContext(): Promise<VIXContext | null> {
+  const token = process.env.TRADIER_API_KEY;
+  if (!token) return null;
+  const baseUrl = process.env.TRADIER_SANDBOX === 'true'
+    ? 'https://sandbox.tradier.com/v1'
+    : 'https://api.tradier.com/v1';
+  const res = await fetch(`${baseUrl}/markets/quotes?symbols=VIX&greeks=false`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const q = data.quotes?.quote;
+  if (!q) return null;
+  const price = q.last ?? q.bid ?? 0;
+  const prevClose = q.prevclose ?? q.close ?? price;
+  const changePct = prevClose > 0 ? ((price - prevClose) / prevClose) * 100 : 0;
+  const level = price > 30 ? 'EXTREME FEAR' : price > 25 ? 'HIGH FEAR' : price > 20 ? 'ELEVATED' : price > 15 ? 'MODERATE' : 'LOW / COMPLACENT';
+  return { price, changePct, level };
+}
+
+// ─── Earnings Context (quick Yahoo fetch) ──────────────────
+
+interface EarningsContext {
+  nextEarningsDate: string | null;
+  daysToEarnings: number | null;
+  lastQuarterSurprise: string | null;
+  earningsImpact: string;
+}
+
+async function fetchEarningsContext(symbol: string): Promise<EarningsContext | null> {
+  try {
+    // Quick Yahoo Finance summary fetch for earnings dates
+    const res = await fetch(
+      `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=calendarEvents,earningsHistory`,
+      { signal: AbortSignal.timeout(5000), headers: { 'User-Agent': 'Mozilla/5.0' } }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const result = data?.quoteSummary?.result?.[0];
+    if (!result) return null;
+
+    // Next earnings date
+    const earningsDates = result.calendarEvents?.earnings?.earningsDate;
+    let nextDate: string | null = null;
+    let daysTo: number | null = null;
+    if (earningsDates && earningsDates.length > 0) {
+      const raw = earningsDates[0]?.raw ?? earningsDates[0]?.fmt;
+      if (typeof raw === 'number') {
+        nextDate = new Date(raw * 1000).toISOString().slice(0, 10);
+      } else if (typeof raw === 'string') {
+        nextDate = raw;
+      }
+      if (nextDate) {
+        daysTo = Math.round((new Date(nextDate).getTime() - Date.now()) / 86400000);
+      }
+    }
+
+    // Last quarter surprise
+    let lastSurprise: string | null = null;
+    const history = result.earningsHistory?.history;
+    if (history && history.length > 0) {
+      const last = history[history.length - 1];
+      const pct = last.surprisePercent?.raw;
+      if (pct != null) {
+        lastSurprise = `${pct > 0 ? '+' : ''}${(pct * 100).toFixed(1)}% surprise`;
+      }
+    }
+
+    // Impact assessment
+    let impact = 'No upcoming earnings impact';
+    if (daysTo !== null) {
+      if (daysTo <= 0) impact = 'EARNINGS TODAY/JUST REPORTED — expect extreme IV and gaps';
+      else if (daysTo <= 3) impact = 'EARNINGS IMMINENT — IV crush risk on any premium sold, IV expansion benefits buyers';
+      else if (daysTo <= 7) impact = 'Earnings within 1 week — IV typically expands into the event';
+      else if (daysTo <= 14) impact = 'Earnings in 2 weeks — consider positioning around the event';
+      else if (daysTo <= 30) impact = 'Earnings within a month — factor into expiration selection';
+      else impact = 'Earnings > 30 days out — minimal near-term impact';
+    }
+
+    return { nextEarningsDate: nextDate, daysToEarnings: daysTo, lastQuarterSurprise: lastSurprise, earningsImpact: impact };
+  } catch {
+    return null;
+  }
+}
+
+// ─── Trade Analysis Prompt Builder ─────────────────────────
+
+function buildPrompt(d: AnalysisRequest, flow?: FlowResult, vix?: VIXContext | null, earnings?: EarningsContext | null): string {
   const pctFmt = (v: number) => `${(v * 100).toFixed(1)}%`;
   const dollarFmt = (v: number) => `$${v.toFixed(2)}`;
   const abbrNum = (n: number) => {
@@ -494,7 +605,15 @@ PRICE ACTION
 • Today's move: ${moveSigma.toFixed(1)}σ (${moveATR.toFixed(1)}x ATR) — ${moveSigma > 2.5 ? 'ABNORMALLY LARGE' : moveSigma > 1.5 ? 'above average' : 'within normal range'}
 • Volume: ${(d.volume / 1e6).toFixed(1)}M (${d.avgVolume > 0 ? ((d.volume / d.avgVolume) * 100).toFixed(0) : '?'}% of avg)
 • Bid/Ask: ${dollarFmt(d.bid)} × ${dollarFmt(d.ask)}
-
+${vix ? `
+MARKET REGIME (VIX)
+• VIX: ${vix.price.toFixed(2)} (${vix.changePct > 0 ? '+' : ''}${vix.changePct.toFixed(1)}%) — ${vix.level}
+• ${vix.price > 25 ? 'HIGH VIX favors premium selling strategies. Vanna flows are large — vol drops force dealer buying.' : vix.price > 18 ? 'MODERATE VIX — balanced opportunity set. Watch for vol expansion/compression signals.' : 'LOW VIX — premium cheap, favor buying strategies or low-risk theta plays. Beware complacency → tail risk.'}
+` : ''}${earnings ? `
+EARNINGS CONTEXT
+• Next Earnings: ${earnings.nextEarningsDate ?? 'Unknown'}${earnings.daysToEarnings !== null ? ` (${earnings.daysToEarnings} days away)` : ''}
+• ${earnings.earningsImpact}${earnings.lastQuarterSurprise ? `\n• Last Quarter: ${earnings.lastQuarterSurprise}` : ''}
+` : ''}
 STOCK VOLATILITY PROFILE
 • 14-day ATR: ${dollarFmt(d.atr14)} (${d.atrPercent.toFixed(2)}% of price)
 • Daily 1σ: ${d.dailySigma.toFixed(2)}% | Avg daily range: ${d.avgDailyRangePct.toFixed(2)}%
@@ -607,7 +726,29 @@ Also provide:
 
 Be specific, quantitative, and reference the actual data. Do NOT give generic advice. Every recommendation should be traceable back to specific data points above. Think like a professional options desk analyst writing a trade memo.
 
-Format your response using clear headers and be concise but thorough.`;
+Format your response using clear headers and be concise but thorough.
+
+IMPORTANT — STRUCTURED OUTPUT:
+After your narrative analysis, you MUST include a machine-readable JSON block at the very end of your response. This block will be parsed by our system to allow users to track your recommendations.
+Wrap the JSON in \`\`\`json ... \`\`\` code fences. The JSON must be an array of trade objects:
+\`\`\`json
+[
+  {
+    "strategy": "Bull Put Spread",
+    "direction": "bullish",
+    "confidence": "high",
+    "strikes": "Sell $600P / Buy $595P",
+    "expiration": "2025-02-21 (7 DTE)",
+    "entry": "Enter at current levels with spot near $605",
+    "profitTargetPct": 50,
+    "stopLossPct": 100,
+    "risk": "Max loss $500 per spread",
+    "reasoning": ["GEX positive = mean reversion favors put sellers", "IV rank 65 supports premium selling"],
+    "tags": ["credit-spread", "theta-play"]
+  }
+]
+\`\`\`
+Include ALL trades you recommended in the narrative. Use the exact strategy names and strike prices from your analysis.`;
 }
 
 function buildFundamentalPrompt(d: AnalysisRequest, fin: FundamentalData | null): string {
@@ -792,4 +933,50 @@ Using the live data above as your foundation, provide a complete equity research
 - Conviction level (1-10) with justification
 
 Be specific, data-driven, and balanced. Use the LIVE numbers provided — do not substitute with older data from training. Format with clear headers.`;
+}
+
+// ─── Parse structured trade ideas from Claude's JSON block ───
+
+interface ParsedTradeIdea {
+  strategy: string;
+  direction: string;
+  confidence: string;
+  strikes: string;
+  expiration: string;
+  entry: string;
+  profitTargetPct: number;
+  stopLossPct: number;
+  risk: string;
+  reasoning: string[];
+  tags: string[];
+}
+
+function parseTradeIdeasFromAnalysis(text: string): ParsedTradeIdea[] {
+  try {
+    // Look for the last JSON code block in the response
+    const jsonBlocks = [...text.matchAll(/```json\s*([\s\S]*?)```/g)];
+    if (jsonBlocks.length === 0) return [];
+
+    const lastBlock = jsonBlocks[jsonBlocks.length - 1][1].trim();
+    const parsed = JSON.parse(lastBlock);
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .filter((t: Record<string, unknown>) => t && typeof t.strategy === 'string')
+      .map((t: Record<string, unknown>) => ({
+        strategy: String(t.strategy || ''),
+        direction: String(t.direction || 'neutral'),
+        confidence: String(t.confidence || 'medium'),
+        strikes: String(t.strikes || ''),
+        expiration: String(t.expiration || ''),
+        entry: String(t.entry || ''),
+        profitTargetPct: Number(t.profitTargetPct) || 50,
+        stopLossPct: Number(t.stopLossPct) || 100,
+        risk: String(t.risk || ''),
+        reasoning: Array.isArray(t.reasoning) ? t.reasoning.map(String) : [],
+        tags: Array.isArray(t.tags) ? t.tags.map(String) : [],
+      }));
+  } catch {
+    return [];
+  }
 }

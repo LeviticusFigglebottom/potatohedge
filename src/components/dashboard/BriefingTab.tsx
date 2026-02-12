@@ -4,8 +4,9 @@ import { useState, useCallback } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import {
   Newspaper, Loader2, AlertTriangle, TrendingUp, TrendingDown, Minus,
-  Wallet, ChevronDown, ChevronUp, CheckCircle2, Sparkles,
+  Wallet, ChevronDown, ChevronUp, CheckCircle2, Sparkles, Eye,
 } from 'lucide-react';
+import { buildTrackedTradeFromAlgo, addTrackedTrade, sizePosition, fetchEntryPrices, fillEntryPrices, calculatePositionValue, validateAndClampStrikes, type TrackedLeg } from '@/lib/tradeTracker';
 
 // ─── Trade rule storage (shared with PaperTradingTab + PaperMonitor) ───
 interface TradeRule {
@@ -37,6 +38,37 @@ function saveGroupRule(rule: TradeRule) {
   const rules = loadRules().filter(r => r.id !== rule.id);
   rules.push(rule);
   localStorage.setItem('optix-paper-rules', JSON.stringify(rules));
+}
+
+function parseQuantity(strikesText: string): number {
+  const m = strikesText.match(/^(\d+)\s*x\s/i) || strikesText.match(/×\s*(\d+)/);
+  return m ? Math.max(1, Math.min(10, parseInt(m[1]))) : 1;
+}
+
+/** Validate and clamp a strike to be within 2 ATR of spot. Returns clamped strike. */
+function clampStrike(strike: number, spot: number, type: 'C' | 'P'): number {
+  const atr = spot * 0.015; // 1.5% default ATR
+  const maxDist = atr * 2;
+  const step = spot > 200 ? 5 : spot > 50 ? 2.5 : 1;
+  if (type === 'C' && strike > spot + maxDist) {
+    return Math.round((spot + maxDist) / step) * step;
+  }
+  if (type === 'P' && strike < spot - maxDist) {
+    return Math.round((spot - maxDist) / step) * step;
+  }
+  return strike;
+}
+
+/** Calculate proper contract quantity using portfolio sizing (1-5% of $100K). */
+function calcQty(spot: number, strategy: string, legs: { strike: number; type: 'C' | 'P'; side: 'long' | 'short' }[]): number {
+  const trackerLegs: TrackedLeg[] = legs.map(l => ({
+    optionSymbol: '', optionType: l.type === 'C' ? 'call' : 'put',
+    strike: l.strike, expiration: '', side: l.side === 'long' ? 'long' : 'short',
+    quantity: 1, entryBid: 0, entryAsk: 0, entryMid: 0,
+    exitBid: null, exitAsk: null, exitMid: null,
+    entryDelta: 0, entryGamma: 0, entryTheta: 0, entryVega: 0, entryIV: 0,
+  }));
+  return sizePosition(trackerLegs, strategy, spot);
 }
 
 function buildOCC(symbol: string, expiration: string, type: 'C' | 'P', strike: number): string {
@@ -173,6 +205,67 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
   const { setActiveTab } = useDashboardStore();
   const [expanded, setExpanded] = useState<number | null>(null);
   const [paperStatus, setPaperStatus] = useState<Record<number, string>>({});
+  const [trackedIdeas, setTrackedIdeas] = useState<Set<number>>(new Set());
+
+  const handleTrack = async (idea: TradeIdea, idx: number) => {
+    // Build the trade first (with pending legs)
+    const tracked = buildTrackedTradeFromAlgo({
+      symbol: idea.ticker,
+      spotPrice: idea.spot,
+      trade: {
+        strategy: idea.strategy,
+        direction: idea.direction,
+        confidence: idea.confidence,
+        score: idea.score,
+        expiration: idea.expiration,
+        strikes: idea.strikes,
+        entry: idea.entry,
+        risk: idea.risk,
+        reasoning: idea.reasoning,
+        tags: idea.tags,
+        profitTargetPct: idea.profitTargetPct,
+        stopLossPct: idea.stopLossPct,
+      },
+      marketSnapshot: {
+        ivRank: idea.ivRank,
+        currentIV: idea.currentIV,
+        hvCurrent: 0,
+        totalGEX: 0,
+        gammaFlip: idea.gammaFlip,
+        callWall: idea.callWall,
+        putWall: idea.putWall,
+        biasScore: idea.biasScore,
+        overallBias: idea.bias,
+        volRegime: idea.ivRank > 60 ? 'high' : idea.ivRank < 30 ? 'low' : 'mid',
+        gammaRegime: 'neutral',
+      },
+      source: 'ai-briefing',
+      nearestExp: idea.nearestExp,
+    });
+    // Fetch live prices and fill entry immediately so trade starts as 'entered'
+    if (tracked.status === 'pending') {
+      const occSymbols = tracked.legs.map(l => l.optionSymbol).filter(Boolean);
+      const { quotes } = await fetchEntryPrices(occSymbols, idea.ticker);
+      if (Object.keys(quotes).length > 0) {
+        tracked.legs = fillEntryPrices(tracked.legs, quotes);
+        const hasRealPrices = tracked.legs.length > 0 && tracked.legs.every(l => l.entryMid > 0);
+        if (hasRealPrices) {
+          // Reject penny options: if avg mid < $0.10, don't mark as entered
+          const pricedLegs = tracked.legs.filter(l => l.entryMid > 0);
+          const avgMid = pricedLegs.reduce((s, l) => s + l.entryMid, 0) / pricedLegs.length;
+          if (avgMid >= 0.10) {
+            tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
+            tracked.status = 'entered';
+            tracked.enteredAt = Date.now();
+            tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
+          }
+          // If avgMid < $0.10, leave as pending — likely penny options that shouldn't be traded
+        }
+      }
+    }
+    addTrackedTrade(tracked);
+    setTrackedIdeas(prev => new Set(prev).add(idx));
+  };
 
   const handlePaperTrade = async (idea: TradeIdea, idx: number) => {
     setPaperStatus(s => ({ ...s, [idx]: 'placing...' }));
@@ -197,6 +290,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
 
       const exp = idea.nearestExp;
       const thesis = `${idea.strategy} — ${idea.reasoning[0] || ''}`;
+      let qty = parseQuantity(idea.strikes);
 
       if (isIronCondor && allStrikes.length >= 2) {
         // Iron condor: sell call + sell put, buy wings
@@ -210,6 +304,19 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
         let sellPut = sellPutMatch ? parseFloat(sellPutMatch[1]) : allStrikes[1] || allStrikes[0] - 20;
         // Ensure call is above put
         if (sellCall < sellPut) [sellCall, sellPut] = [sellPut, sellCall];
+        // Clamp strikes to within 2 ATR of spot
+        sellCall = clampStrike(sellCall, idea.spot, 'C');
+        sellPut = clampStrike(sellPut, idea.spot, 'P');
+
+        // Auto-size if no explicit qty in text
+        if (qty === 1) {
+          qty = calcQty(idea.spot, idea.strategy, [
+            { strike: sellCall, type: 'C', side: 'short' },
+            { strike: sellCall + wingWidth, type: 'C', side: 'long' },
+            { strike: sellPut, type: 'P', side: 'short' },
+            { strike: sellPut - wingWidth, type: 'P', side: 'long' },
+          ]);
+        }
 
         const res = await fetch('/api/paper/trade', {
           method: 'POST',
@@ -220,10 +327,10 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
             orderType: 'credit',
             duration: 'gtc',
             legs: [
-              { expiration: exp, optionType: 'C', strike: sellCall, side: 'sell_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'C', strike: sellCall + wingWidth, side: 'buy_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'P', strike: sellPut, side: 'sell_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'P', strike: sellPut - wingWidth, side: 'buy_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'C', strike: sellCall, side: 'sell_to_open', quantity: qty },
+              { expiration: exp, optionType: 'C', strike: sellCall + wingWidth, side: 'buy_to_open', quantity: qty },
+              { expiration: exp, optionType: 'P', strike: sellPut, side: 'sell_to_open', quantity: qty },
+              { expiration: exp, optionType: 'P', strike: sellPut - wingWidth, side: 'buy_to_open', quantity: qty },
             ],
             thesis,
           }),
@@ -255,34 +362,44 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
           // Bull put spread (credit): sell higher put, buy lower put
           optType = 'P';
           orderType = 'credit';
-          leg1Strike = sellStrikes[0] || Math.max(...allStrikes);
-          leg2Strike = buyStrikes[0] || Math.min(...allStrikes);
+          leg1Strike = clampStrike(sellStrikes[0] || Math.max(...allStrikes), idea.spot, 'P');
+          leg2Strike = clampStrike(buyStrikes[0] || Math.min(...allStrikes), idea.spot, 'P');
           leg1Side = 'sell_to_open';
           leg2Side = 'buy_to_open';
         } else if (isBearCall) {
           // Bear call spread (credit): sell lower call, buy higher call
           optType = 'C';
           orderType = 'credit';
-          leg1Strike = sellStrikes[0] || Math.min(...allStrikes);
-          leg2Strike = buyStrikes[0] || Math.max(...allStrikes);
+          leg1Strike = clampStrike(sellStrikes[0] || Math.min(...allStrikes), idea.spot, 'C');
+          leg2Strike = clampStrike(buyStrikes[0] || Math.max(...allStrikes), idea.spot, 'C');
           leg1Side = 'sell_to_open';
           leg2Side = 'buy_to_open';
         } else if (isBullCall) {
           // Bull call spread (debit): buy lower call, sell higher call
           optType = 'C';
           orderType = 'debit';
-          leg1Strike = buyStrikes[0] || Math.min(...allStrikes);
-          leg2Strike = sellStrikes[0] || Math.max(...allStrikes);
+          leg1Strike = clampStrike(buyStrikes[0] || Math.min(...allStrikes), idea.spot, 'C');
+          leg2Strike = clampStrike(sellStrikes[0] || Math.max(...allStrikes), idea.spot, 'C');
           leg1Side = 'buy_to_open';
           leg2Side = 'sell_to_open';
         } else {
           // Bear put spread (debit): buy higher put, sell lower put
           optType = 'P';
           orderType = 'debit';
-          leg1Strike = buyStrikes[0] || Math.max(...allStrikes);
-          leg2Strike = sellStrikes[0] || Math.min(...allStrikes);
+          leg1Strike = clampStrike(buyStrikes[0] || Math.max(...allStrikes), idea.spot, 'P');
+          leg2Strike = clampStrike(sellStrikes[0] || Math.min(...allStrikes), idea.spot, 'P');
           leg1Side = 'buy_to_open';
           leg2Side = 'sell_to_open';
+        }
+
+        // Auto-size if no explicit qty in text
+        if (qty === 1) {
+          const s1Side = leg1Side.includes('sell') ? 'short' : 'long';
+          const s2Side = leg2Side.includes('sell') ? 'short' : 'long';
+          qty = calcQty(idea.spot, idea.strategy, [
+            { strike: leg1Strike, type: optType, side: s1Side as 'long' | 'short' },
+            { strike: leg2Strike, type: optType, side: s2Side as 'long' | 'short' },
+          ]);
         }
 
         const res = await fetch('/api/paper/trade', {
@@ -294,8 +411,8 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
             orderType,
             duration: 'gtc',
             legs: [
-              { expiration: exp, optionType: optType, strike: leg1Strike, side: leg1Side, quantity: 1 },
-              { expiration: exp, optionType: optType, strike: leg2Strike, side: leg2Side, quantity: 1 },
+              { expiration: exp, optionType: optType, strike: leg1Strike, side: leg1Side, quantity: qty },
+              { expiration: exp, optionType: optType, strike: leg2Strike, side: leg2Side, quantity: qty },
             ],
             thesis,
           }),
@@ -314,6 +431,11 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
       } else if (isStraddle && allStrikes.length >= 1) {
         // Long straddle: buy call + buy put at same strike
         const strike = allStrikes[0];
+        if (qty === 1) {
+          qty = calcQty(idea.spot, idea.strategy, [
+            { strike, type: 'C', side: 'long' }, { strike, type: 'P', side: 'long' },
+          ]);
+        }
         const res = await fetch('/api/paper/trade', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -323,8 +445,8 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
             orderType: 'debit',
             duration: 'gtc',
             legs: [
-              { expiration: exp, optionType: 'C', strike, side: 'buy_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'P', strike, side: 'buy_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'C', strike, side: 'buy_to_open', quantity: qty },
+              { expiration: exp, optionType: 'P', strike, side: 'buy_to_open', quantity: qty },
             ],
             thesis,
           }),
@@ -344,6 +466,11 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
         // Long strangle: buy OTM put + buy OTM call
         const putStrike = Math.min(...allStrikes);
         const callStrike = Math.max(...allStrikes);
+        if (qty === 1) {
+          qty = calcQty(idea.spot, idea.strategy, [
+            { strike: callStrike, type: 'C', side: 'long' }, { strike: putStrike, type: 'P', side: 'long' },
+          ]);
+        }
         const res = await fetch('/api/paper/trade', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -353,8 +480,8 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
             orderType: 'debit',
             duration: 'gtc',
             legs: [
-              { expiration: exp, optionType: 'P', strike: putStrike, side: 'buy_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'C', strike: callStrike, side: 'buy_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'P', strike: putStrike, side: 'buy_to_open', quantity: qty },
+              { expiration: exp, optionType: 'C', strike: callStrike, side: 'buy_to_open', quantity: qty },
             ],
             thesis,
           }),
@@ -372,8 +499,11 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
 
       } else {
         // Fallback: single leg (directional call or put)
-        const strike = allStrikes[0] || Math.round(idea.spot);
         const optionType: 'C' | 'P' = /put|bear/i.test(idea.strategy) || idea.direction === 'bearish' ? 'P' : 'C';
+        const strike = clampStrike(allStrikes[0] || Math.round(idea.spot), idea.spot, optionType);
+        if (qty === 1) {
+          qty = calcQty(idea.spot, idea.strategy, [{ strike, type: optionType, side: 'long' }]);
+        }
 
         const res = await fetch('/api/paper/trade', {
           method: 'POST',
@@ -385,7 +515,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
             optionType,
             strike,
             side: 'buy_to_open',
-            quantity: 1,
+            quantity: qty,
             orderType: 'market',
             duration: 'gtc',
             thesis,
@@ -402,6 +532,8 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId} (TP: +${idea.profitTargetPct || 75}% / SL: -${idea.stopLossPct || 50}%)` }));
       }
+      // Auto-track the paper trade so TrackerMonitor monitors it
+      if (!trackedIdeas.has(idx)) handleTrack(idea, idx);
     } catch (err) {
       setPaperStatus(s => ({ ...s, [idx]: `Error: ${err instanceof Error ? err.message : 'Failed'}` }));
     }
@@ -494,6 +626,18 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
                         {status === 'placing...' ? 'Placing...' : 'Paper Trade'}
                       </button>
                     )}
+                    {trackedIdeas.has(idx) ? (
+                      <span className="text-xs font-mono text-accent-green flex items-center gap-1">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> Tracked
+                      </span>
+                    ) : (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleTrack(idea, idx); }}
+                        className="px-3 py-1.5 rounded-md text-xs font-mono bg-accent-purple/15 text-accent-purple border border-accent-purple/25 hover:bg-accent-purple/25 transition-all flex items-center gap-1.5"
+                      >
+                        <Eye className="w-3.5 h-3.5" /> Track
+                      </button>
+                    )}
                   </div>
                 </div>
               )}
@@ -509,6 +653,69 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
   const { setActiveTab } = useDashboardStore();
   const [expanded, setExpanded] = useState<number | null>(null);
   const [paperStatus, setPaperStatus] = useState<Record<number, string>>({});
+  const [trackedIdeas, setTrackedIdeas] = useState<Set<number>>(new Set());
+
+  const handleTrack = async (idea: AITradeIdea, idx: number) => {
+    const dirLow = idea.direction.toLowerCase();
+    const direction = dirLow.includes('bull') ? 'bullish' : dirLow.includes('bear') ? 'bearish' : 'neutral';
+    const targetMatch = idea.target?.match(/(\d+)\s*%/);
+    const stopMatch = idea.stopMaxLoss?.match(/(\d+)\s*%/);
+    const tracked = buildTrackedTradeFromAlgo({
+      symbol: idea.ticker,
+      spotPrice: idea.spot,
+      trade: {
+        strategy: idea.strategy,
+        direction,
+        confidence: 'medium',
+        score: 70,
+        expiration: idea.expiration,
+        strikes: idea.strikes,
+        entry: idea.entry,
+        risk: idea.stopMaxLoss || 'See trade details',
+        reasoning: [idea.thesis, idea.invalidation ? `Invalidation: ${idea.invalidation}` : ''].filter(Boolean),
+        tags: ['ai-generated'],
+        profitTargetPct: targetMatch ? parseInt(targetMatch[1]) : 50,
+        stopLossPct: stopMatch ? parseInt(stopMatch[1]) : 100,
+      },
+      marketSnapshot: {
+        ivRank: idea.ivRank,
+        currentIV: 0,
+        hvCurrent: 0,
+        totalGEX: 0,
+        gammaFlip: idea.gammaFlip,
+        callWall: idea.callWall,
+        putWall: idea.putWall,
+        biasScore: idea.biasScore,
+        overallBias: idea.bias,
+        volRegime: idea.ivRank > 60 ? 'high' : idea.ivRank < 30 ? 'low' : 'mid',
+        gammaRegime: 'neutral',
+      },
+      source: 'ai-analysis',
+      nearestExp: idea.nearestExp,
+    });
+    // Fetch live prices and fill entry immediately
+    if (tracked.status === 'pending') {
+      const occSymbols = tracked.legs.map(l => l.optionSymbol).filter(Boolean);
+      const { quotes } = await fetchEntryPrices(occSymbols, idea.ticker);
+      if (Object.keys(quotes).length > 0) {
+        tracked.legs = fillEntryPrices(tracked.legs, quotes);
+        const hasRealPrices = tracked.legs.length > 0 && tracked.legs.every(l => l.entryMid > 0);
+        if (hasRealPrices) {
+          // Reject penny options: if avg mid < $0.10, don't mark as entered
+          const pricedLegs = tracked.legs.filter(l => l.entryMid > 0);
+          const avgMid = pricedLegs.reduce((s, l) => s + l.entryMid, 0) / pricedLegs.length;
+          if (avgMid >= 0.10) {
+            tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
+            tracked.status = 'entered';
+            tracked.enteredAt = Date.now();
+            tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
+          }
+        }
+      }
+    }
+    addTrackedTrade(tracked);
+    setTrackedIdeas(prev => new Set(prev).add(idx));
+  };
 
   const handlePaperTrade = async (idea: AITradeIdea, idx: number) => {
     setPaperStatus(s => ({ ...s, [idx]: 'placing...' }));
@@ -538,6 +745,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
 
       const exp = idea.nearestExp;
       const thesis = `[AI] ${idea.title} — ${idea.thesis || idea.strategy}`;
+      let qty = parseQuantity(idea.strikes);
 
       if (isIronCondor && allStrikes.length >= 2) {
         const sellCallMatch = strikesLow.match(/(\d+)\s*c/i) || strikesLow.match(/sell\s+\$?(\d+)/i);
@@ -545,17 +753,31 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
         let sellCall = sellCallMatch ? parseFloat(sellCallMatch[1]) : Math.max(...allStrikes);
         let sellPut = sellPutMatch ? parseFloat(sellPutMatch[1]) : Math.min(...allStrikes);
         if (sellCall < sellPut) [sellCall, sellPut] = [sellPut, sellCall];
+        // Clamp strikes to within 2 ATR of spot
+        sellCall = clampStrike(sellCall, idea.spot, 'C');
+        sellPut = clampStrike(sellPut, idea.spot, 'P');
         const wingWidth = 5;
+
+        // Auto-size: target 1-5% of portfolio
+        if (qty === 1) {
+          qty = calcQty(idea.spot, idea.strategy, [
+            { strike: sellCall, type: 'C', side: 'short' },
+            { strike: sellCall + wingWidth, type: 'C', side: 'long' },
+            { strike: sellPut, type: 'P', side: 'short' },
+            { strike: sellPut - wingWidth, type: 'P', side: 'long' },
+          ]);
+        }
+
         const res = await fetch('/api/paper/trade', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             type: 'spread', symbol: idea.ticker, orderType: 'credit', duration: 'gtc',
             legs: [
-              { expiration: exp, optionType: 'C', strike: sellCall, side: 'sell_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'C', strike: sellCall + wingWidth, side: 'buy_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'P', strike: sellPut, side: 'sell_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'P', strike: sellPut - wingWidth, side: 'buy_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'C', strike: sellCall, side: 'sell_to_open', quantity: qty },
+              { expiration: exp, optionType: 'C', strike: sellCall + wingWidth, side: 'buy_to_open', quantity: qty },
+              { expiration: exp, optionType: 'P', strike: sellPut, side: 'sell_to_open', quantity: qty },
+              { expiration: exp, optionType: 'P', strike: sellPut - wingWidth, side: 'buy_to_open', quantity: qty },
             ],
             thesis,
           }),
@@ -568,7 +790,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           underlying: idea.ticker, strategy: `[AI] ${idea.strategy}`, thesis,
           profitTargetPct: 50, stopLossPct: 100, autoExit: true, createdAt: new Date().toISOString(),
         });
-        setPaperStatus(s => ({ ...s, [idx]: `Placed IC #${data.orderId}` }));
+        setPaperStatus(s => ({ ...s, [idx]: `Placed IC ${qty}x #${data.orderId}` }));
 
       } else if ((isBullPut || isBearCall || isBullCall || isBearPut) && allStrikes.length >= 2) {
         let leg1Strike: number, leg2Strike: number;
@@ -578,24 +800,34 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
 
         if (isBullPut) {
           optType = 'P'; orderType = 'credit';
-          leg1Strike = sellStrikes[0] || Math.max(...allStrikes);
-          leg2Strike = buyStrikes[0] || Math.min(...allStrikes);
+          leg1Strike = clampStrike(sellStrikes[0] || Math.max(...allStrikes), idea.spot, 'P');
+          leg2Strike = clampStrike(buyStrikes[0] || Math.min(...allStrikes), idea.spot, 'P');
           leg1Side = 'sell_to_open'; leg2Side = 'buy_to_open';
         } else if (isBearCall) {
           optType = 'C'; orderType = 'credit';
-          leg1Strike = sellStrikes[0] || Math.min(...allStrikes);
-          leg2Strike = buyStrikes[0] || Math.max(...allStrikes);
+          leg1Strike = clampStrike(sellStrikes[0] || Math.min(...allStrikes), idea.spot, 'C');
+          leg2Strike = clampStrike(buyStrikes[0] || Math.max(...allStrikes), idea.spot, 'C');
           leg1Side = 'sell_to_open'; leg2Side = 'buy_to_open';
         } else if (isBullCall) {
           optType = 'C'; orderType = 'debit';
-          leg1Strike = buyStrikes[0] || Math.min(...allStrikes);
-          leg2Strike = sellStrikes[0] || Math.max(...allStrikes);
+          leg1Strike = clampStrike(buyStrikes[0] || Math.min(...allStrikes), idea.spot, 'C');
+          leg2Strike = clampStrike(sellStrikes[0] || Math.max(...allStrikes), idea.spot, 'C');
           leg1Side = 'buy_to_open'; leg2Side = 'sell_to_open';
         } else {
           optType = 'P'; orderType = 'debit';
-          leg1Strike = buyStrikes[0] || Math.max(...allStrikes);
-          leg2Strike = sellStrikes[0] || Math.min(...allStrikes);
+          leg1Strike = clampStrike(buyStrikes[0] || Math.max(...allStrikes), idea.spot, 'P');
+          leg2Strike = clampStrike(sellStrikes[0] || Math.min(...allStrikes), idea.spot, 'P');
           leg1Side = 'buy_to_open'; leg2Side = 'sell_to_open';
+        }
+
+        // Auto-size: target 1-5% of portfolio
+        if (qty === 1) {
+          const s1Side = leg1Side.includes('sell') ? 'short' : 'long';
+          const s2Side = leg2Side.includes('sell') ? 'short' : 'long';
+          qty = calcQty(idea.spot, idea.strategy, [
+            { strike: leg1Strike, type: optType, side: s1Side as 'long' | 'short' },
+            { strike: leg2Strike, type: optType, side: s2Side as 'long' | 'short' },
+          ]);
         }
 
         const res = await fetch('/api/paper/trade', {
@@ -604,8 +836,8 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           body: JSON.stringify({
             type: 'spread', symbol: idea.ticker, orderType, duration: 'gtc',
             legs: [
-              { expiration: exp, optionType: optType, strike: leg1Strike, side: leg1Side, quantity: 1 },
-              { expiration: exp, optionType: optType, strike: leg2Strike, side: leg2Side, quantity: 1 },
+              { expiration: exp, optionType: optType, strike: leg1Strike, side: leg1Side, quantity: qty },
+              { expiration: exp, optionType: optType, strike: leg2Strike, side: leg2Side, quantity: qty },
             ],
             thesis,
           }),
@@ -625,14 +857,21 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
         const strike2 = isStrangle && allStrikes.length >= 2 ? allStrikes[1] : strike1;
         const putStrike = Math.min(strike1, strike2);
         const callStrike = Math.max(strike1, strike2);
+        // Auto-size
+        if (qty === 1) {
+          qty = calcQty(idea.spot, idea.strategy, [
+            { strike: callStrike, type: 'C', side: 'long' },
+            { strike: putStrike, type: 'P', side: 'long' },
+          ]);
+        }
         const res = await fetch('/api/paper/trade', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             type: 'spread', symbol: idea.ticker, orderType: 'debit', duration: 'gtc',
             legs: [
-              { expiration: exp, optionType: 'C', strike: callStrike, side: 'buy_to_open', quantity: 1 },
-              { expiration: exp, optionType: 'P', strike: putStrike, side: 'buy_to_open', quantity: 1 },
+              { expiration: exp, optionType: 'C', strike: callStrike, side: 'buy_to_open', quantity: qty },
+              { expiration: exp, optionType: 'P', strike: putStrike, side: 'buy_to_open', quantity: qty },
             ],
             thesis,
           }),
@@ -645,18 +884,24 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           underlying: idea.ticker, strategy: `[AI] ${idea.strategy}`, thesis,
           profitTargetPct: 50, stopLossPct: 40, autoExit: true, createdAt: new Date().toISOString(),
         });
-        setPaperStatus(s => ({ ...s, [idx]: `Placed ${isStraddle ? 'straddle' : 'strangle'} #${data.orderId}` }));
+        setPaperStatus(s => ({ ...s, [idx]: `Placed ${isStraddle ? 'straddle' : 'strangle'} ${qty}x #${data.orderId}` }));
 
       } else {
         // Fallback: single leg
-        const strike = allStrikes[0] || Math.round(idea.spot);
         const optionType: 'C' | 'P' = /put|bear/i.test(idea.strategy) || idea.direction.toLowerCase().includes('bear') ? 'P' : 'C';
+        const strike = clampStrike(allStrikes[0] || Math.round(idea.spot), idea.spot, optionType);
+        // Auto-size
+        if (qty === 1) {
+          qty = calcQty(idea.spot, idea.strategy, [
+            { strike, type: optionType, side: 'long' },
+          ]);
+        }
         const res = await fetch('/api/paper/trade', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             type: 'single', symbol: idea.ticker, expiration: exp, optionType,
-            strike, side: 'buy_to_open', quantity: 1, orderType: 'market', duration: 'gtc', thesis,
+            strike, side: 'buy_to_open', quantity: qty, orderType: 'market', duration: 'gtc', thesis,
           }),
         });
         const data = await res.json();
@@ -669,6 +914,8 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId}` }));
       }
+      // Auto-track the paper trade so TrackerMonitor monitors it
+      if (!trackedIdeas.has(idx)) handleTrack(idea, idx);
     } catch (err) {
       setPaperStatus(s => ({ ...s, [idx]: `Error: ${err instanceof Error ? err.message : 'Failed'}` }));
     }
@@ -756,6 +1003,18 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
                         {status === 'placing...' ? 'Placing...' : 'Paper Trade'}
                       </button>
                     )}
+                    {trackedIdeas.has(idx) ? (
+                      <span className="text-xs font-mono text-accent-green flex items-center gap-1">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> Tracked
+                      </span>
+                    ) : (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleTrack(idea, idx); }}
+                        className="px-3 py-1.5 rounded-md text-xs font-mono bg-accent-cyan/15 text-accent-cyan border border-accent-cyan/25 hover:bg-accent-cyan/25 transition-all flex items-center gap-1.5"
+                      >
+                        <Eye className="w-3.5 h-3.5" /> Track
+                      </button>
+                    )}
                   </div>
                 </div>
               )}
@@ -768,10 +1027,12 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
 }
 
 export default function BriefingTab() {
-  const [data, setData] = useState<BriefingResponse | null>(null);
+  const { briefingCache, setBriefingCache } = useDashboardStore();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [phase, setPhase] = useState('');
+
+  const data = briefingCache as BriefingResponse | null;
 
   const fetchBriefing = useCallback(async () => {
     setLoading(true);
@@ -800,14 +1061,14 @@ export default function BriefingTab() {
       }
 
       const json = await res.json();
-      setData(json);
+      setBriefingCache(json);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to generate briefing');
     } finally {
       setLoading(false);
       setPhase('');
     }
-  }, []);
+  }, [setBriefingCache]);
 
   // Empty state
   if (!data && !loading && !error) {

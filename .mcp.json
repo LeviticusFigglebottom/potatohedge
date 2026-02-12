@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "optix-dashboard": {
+      "command": "npx",
+      "args": ["tsx", "mcp-server.ts"],
+      "cwd": "/home/user/potatohedge",
+      "env": {
+        "DASHBOARD_URL": "http://localhost:3000"
+      }
+    }
+  }
+}

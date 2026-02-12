@@ -479,7 +479,7 @@ ${flowData.flow.tickersScanned > 0 ? '4. **OPTIONS FLOW ANALYSIS** — Analyze t
 | **Ticker** | Stock symbol |
 | **Direction** | Bullish / Bearish / Neutral |
 | **Strategy** | e.g., "Buy 605C weeklies", "Bear put spread 590/580", "Sell iron condor 595/600/610/615" |
-| **Strike(s)** | Exact strike price(s) |
+| **Strike(s)** | Exact strike price(s) — MUST follow strike rules below |
 | **Expiration** | Specific date and DTE |
 | **Entry** | Price target or condition for entry |
 | **Target** | Profit target price/level |
@@ -487,7 +487,29 @@ ${flowData.flow.tickersScanned > 0 ? '4. **OPTIONS FLOW ANALYSIS** — Analyze t
 | **Thesis** | 2-3 sentences: what Greek/flow/level drives this, what catalyst or positioning supports it |
 | **Invalidation** | What specific level or event kills the trade |
 
-Prioritize trades where multiple signals converge: gamma positioning + flow direction + key level proximity + IV regime. Prefer defined-risk strategies (spreads) over naked options. Reference the algorithm trade ideas data above but apply your own judgment — you may modify strikes, expirations, or strategies based on the full market context.
+**MANDATORY STRIKE SELECTION RULES — FOLLOW THESE EXACTLY:**
+1. **Near-the-money only**: All strikes MUST be within 2 ATR of the current spot price. For SPY at $605 with 1% ATR (~$6), that means strikes between ~$593 and ~$617. NEVER pick strikes like $700C or $250P — those are far OTM penny options worth $0.01 with zero edge.
+2. **Minimum premium**: Every individual option leg must have an estimated market value of at least $0.10 per contract. If a strike would trade for pennies, move it closer to the money. A $5-wide spread should cost at least $0.50-1.50 in premium, NOT $0.01.
+3. **Use key levels for strike placement**: Place short strikes near gamma flip, put wall, or call wall levels. Place long strikes 1 ATR beyond the short strikes. The algorithm's ATR-based strikes above are good starting points.
+4. **Credit spreads**: Short strike should be ~0.5-1 ATR from spot (near a support/resistance level). The premium collected should be 20-40% of the spread width.
+5. **Debit spreads**: Long strike should be ATM or slightly ITM. Short strike should be 1-2 ATR away. The debit paid should be 30-60% of the spread width.
+6. **Position value floor**: Each contract in the position must have a notional value of at least $100 (i.e., option mid price × 100 shares ≥ $100, so mid ≥ $1.00 per leg for single-leg trades, or net spread premium ≥ $0.50).
+
+Prioritize trades where multiple signals converge: gamma positioning + flow direction + key level proximity + IV regime. Prefer defined-risk strategies (spreads) over naked options. Reference the algorithm trade ideas data above — use their ATR-derived strikes as the foundation, then adjust based on key levels and flow data.
+
+CRITICAL FORMAT REQUIREMENT: Start each trade idea with "TRADE N:" (e.g., "TRADE 1: SPY BULL PUT SPREAD") followed by the fields in either table or colon format. This exact prefix is required for the UI to parse and display your trade ideas. Example:
+
+TRADE 1: SPY BULL PUT SPREAD
+| **Ticker** | SPY |
+| **Direction** | Bullish |
+| **Strategy** | Bull put spread |
+| **Strike(s)** | Sell $595P / Buy $590P |
+| **Expiration** | 2025-02-21 (7 DTE) |
+| **Entry** | Enter for ~$1.20 credit |
+| **Target** | 50% of max credit ($0.60) |
+| **Stop/Max Loss** | Close at $3.80 debit (net risk ~$380) |
+| **Thesis** | Positive GEX regime pins price above gamma flip. Vanna + charm both push dealer buying. |
+| **Invalidation** | Break below $590 put wall |
 
 Be opinionated and direct. Use **bold** for key names, levels, and directional calls. Every claim must reference specific data. Do NOT hedge every statement — make clear calls.`;
 
@@ -523,20 +545,38 @@ function parseAITradeIdeas(text: string): AITradeIdea[] {
     }
   }
 
-  // Strategy 2 (fallback): Find "N." numbered blocks after a "TRADE IDEAS" heading
+  // Strategy 2 (fallback): Find "N." or "N)" numbered blocks after a trade-related heading
   if (tradeStartIndices.length === 0) {
     let inSection = false;
     for (let i = 0; i < lines.length; i++) {
-      if (/trade\s+ideas?/i.test(lines[i])) {
+      if (/(?:trade\s+ideas?|options?\s+trade|actionable\s+(?:plays?|setups?|ideas?)|recommended\s+trades?)/i.test(lines[i])) {
         inSection = true;
         continue;
       }
-      if (inSection && /^\s*(?:#{1,3}\s*|\*{1,2})?\d+\.\s+\S/.test(lines[i])) {
+      if (inSection && /^\s*(?:#{1,3}\s*|\*{1,2})?\d+[\.\)]\s+\S/.test(lines[i])) {
         tradeStartIndices.push(i);
       }
       // Stop at next major heading that isn't trade-related
-      if (inSection && /^#{1,2}\s/.test(lines[i]) && !/trade/i.test(lines[i]) && !/\d+\./.test(lines[i])) {
+      if (inSection && /^#{1,2}\s/.test(lines[i]) && !/trade|play|setup|idea|options/i.test(lines[i]) && !/\d+[\.\)]/.test(lines[i])) {
         break;
+      }
+    }
+  }
+
+  // Strategy 3 (fallback): Find heading-style trade blocks "### N. TICKER — Strategy"
+  if (tradeStartIndices.length === 0) {
+    for (let i = 0; i < lines.length; i++) {
+      if (/^\s*#{2,4}\s*\d+[\.\)]\s+[A-Z]{1,5}\s/.test(lines[i])) {
+        tradeStartIndices.push(i);
+      }
+    }
+  }
+
+  // Strategy 4 (fallback): Find bold-prefixed trade entries "**1. TICKER — Strategy**"
+  if (tradeStartIndices.length === 0) {
+    for (let i = 0; i < lines.length; i++) {
+      if (/^\s*\*{2}\d+[\.\)]\s+[A-Z]{1,5}\s/.test(lines[i])) {
+        tradeStartIndices.push(i);
       }
     }
   }
@@ -551,9 +591,9 @@ function parseAITradeIdeas(text: string): AITradeIdea[] {
     const block = blockLines.join('\n');
 
     // Extract title from first line
-    const titleLine = blockLines[0].replace(/\*\*/g, '').trim();
+    const titleLine = blockLines[0].replace(/\*\*/g, '').replace(/^#{1,4}\s*/, '').trim();
     const titleMatch = titleLine.match(/(?:TRADE\s+\d+\s*[:\-–—]\s*)(.*)/i)
-      || titleLine.match(/^\d+\.\s+(.*)/);
+      || titleLine.match(/^\d+[\.\)]\s+(.*)/);
     const title = titleMatch ? titleMatch[1].trim() : titleLine;
 
     // Field extractor: handles multiple formats
@@ -583,6 +623,11 @@ function parseAITradeIdeas(text: string): AITradeIdea[] {
       const titleTicker = title.match(/\b([A-Z]{1,5})\b/);
       if (titleTicker) ticker = titleTicker[1];
     }
+    // Also try extracting from the block content if title didn't have it
+    if (!ticker || !/^[A-Z]{1,5}$/.test(ticker)) {
+      const blockTicker = block.match(/\b(SPY|QQQ|IWM|AAPL|MSFT|GOOGL|AMZN|NVDA|TSLA|META|XLF|XLE|XLK|XLV|XLI|XLY|XLP|XLU|XLRE|XLB|XLC|DIA|GLD|TLT)\b/);
+      if (blockTicker) ticker = blockTicker[1];
+    }
     if (!ticker || !/^[A-Z]{1,5}$/.test(ticker)) continue;
 
     ideas.push({
@@ -590,13 +635,13 @@ function parseAITradeIdeas(text: string): AITradeIdea[] {
       ticker,
       direction: field('Direction'),
       strategy: field('Strategy'),
-      strikes: field('Strike'),
-      expiration: field('Expiration'),
+      strikes: field('Strike') || field('Strikes'),
+      expiration: field('Expiration') || field('Exp'),
       entry: field('Entry'),
-      target: field('Target'),
-      stopMaxLoss: field('Stop') || field('Max Loss'),
-      thesis: field('Thesis') || field('Thesi'),
-      invalidation: field('Invalidation'),
+      target: field('Target') || field('Profit'),
+      stopMaxLoss: field('Stop') || field('Max Loss') || field('Risk'),
+      thesis: field('Thesis') || field('Thesi') || field('Rationale'),
+      invalidation: field('Invalidation') || field('Invalid'),
     });
   }
 

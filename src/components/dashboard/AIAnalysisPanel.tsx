@@ -2,28 +2,63 @@
 
 import { useState, useCallback, useEffect } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
-import { Sparkles, AlertTriangle, Loader2, RefreshCw, Brain, FileText } from 'lucide-react';
+import { Sparkles, AlertTriangle, Loader2, RefreshCw, Brain, FileText, Eye, CheckCircle2, Target, ChevronRight } from 'lucide-react';
+import { buildTrackedTradeFromAlgo, addTrackedTrade } from '@/lib/tradeTracker';
+
+interface AITradeIdea {
+  strategy: string;
+  direction: string;
+  confidence: string;
+  strikes: string;
+  expiration: string;
+  entry: string;
+  profitTargetPct: number;
+  stopLossPct: number;
+  risk: string;
+  reasoning: string[];
+  tags: string[];
+}
 
 export default function AIAnalysisPanel() {
   const {
-    symbol, quote, multiGEX, snapshot, recommendations, correlations,
+    symbol, quote, multiGEX, snapshot, recommendations, correlations, expirations,
+    aiAnalysisCache, setAiAnalysisCache,
   } = useDashboardStore();
 
-  const [analysis, setAnalysis] = useState<string | null>(null);
-  const [analysisMode, setAnalysisMode] = useState<'trade' | 'fundamental'>('trade');
+  // Restore from store cache (survives tab switches; cleared on symbol change by loadSymbol)
+  const [analysis, setAnalysisLocal] = useState<string | null>(aiAnalysisCache?.analysis ?? null);
+  const [tradeIdeas, setTradeIdeasLocal] = useState<AITradeIdea[]>(aiAnalysisCache?.tradeIdeas ?? []);
+  const [trackedIds, setTrackedIds] = useState<Set<number>>(new Set());
+  const [analysisMode, setAnalysisModeLocal] = useState<'trade' | 'fundamental'>(aiAnalysisCache?.mode ?? 'trade');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [model, setModel] = useState<string>('');
-  const [tokens, setTokens] = useState<{ input: number; output: number } | null>(null);
+  const [model, setModelLocal] = useState<string>(aiAnalysisCache?.model ?? '');
+  const [tokens, setTokensLocal] = useState<{ input: number; output: number } | null>(aiAnalysisCache?.tokens ?? null);
 
-  // Reset when ticker changes
+  // Wrap setters to sync to store
+  const setAnalysis = useCallback((val: string | null) => {
+    setAnalysisLocal(val);
+    if (val === null) {
+      setAiAnalysisCache(null);
+    }
+  }, [setAiAnalysisCache]);
+  const setTradeIdeas = useCallback((val: AITradeIdea[]) => setTradeIdeasLocal(val), []);
+  const setModel = useCallback((val: string) => setModelLocal(val), []);
+  const setTokens = useCallback((val: { input: number; output: number } | null) => setTokensLocal(val), []);
+  const setAnalysisMode = useCallback((val: 'trade' | 'fundamental') => setAnalysisModeLocal(val), []);
+
+  // Sync cache when store clears it (symbol change)
   useEffect(() => {
-    setAnalysis(null);
-    setAnalysisMode('trade');
-    setError(null);
-    setModel('');
-    setTokens(null);
-  }, [symbol]);
+    if (!aiAnalysisCache) {
+      setAnalysisLocal(null);
+      setTradeIdeasLocal([]);
+      setTrackedIds(new Set());
+      setAnalysisModeLocal('trade');
+      setError(null);
+      setModelLocal('');
+      setTokensLocal(null);
+    }
+  }, [aiAnalysisCache]);
 
   const runAnalysis = useCallback(async (mode: 'trade' | 'fundamental' = 'trade') => {
     if (!quote || !multiGEX) {
@@ -207,15 +242,27 @@ export default function AIAnalysisPanel() {
       }
 
       const result = await res.json();
+      const ideas = result.tradeIdeas || [];
+      const resultModel = result.model || '';
+      const resultTokens = result.usage ? { input: result.usage.input_tokens, output: result.usage.output_tokens } : null;
       setAnalysis(result.analysis);
-      setModel(result.model || '');
-      setTokens(result.usage ? { input: result.usage.input_tokens, output: result.usage.output_tokens } : null);
+      setTradeIdeas(ideas);
+      setTrackedIds(new Set());
+      setModel(resultModel);
+      setTokens(resultTokens);
+      setAiAnalysisCache({
+        analysis: result.analysis,
+        tradeIdeas: ideas,
+        mode: analysisMode,
+        model: resultModel,
+        tokens: resultTokens,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Analysis failed');
     } finally {
       setLoading(false);
     }
-  }, [symbol, quote, multiGEX, snapshot, recommendations, correlations]);
+  }, [symbol, quote, multiGEX, snapshot, recommendations, correlations, analysisMode, setAnalysis, setTradeIdeas, setModel, setTokens, setAiAnalysisCache]);
 
   // Don't show if no data
   if (!quote) return null;
@@ -372,9 +419,12 @@ export default function AIAnalysisPanel() {
               <button
                 onClick={() => {
                   setAnalysis(null);
+                  setTradeIdeas([]);
+                  setTrackedIds(new Set());
                   setError(null);
                   setModel('');
                   setTokens(null);
+                  setAiAnalysisCache(null);
                 }}
                 className="text-xs font-mono text-text-muted hover:text-text-secondary transition-colors"
               >
@@ -387,8 +437,147 @@ export default function AIAnalysisPanel() {
           <div className="px-5 py-4 ai-analysis-content">
             <AnalysisRenderer text={analysis} />
           </div>
+
+          {/* AI Trade Ideas — trackable cards */}
+          {tradeIdeas.length > 0 && analysisMode === 'trade' && (
+            <div className="px-5 py-4 border-t border-border/30">
+              <div className="flex items-center gap-2 mb-3">
+                <Target className="w-4 h-4 text-purple-400" />
+                <span className="text-xs font-mono font-semibold uppercase tracking-wider text-purple-300">
+                  AI Trade Recommendations — Track & Monitor
+                </span>
+              </div>
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                {tradeIdeas.map((idea, idx) => (
+                  <AITradeCard
+                    key={idx}
+                    idea={idea}
+                    tracked={trackedIds.has(idx)}
+                    onTrack={() => {
+                      const nearestExp = expirations[0]?.date || new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+                      const dirLow = idea.direction.toLowerCase();
+                      const tracked = buildTrackedTradeFromAlgo({
+                        symbol,
+                        spotPrice: quote!.last,
+                        trade: {
+                          strategy: idea.strategy,
+                          direction: dirLow.includes('bull') ? 'bullish' : dirLow.includes('bear') ? 'bearish' : 'neutral',
+                          confidence: idea.confidence,
+                          score: idea.confidence === 'high' ? 85 : idea.confidence === 'medium' ? 65 : 45,
+                          expiration: idea.expiration,
+                          strikes: idea.strikes,
+                          entry: idea.entry,
+                          risk: idea.risk,
+                          reasoning: idea.reasoning,
+                          tags: idea.tags,
+                          profitTargetPct: idea.profitTargetPct,
+                          stopLossPct: idea.stopLossPct,
+                        },
+                        marketSnapshot: {
+                          ivRank: snapshot?.iv?.ivRank ?? 0,
+                          currentIV: snapshot?.iv?.currentIV ?? 0,
+                          hvCurrent: snapshot?.iv?.hvCurrent ?? 0,
+                          totalGEX: multiGEX?.aggregated?.totalGEX ?? 0,
+                          gammaFlip: multiGEX?.aggregated?.gammaFlip ?? null,
+                          callWall: multiGEX?.aggregated?.callWall ?? null,
+                          putWall: multiGEX?.aggregated?.putWall ?? null,
+                          biasScore: recommendations?.biasScore ?? 0,
+                          overallBias: recommendations?.overallBias ?? 'neutral',
+                          volRegime: recommendations?.volRegime ?? 'mid',
+                          gammaRegime: recommendations?.gammaRegime ?? 'neutral',
+                        },
+                        source: 'ai-analysis',
+                        nearestExp,
+                      });
+                      addTrackedTrade(tracked);
+                      setTrackedIds(prev => new Set(prev).add(idx));
+                    }}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
+    </div>
+  );
+}
+
+/** Compact trade card for AI-generated trade ideas with Track button */
+function AITradeCard({ idea, tracked, onTrack }: { idea: AITradeIdea; tracked: boolean; onTrack: () => void }) {
+  const dirColor = idea.direction.toLowerCase().includes('bull') ? 'text-accent-green'
+    : idea.direction.toLowerCase().includes('bear') ? 'text-accent-red' : 'text-accent-cyan';
+  const dirBg = idea.direction.toLowerCase().includes('bull') ? 'border-accent-green/30'
+    : idea.direction.toLowerCase().includes('bear') ? 'border-accent-red/30' : 'border-accent-cyan/30';
+  const confColor = idea.confidence === 'high' ? 'text-accent-green'
+    : idea.confidence === 'medium' ? 'text-accent-amber' : 'text-text-muted';
+
+  return (
+    <div className={`panel border ${dirBg}`}>
+      <div className="px-4 py-3 border-b border-border/30 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <Target className={`w-4 h-4 ${dirColor}`} />
+          <div>
+            <h3 className="text-sm font-semibold text-text-primary">{idea.strategy}</h3>
+            <div className="flex items-center gap-2 mt-0.5">
+              <span className={`text-[10px] font-mono uppercase ${dirColor}`}>{idea.direction}</span>
+              <span className="text-text-muted text-[10px]">•</span>
+              <span className={`text-[10px] font-mono ${confColor}`}>{idea.confidence} confidence</span>
+              <span className="text-[10px] font-mono text-purple-400/60 bg-purple-500/10 px-1.5 rounded">AI</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className="px-4 py-3 space-y-2 text-sm">
+        <div>
+          <span className="text-xs font-mono text-text-muted uppercase tracking-wider">Strikes</span>
+          <p className="text-text-secondary mt-0.5">{idea.strikes}</p>
+        </div>
+        <div>
+          <span className="text-xs font-mono text-text-muted uppercase tracking-wider">Expiration</span>
+          <p className="text-text-secondary mt-0.5">{idea.expiration}</p>
+        </div>
+        <div>
+          <span className="text-xs font-mono text-text-muted uppercase tracking-wider">Entry</span>
+          <p className="text-text-secondary mt-0.5">{idea.entry}</p>
+        </div>
+        <div>
+          <span className="text-xs font-mono text-text-muted uppercase tracking-wider">Risk</span>
+          <p className="text-text-secondary mt-0.5">{idea.risk}</p>
+        </div>
+        {idea.reasoning.length > 0 && (
+          <div>
+            <span className="text-xs font-mono text-text-muted uppercase tracking-wider">Reasoning</span>
+            <ul className="mt-1 space-y-1">
+              {idea.reasoning.slice(0, 3).map((r, i) => (
+                <li key={i} className="flex items-start gap-2 text-text-secondary text-xs">
+                  <ChevronRight className="w-3 h-3 mt-0.5 text-text-muted shrink-0" />
+                  <span>{r}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        <div className="flex items-center justify-between pt-1">
+          <div className="flex flex-wrap gap-1.5">
+            {idea.tags.slice(0, 4).map(tag => (
+              <span key={tag} className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-bg-tertiary text-text-muted">{tag}</span>
+            ))}
+          </div>
+          {tracked ? (
+            <span className="text-xs font-mono text-accent-green flex items-center gap-1 shrink-0">
+              <CheckCircle2 className="w-3.5 h-3.5" /> Tracked
+            </span>
+          ) : (
+            <button
+              onClick={onTrack}
+              className="px-3 py-1.5 rounded-md text-xs font-mono bg-purple-500/15 text-purple-300 border border-purple-500/25 hover:bg-purple-500/25 transition-all flex items-center gap-1.5 shrink-0"
+            >
+              <Eye className="w-3.5 h-3.5" /> Track
+            </button>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

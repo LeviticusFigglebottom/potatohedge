@@ -34,9 +34,12 @@ export async function GET() {
       const costPerContract = p.quantity !== 0 ? p.cost_basis / (Math.abs(p.quantity) * 100) : 0;
       const currentPrice = quote?.last ?? 0;
       const currentValue = currentPrice * Math.abs(p.quantity) * 100;
+      // For long positions: P/L = current_value - cost_basis
+      // For short positions: Tradier's cost_basis is negative (credit received),
+      // so P/L = |cost_basis| - current_value (credit received minus cost to close)
       const unrealizedPL = p.quantity > 0
         ? currentValue - p.cost_basis
-        : p.cost_basis - currentValue; // short positions invert
+        : Math.abs(p.cost_basis) - currentValue;
       const unrealizedPLPct = p.cost_basis !== 0 ? (unrealizedPL / Math.abs(p.cost_basis)) * 100 : 0;
 
       return {
