@@ -704,16 +704,17 @@ export function buildTrackedTradeFromAlgo(params: {
     }
   }
 
-  // Calculate max risk (entry prices are 0 until TrackerMonitor fills them)
+  // Calculate max risk
   const maxRisk = calculateMaxRisk(parsedLegs, trade.strategy, spotPrice);
 
-  // Entry value is null until TrackerMonitor fetches real option prices
-  // This prevents phantom P/L from estimated prices
+  // If legs already have real entry prices, start as 'entered' immediately.
+  // Otherwise start as 'pending' — TrackerMonitor will fill prices on first cycle.
   const hasRealPrices = parsedLegs.some(l => l.entryMid > 0);
   const entryValue = hasRealPrices ? calculatePositionValue(parsedLegs, 'entry') : null;
+  const now = Date.now();
 
   return {
-    id: `track-${source}-${symbol}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    id: `track-${source}-${symbol}-${now}-${Math.random().toString(36).slice(2, 7)}`,
     source,
     symbol,
     spotAtEntry: spotPrice,
@@ -730,21 +731,63 @@ export function buildTrackedTradeFromAlgo(params: {
     reasoning: trade.reasoning,
     tags: trade.tags,
     marketSnapshot,
-    trackedAt: Date.now(),
-    enteredAt: null,            // Stays pending until TrackerMonitor prices the legs
+    trackedAt: now,
+    enteredAt: hasRealPrices ? now : null,
     exitedAt: null,
     expirationDate,
-    status: 'pending',          // Will transition to 'entered' once real prices are fetched
+    status: hasRealPrices ? 'entered' : 'pending',
     outcome: null,
     entryDebit: entryValue,
     exitValue: null,
     realizedPL: null,
     realizedPLPct: null,
     maxRisk,
-    priceHistory: [],           // Empty until TrackerMonitor starts tracking
+    priceHistory: hasRealPrices
+      ? [{ timestamp: now, spotPrice, positionValue: entryValue! }]
+      : [],
     exitReason: null,
     notes: '',
   };
+}
+
+/**
+ * Fetch live option prices for a set of OCC symbols.
+ * Used at trade creation time to get entry prices immediately.
+ */
+export async function fetchEntryPrices(
+  occSymbols: string[],
+  underlying: string
+): Promise<{ quotes: Record<string, { bid: number; ask: number; mid: number; last: number }>; spot: number | null }> {
+  if (typeof window === 'undefined' || occSymbols.length === 0) {
+    return { quotes: {}, spot: null };
+  }
+  try {
+    const res = await fetch(
+      `/api/tracker/prices?symbols=${encodeURIComponent(occSymbols.join(','))}&underlying=${encodeURIComponent(underlying)}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!res.ok) return { quotes: {}, spot: null };
+    return await res.json();
+  } catch {
+    return { quotes: {}, spot: null };
+  }
+}
+
+/**
+ * Fill entry prices on TrackedLeg array from fetched quotes.
+ * Returns updated legs with entryBid/entryAsk/entryMid populated.
+ */
+export function fillEntryPrices(
+  legs: TrackedLeg[],
+  quotes: Record<string, { bid: number; ask: number; mid: number; last?: number }>
+): TrackedLeg[] {
+  return legs.map(leg => {
+    const q = quotes[leg.optionSymbol];
+    if (!q) return leg;
+    const bestMid = q.mid > 0 ? q.mid : (q.last ?? 0);
+    if (bestMid <= 0) return leg;
+    return { ...leg, entryBid: q.bid, entryAsk: q.ask, entryMid: bestMid };
+  });
 }
 
 /**

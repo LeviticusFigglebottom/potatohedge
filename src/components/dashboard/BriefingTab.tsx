@@ -6,7 +6,7 @@ import {
   Newspaper, Loader2, AlertTriangle, TrendingUp, TrendingDown, Minus,
   Wallet, ChevronDown, ChevronUp, CheckCircle2, Sparkles, Eye,
 } from 'lucide-react';
-import { buildTrackedTradeFromAlgo, addTrackedTrade, sizePosition, type TrackedLeg } from '@/lib/tradeTracker';
+import { buildTrackedTradeFromAlgo, addTrackedTrade, sizePosition, fetchEntryPrices, fillEntryPrices, calculatePositionValue, type TrackedLeg } from '@/lib/tradeTracker';
 
 // ─── Trade rule storage (shared with PaperTradingTab + PaperMonitor) ───
 interface TradeRule {
@@ -193,7 +193,8 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
   const [paperStatus, setPaperStatus] = useState<Record<number, string>>({});
   const [trackedIdeas, setTrackedIdeas] = useState<Set<number>>(new Set());
 
-  const handleTrack = (idea: TradeIdea, idx: number) => {
+  const handleTrack = async (idea: TradeIdea, idx: number) => {
+    // Build the trade first (with pending legs)
     const tracked = buildTrackedTradeFromAlgo({
       symbol: idea.ticker,
       spotPrice: idea.spot,
@@ -227,6 +228,21 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
       source: 'ai-briefing',
       nearestExp: idea.nearestExp,
     });
+    // Fetch live prices and fill entry immediately so trade starts as 'entered'
+    if (tracked.status === 'pending') {
+      const occSymbols = tracked.legs.map(l => l.optionSymbol).filter(Boolean);
+      const { quotes } = await fetchEntryPrices(occSymbols, idea.ticker);
+      if (Object.keys(quotes).length > 0) {
+        tracked.legs = fillEntryPrices(tracked.legs, quotes);
+        const hasRealPrices = tracked.legs.some(l => l.entryMid > 0);
+        if (hasRealPrices) {
+          tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
+          tracked.status = 'entered';
+          tracked.enteredAt = Date.now();
+          tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
+        }
+      }
+    }
     addTrackedTrade(tracked);
     setTrackedIdeas(prev => new Set(prev).add(idx));
   };
@@ -616,10 +632,9 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
   const [paperStatus, setPaperStatus] = useState<Record<number, string>>({});
   const [trackedIdeas, setTrackedIdeas] = useState<Set<number>>(new Set());
 
-  const handleTrack = (idea: AITradeIdea, idx: number) => {
+  const handleTrack = async (idea: AITradeIdea, idx: number) => {
     const dirLow = idea.direction.toLowerCase();
     const direction = dirLow.includes('bull') ? 'bullish' : dirLow.includes('bear') ? 'bearish' : 'neutral';
-    // Parse profit target / stop loss from AI idea text (e.g. "50% of credit" or "$150")
     const targetMatch = idea.target?.match(/(\d+)\s*%/);
     const stopMatch = idea.stopMaxLoss?.match(/(\d+)\s*%/);
     const tracked = buildTrackedTradeFromAlgo({
@@ -655,6 +670,21 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
       source: 'ai-analysis',
       nearestExp: idea.nearestExp,
     });
+    // Fetch live prices and fill entry immediately
+    if (tracked.status === 'pending') {
+      const occSymbols = tracked.legs.map(l => l.optionSymbol).filter(Boolean);
+      const { quotes } = await fetchEntryPrices(occSymbols, idea.ticker);
+      if (Object.keys(quotes).length > 0) {
+        tracked.legs = fillEntryPrices(tracked.legs, quotes);
+        const hasRealPrices = tracked.legs.some(l => l.entryMid > 0);
+        if (hasRealPrices) {
+          tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
+          tracked.status = 'entered';
+          tracked.enteredAt = Date.now();
+          tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
+        }
+      }
+    }
     addTrackedTrade(tracked);
     setTrackedIdeas(prev => new Set(prev).add(idx));
   };

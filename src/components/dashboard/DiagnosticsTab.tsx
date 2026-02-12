@@ -377,6 +377,7 @@ export default function DiagnosticsTab() {
   const [evaluating, setEvaluating] = useState(false);
   const [evalResults, setEvalResults] = useState<{ results: EvalResult[]; errors?: { tradeId: string; error: string }[] } | null>(null);
   const [closingTradeId, setClosingTradeId] = useState<string | null>(null);
+  const [confirmNuclear, setConfirmNuclear] = useState(false);
   const autoRefreshRef = useRef(autoRefresh);
   autoRefreshRef.current = autoRefresh;
 
@@ -435,6 +436,17 @@ export default function DiagnosticsTab() {
 
   const handlePurgeClosed = async () => {
     await diagPost('purge-closed').catch(() => {});
+    fetchAll();
+  };
+
+  const handlePurgeAll = async () => {
+    await diagPost('purge-all').catch(() => {});
+    // Also clear localStorage to prevent stale data from re-syncing
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('optix_tracked_trades');
+      localStorage.removeItem('optix_tracked_trades:lastSave');
+      localStorage.removeItem('optix_tracked_trades:deletedIds');
+    }
     fetchAll();
   };
 
@@ -576,6 +588,22 @@ export default function DiagnosticsTab() {
                   {evaluating ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
                   Force Evaluate All ({openTrades.length} open)
                 </button>
+              )}
+              {health.trades.total > 0 && (
+                confirmNuclear ? (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[10px] text-red-400 font-mono">Purge ALL {health.trades.total} trades?</span>
+                    <button onClick={() => { handlePurgeAll(); setConfirmNuclear(false); }} className="px-2 py-0.5 rounded text-[10px] font-mono bg-red-500/15 text-red-400 hover:bg-red-500/25 transition-colors">Yes, nuke it</button>
+                    <button onClick={() => setConfirmNuclear(false)} className="px-2 py-0.5 rounded text-[10px] font-mono text-text-muted hover:text-text-secondary transition-colors">No</button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setConfirmNuclear(true)}
+                    className="px-3 py-1 rounded text-[10px] font-mono text-red-500/60 hover:bg-red-500/10 hover:text-red-400 transition-colors"
+                  >
+                    Nuclear: Purge ALL
+                  </button>
+                )
               )}
             </div>
           </div>

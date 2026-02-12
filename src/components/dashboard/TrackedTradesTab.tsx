@@ -487,11 +487,20 @@ export default function TrackedTradesTab() {
     setAnalytics(computeAnalytics(updated));
   }, []);
 
-  const handleRemoveAll = useCallback(() => {
+  const handleRemoveAll = useCallback(async () => {
     const remaining = purgeAllTrades();
     setTrades(remaining);
     setAnalytics(computeAnalytics(remaining));
     setConfirmRemoveAll(false);
+    // Also purge server-side to prevent resurrection on next sync
+    try {
+      await fetch('/api/diagnostics', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'purge-all' }),
+        signal: AbortSignal.timeout(5000),
+      });
+    } catch { /* best effort */ }
   }, []);
 
   const handlePurgeClosed = useCallback(() => {

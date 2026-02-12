@@ -108,6 +108,9 @@ export async function POST(request: NextRequest) {
       case 'purge-closed':
         return NextResponse.json(await purgeClosedFromServer());
 
+      case 'purge-all':
+        return NextResponse.json(await purgeAllFromServer());
+
       case 'fix-trade': {
         const { id, fixes } = body;
         if (!id) return NextResponse.json({ error: 'id required' }, { status: 400 });
@@ -143,7 +146,8 @@ async function getHealth() {
   const trades = await loadTrackedTradesFromServer();
 
   const openTrades = trades.filter(t => t.status === 'pending' || t.status === 'entered');
-  const unpricedTrades = openTrades.filter(t => !t.entryDebit || t.entryDebit === 0);
+  // entryDebit=0 is valid for credit spreads; only null means truly unpriced
+  const unpricedTrades = openTrades.filter(t => t.entryDebit === null || t.entryDebit === undefined);
   const expiredNotClosed = trades.filter(t => {
     if (t.status === 'exited' || t.status === 'expired') return false;
     const expDate = new Date(t.expirationDate + 'T16:00:00-05:00').getTime();
@@ -208,9 +212,9 @@ async function getTradesReport() {
       if (leg.side !== 'long' && leg.side !== 'short') issues.push(`Leg ${leg.optionSymbol || 'unknown'} has invalid side: ${leg.side}`);
     }
 
-    // Check pricing
-    if (t.status === 'entered' && (!t.entryDebit || t.entryDebit === 0)) {
-      issues.push('Entered but entryDebit is 0/null');
+    // Check pricing — entryDebit=0 is valid for credit spreads
+    if (t.status === 'entered' && t.entryDebit === null) {
+      issues.push('Entered but entryDebit is null (never priced)');
     }
 
     // Check for phantom P/L
@@ -349,7 +353,7 @@ function generateRecommendations(
   }
 
   // Data quality
-  const unpriced = trades.filter(t => (t.status === 'pending' || t.status === 'entered') && (!t.entryDebit || t.entryDebit === 0));
+  const unpriced = trades.filter(t => (t.status === 'pending' || t.status === 'entered') && t.entryDebit === null);
   if (unpriced.length > 0) {
     recs.push(`${unpriced.length} open trades still awaiting entry pricing — TrackerMonitor may not be running during market hours`);
   }
@@ -588,6 +592,17 @@ async function purgeClosedFromServer() {
 
   await saveTrackedTradesToServer(open);
   return { ok: true, purged: removed, remaining: open.length, message: `Removed ${removed} closed/expired trades from server` };
+}
+
+// ─── Purge ALL Trades from Server (nuclear reset) ────────
+
+async function purgeAllFromServer() {
+  const trades = await loadTrackedTradesFromServer();
+  const count = trades.length;
+  if (count === 0) return { ok: true, message: 'No trades to purge', purged: 0 };
+
+  await saveTrackedTradesToServer([]);
+  return { ok: true, purged: count, remaining: 0, message: `Nuclear purge: removed all ${count} tracked trades from server` };
 }
 
 // ─── Helpers ──────────────────────────────────────────────
