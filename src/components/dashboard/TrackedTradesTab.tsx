@@ -4,10 +4,11 @@ import { useState, useEffect, useCallback } from 'react';
 import {
   BarChart3, TrendingUp, TrendingDown, Minus, Target, Clock, CheckCircle2,
   XCircle, AlertTriangle, Trash2, X as XIcon, ChevronDown, ChevronUp,
-  Activity, Award, Percent, DollarSign, Timer, Crosshair, Eye,
+  Activity, Award, Percent, DollarSign, Timer, Crosshair, Eye, Eraser,
 } from 'lucide-react';
 import {
   loadTrackedTrades, loadTrackedTradesWithSync, removeTrackedTrade,
+  purgeClosedTrades, purgeAllTrades,
   computeAnalytics, type TrackedTrade, type TradeAnalytics, type TradeStatus,
 } from '@/lib/tradeTracker';
 
@@ -452,6 +453,7 @@ export default function TrackedTradesTab() {
   const [sortField, setSortField] = useState<SortField>('date');
   const [showAnalytics, setShowAnalytics] = useState(true);
   const [confirmRemoveAll, setConfirmRemoveAll] = useState(false);
+  const [confirmPurgeClosed, setConfirmPurgeClosed] = useState(false);
 
   // Load trades on mount — use localStorage first (instant, always fresh),
   // then sync with server in background to pick up diagnostics changes.
@@ -484,11 +486,17 @@ export default function TrackedTradesTab() {
   }, []);
 
   const handleRemoveAll = useCallback(() => {
-    if (typeof window === 'undefined') return;
-    localStorage.removeItem('optix_tracked_trades');
-    setTrades([]);
-    setAnalytics(computeAnalytics([]));
+    const remaining = purgeAllTrades();
+    setTrades(remaining);
+    setAnalytics(computeAnalytics(remaining));
     setConfirmRemoveAll(false);
+  }, []);
+
+  const handlePurgeClosed = useCallback(() => {
+    const remaining = purgeClosedTrades();
+    setTrades(remaining);
+    setAnalytics(computeAnalytics(remaining));
+    setConfirmPurgeClosed(false);
   }, []);
 
   // Apply filters and sorting
@@ -569,9 +577,26 @@ export default function TrackedTradesTab() {
             >
               <BarChart3 className="w-3.5 h-3.5 inline mr-1" />Analytics
             </button>
+            {/* Purge closed/expired trades */}
+            {confirmPurgeClosed ? (
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] text-amber-400 font-mono">Remove closed?</span>
+                <button onClick={handlePurgeClosed} className="px-2 py-0.5 rounded text-[10px] font-mono bg-amber-500/15 text-amber-400 hover:bg-amber-500/25 transition-colors">Yes</button>
+                <button onClick={() => setConfirmPurgeClosed(false)} className="px-2 py-0.5 rounded text-[10px] font-mono text-text-muted hover:text-text-secondary transition-colors">No</button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmPurgeClosed(true)}
+                className="px-2 py-1 rounded text-xs font-mono text-text-muted hover:text-amber-400 transition-colors flex items-center gap-1"
+                title="Remove all closed/expired trades (keeps open)"
+              >
+                <Eraser className="w-3.5 h-3.5" />Purge Closed
+              </button>
+            )}
+            {/* Clear all trades */}
             {confirmRemoveAll ? (
               <div className="flex items-center gap-1.5">
-                <span className="text-[10px] text-red-400 font-mono">Clear all?</span>
+                <span className="text-[10px] text-red-400 font-mono">Clear ALL?</span>
                 <button onClick={handleRemoveAll} className="px-2 py-0.5 rounded text-[10px] font-mono bg-red-500/15 text-red-400 hover:bg-red-500/25 transition-colors">Yes</button>
                 <button onClick={() => setConfirmRemoveAll(false)} className="px-2 py-0.5 rounded text-[10px] font-mono text-text-muted hover:text-text-secondary transition-colors">No</button>
               </div>
@@ -579,6 +604,7 @@ export default function TrackedTradesTab() {
               <button
                 onClick={() => setConfirmRemoveAll(true)}
                 className="text-xs font-mono text-text-muted/60 hover:text-red-400 transition-colors"
+                title="Clear all tracked trades"
               >
                 <Trash2 className="w-3.5 h-3.5" />
               </button>

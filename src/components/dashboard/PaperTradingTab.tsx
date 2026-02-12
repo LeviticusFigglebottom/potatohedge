@@ -4,7 +4,7 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import {
   Wallet, RefreshCw, TrendingUp, TrendingDown, X, Clock,
   CheckCircle2, AlertTriangle, DollarSign, Plus, Target, ShieldAlert,
-  Activity,
+  Activity, Trash2, ChevronDown, ChevronUp, Eraser,
 } from 'lucide-react';
 
 interface ParsedOCC {
@@ -399,6 +399,10 @@ export default function PaperTradingTab() {
   const [tradeStatus, setTradeStatus] = useState<string | null>(null);
   const [notConfigured, setNotConfigured] = useState(false);
   const [editingRule, setEditingRule] = useState<string | null>(null); // OCC symbol being edited
+  const [showHistory, setShowHistory] = useState(false);
+  const [showFills, setShowFills] = useState(false);
+  const [cancellingAll, setCancellingAll] = useState(false);
+  const [confirmPurgeRules, setConfirmPurgeRules] = useState(false);
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const refresh = useCallback(async () => {
@@ -497,6 +501,24 @@ export default function PaperTradingTab() {
     }
   };
 
+  const handleCancelAllOrders = async () => {
+    setCancellingAll(true);
+    try {
+      for (const o of orders.filter(o => o.status === 'pending' || o.status === 'open' || o.status === 'partially_filled')) {
+        try { await fetch(`/api/paper/orders?id=${o.id}`, { method: 'DELETE' }); } catch {}
+      }
+      setTimeout(refresh, 500);
+    } finally {
+      setCancellingAll(false);
+    }
+  };
+
+  const handlePurgeRules = () => {
+    localStorage.removeItem('optix-paper-rules');
+    setConfirmPurgeRules(false);
+    refresh();
+  };
+
   if (notConfigured) {
     return (
       <div className="space-y-4 animate-fade-in">
@@ -544,6 +566,22 @@ export default function PaperTradingTab() {
             )}
           </div>
           <div className="flex items-center gap-2">
+            {/* Purge trade rules */}
+            {confirmPurgeRules ? (
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] text-amber-400 font-mono">Clear rules?</span>
+                <button onClick={handlePurgeRules} className="px-2 py-0.5 rounded text-[10px] font-mono bg-amber-500/15 text-amber-400 hover:bg-amber-500/25 transition-colors">Yes</button>
+                <button onClick={() => setConfirmPurgeRules(false)} className="px-2 py-0.5 rounded text-[10px] font-mono text-text-muted hover:text-text-secondary transition-colors">No</button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmPurgeRules(true)}
+                className="px-2 py-1 rounded text-xs font-mono text-text-muted hover:text-amber-400 transition-colors flex items-center gap-1"
+                title="Purge all trade rules"
+              >
+                <Eraser className="w-3.5 h-3.5" />Rules
+              </button>
+            )}
             <button onClick={() => setShowForm(!showForm)} className="px-3 py-1.5 rounded-md text-xs font-medium bg-accent-cyan/20 text-accent-cyan border border-accent-cyan/30 hover:bg-accent-cyan/30 transition-all flex items-center gap-1.5">
               <Plus className="w-3.5 h-3.5" />
               New Trade
@@ -700,6 +738,14 @@ export default function PaperTradingTab() {
               <Clock className="w-4 h-4 text-yellow-400" />
               Open Orders ({openOrders.length})
             </span>
+            <button
+              onClick={handleCancelAllOrders}
+              disabled={cancellingAll}
+              className="px-2 py-1 rounded text-xs font-mono text-red-400/60 hover:text-red-400 hover:bg-red-500/10 transition-colors flex items-center gap-1"
+            >
+              <Trash2 className="w-3 h-3" />
+              {cancellingAll ? 'Cancelling...' : 'Cancel All'}
+            </button>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -755,89 +801,95 @@ export default function PaperTradingTab() {
         </div>
       )}
 
-      {/* Recent Fills */}
+      {/* Recent Fills (collapsible) */}
       {recentFills.length > 0 && (
         <div className="panel">
-          <div className="panel-header">
+          <div className="panel-header cursor-pointer" onClick={() => setShowFills(!showFills)}>
             <span className="panel-title flex items-center gap-2">
               <CheckCircle2 className="w-4 h-4 text-green-400" />
-              Recent Fills
+              Recent Fills ({recentFills.length})
             </span>
+            {showFills ? <ChevronUp className="w-4 h-4 text-text-muted" /> : <ChevronDown className="w-4 h-4 text-text-muted" />}
           </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-border/30">
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Contract</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Side</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Qty</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Fill Price</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Date</th>
-                </tr>
-              </thead>
-              <tbody>
-                {recentFills.map(o => (
-                  <tr key={o.id} className="border-b border-border/10 hover:bg-bg-hover/50">
-                    <td className="px-3 py-2 font-mono text-text-primary">{fmtOCC(o.parsed || null, o.option_symbol || o.symbol)}</td>
-                    <td className="px-3 py-2 font-mono text-text-secondary text-xs">{o.side?.replace(/_/g, ' ')}</td>
-                    <td className="px-3 py-2 font-mono text-text-secondary">{o.exec_quantity || o.quantity}</td>
-                    <td className="px-3 py-2 font-mono text-text-secondary">{o.avg_fill_price ? fmtMoney(o.avg_fill_price) : '—'}</td>
-                    <td className="px-3 py-2 font-mono text-text-muted text-xs">{o.create_date?.split('T')[0]}</td>
+          {showFills && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-border/30">
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Contract</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Side</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Qty</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Fill Price</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Date</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {recentFills.map(o => (
+                    <tr key={o.id} className="border-b border-border/10 hover:bg-bg-hover/50">
+                      <td className="px-3 py-2 font-mono text-text-primary">{fmtOCC(o.parsed || null, o.option_symbol || o.symbol)}</td>
+                      <td className="px-3 py-2 font-mono text-text-secondary text-xs">{o.side?.replace(/_/g, ' ')}</td>
+                      <td className="px-3 py-2 font-mono text-text-secondary">{o.exec_quantity || o.quantity}</td>
+                      <td className="px-3 py-2 font-mono text-text-secondary">{o.avg_fill_price ? fmtMoney(o.avg_fill_price) : '—'}</td>
+                      <td className="px-3 py-2 font-mono text-text-muted text-xs">{o.create_date?.split('T')[0]}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
 
-      {/* Trade History (Closed Positions) */}
+      {/* Trade History (Closed Positions - collapsible) */}
       {history.length > 0 && (
         <div className="panel">
-          <div className="panel-header">
+          <div className="panel-header cursor-pointer" onClick={() => setShowHistory(!showHistory)}>
             <span className="panel-title flex items-center gap-2">
               {history.reduce((s, h) => s + h.gain_loss, 0) >= 0
                 ? <TrendingUp className="w-4 h-4 text-green-400" />
                 : <TrendingDown className="w-4 h-4 text-red-400" />
               }
               Closed Trades ({history.length})
+              <span className={`text-sm font-mono font-semibold ${history.reduce((s, h) => s + h.gain_loss, 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                {fmtMoney(history.reduce((s, h) => s + h.gain_loss, 0))}
+              </span>
             </span>
-            <span className={`text-sm font-mono font-semibold ${history.reduce((s, h) => s + h.gain_loss, 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              Total: {fmtMoney(history.reduce((s, h) => s + h.gain_loss, 0))}
-            </span>
+            {showHistory ? <ChevronUp className="w-4 h-4 text-text-muted" /> : <ChevronDown className="w-4 h-4 text-text-muted" />}
           </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-border/30">
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Contract</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Qty</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Cost</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Proceeds</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">P&L</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">%</th>
-                  <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Closed</th>
-                </tr>
-              </thead>
-              <tbody>
-                {history.map((h, i) => (
-                  <tr key={i} className="border-b border-border/10 hover:bg-bg-hover/50">
-                    <td className="px-3 py-2 font-mono text-text-primary">{fmtOCC(h.parsed, h.symbol)}</td>
-                    <td className="px-3 py-2 font-mono text-text-secondary">{h.quantity}</td>
-                    <td className="px-3 py-2 font-mono text-text-muted">{fmtMoney(h.cost)}</td>
-                    <td className="px-3 py-2 font-mono text-text-secondary">{fmtMoney(h.proceeds)}</td>
-                    <td className={`px-3 py-2 font-mono font-semibold ${h.gain_loss >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                      {h.gain_loss >= 0 ? '+' : ''}{fmtMoney(h.gain_loss)}
-                    </td>
-                    <td className={`px-3 py-2 font-mono text-xs ${h.gain_loss_percent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                      {h.gain_loss_percent >= 0 ? '+' : ''}{h.gain_loss_percent?.toFixed(1)}%
-                    </td>
-                    <td className="px-3 py-2 font-mono text-text-muted text-xs">{h.close_date?.split('T')[0]}</td>
+          {showHistory && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-border/30">
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Contract</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Qty</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Cost</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Proceeds</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">P&L</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">%</th>
+                    <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Closed</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {history.map((h, i) => (
+                    <tr key={i} className="border-b border-border/10 hover:bg-bg-hover/50">
+                      <td className="px-3 py-2 font-mono text-text-primary">{fmtOCC(h.parsed, h.symbol)}</td>
+                      <td className="px-3 py-2 font-mono text-text-secondary">{h.quantity}</td>
+                      <td className="px-3 py-2 font-mono text-text-muted">{fmtMoney(h.cost)}</td>
+                      <td className="px-3 py-2 font-mono text-text-secondary">{fmtMoney(h.proceeds)}</td>
+                      <td className={`px-3 py-2 font-mono font-semibold ${h.gain_loss >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {h.gain_loss >= 0 ? '+' : ''}{fmtMoney(h.gain_loss)}
+                      </td>
+                      <td className={`px-3 py-2 font-mono text-xs ${h.gain_loss_percent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {h.gain_loss_percent >= 0 ? '+' : ''}{h.gain_loss_percent?.toFixed(1)}%
+                      </td>
+                      <td className="px-3 py-2 font-mono text-text-muted text-xs">{h.close_date?.split('T')[0]}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -398,7 +398,9 @@ export function evaluateTrade(
     const exitValue = calculatePositionValue(exitLegs, 'exit');
     const entryValue = trade.entryDebit ?? calculatePositionValue(trade.legs, 'entry');
     const pl = exitValue - entryValue;
-    const plPct = trade.maxRisk && trade.maxRisk !== 0 ? (pl / Math.abs(trade.maxRisk)) * 100 : 0;
+    // Recalculate maxRisk with quantity correction
+    const correctedMaxRisk = calculateMaxRisk(trade.legs, trade.strategy, currentSpot);
+    const plPct = correctedMaxRisk !== 0 ? (pl / Math.abs(correctedMaxRisk)) * 100 : 0;
 
     updates.status = 'expired';
     updates.exitedAt = now;
@@ -407,6 +409,7 @@ export function evaluateTrade(
     updates.exitValue = exitValue;
     updates.realizedPL = pl;
     updates.realizedPLPct = plPct;
+    updates.maxRisk = correctedMaxRisk;
     updates.exitReason = 'expiration';
     updates.outcome = pl > 0.5 ? 'win' : pl < -0.5 ? 'loss' : 'breakeven';
 
@@ -424,12 +427,24 @@ export function evaluateTrade(
       }
       return leg;
     });
+
+    // Only enter if ALL legs got valid prices (prevents partial-price distortion)
+    const allPriced = entryLegs.every(l => l.entryMid > 0);
+    if (!allPriced) {
+      // Can't enter yet — wait for all legs to have real quotes
+      return null;
+    }
+
     const entryValue = calculatePositionValue(entryLegs, 'entry');
+
+    // Recalculate maxRisk now that we have real entry prices
+    const recalcMaxRisk = calculateMaxRisk(entryLegs, trade.strategy, currentSpot);
 
     updates.status = 'entered';
     updates.enteredAt = now;
     updates.legs = entryLegs;
     updates.entryDebit = entryValue;
+    updates.maxRisk = recalcMaxRisk;
   }
 
   // Calculate current position value for entered trades
@@ -440,10 +455,36 @@ export function evaluateTrade(
       const price = currentLegPrices.find(p => p.symbol === leg.optionSymbol);
       return { ...leg, exitBid: price?.bid ?? 0, exitAsk: price?.ask ?? 0, exitMid: price?.mid ?? 0 };
     });
+
+    // Only calculate P/L if ALL legs have current prices (prevents distorted numbers)
+    const allCurrentPriced = currentLegs.every(l => (l.exitMid ?? 0) > 0);
+    if (!allCurrentPriced) {
+      // Still update the snapshot with what we have but don't trigger exits
+      return null;
+    }
+
     const currentValue = calculatePositionValue(currentLegs, 'exit');
     const entryValue = updates.entryDebit ?? trade.entryDebit ?? calculatePositionValue(activeLeg, 'entry');
+
+    // Fix maxRisk for existing trades that were calculated without quantity
+    // If maxRisk looks like single-contract but legs have qty > 1, recalculate
+    const effectiveMaxRisk = updates.maxRisk ?? trade.maxRisk ?? calculateMaxRisk(activeLeg, trade.strategy, currentSpot);
+    const qty = Math.max(1, ...activeLeg.map(l => l.quantity));
+    let correctedMaxRisk = effectiveMaxRisk;
+    if (qty > 1 && effectiveMaxRisk > 0) {
+      // Detect if maxRisk was calculated without quantity (legacy bug):
+      // For a $5 spread with qty=2, wrong maxRisk=$500, correct=$1000.
+      // Heuristic: if maxRisk / (width * 100) ≈ 1, it's the old per-contract calculation.
+      const strikes = activeLeg.map(l => l.strike).sort((a, b) => a - b);
+      const width = strikes.length >= 2 ? strikes[strikes.length - 1] - strikes[0] : 0;
+      if (width > 0 && Math.abs(effectiveMaxRisk - width * 100) < 1) {
+        correctedMaxRisk = width * 100 * qty;
+        updates.maxRisk = correctedMaxRisk;
+      }
+    }
+
     const unrealizedPL = currentValue - entryValue;
-    const plPct = trade.maxRisk && trade.maxRisk !== 0 ? (unrealizedPL / Math.abs(trade.maxRisk)) * 100 : 0;
+    const plPct = correctedMaxRisk !== 0 ? (unrealizedPL / Math.abs(correctedMaxRisk)) * 100 : 0;
 
     // Add price snapshot
     const snapshot = { timestamp: now, spotPrice: currentSpot, positionValue: currentValue };
@@ -498,7 +539,9 @@ export function manuallyExitTrade(
   const exitValue = calculatePositionValue(exitLegs, 'exit');
   const entryValue = trade.entryDebit ?? calculatePositionValue(trade.legs, 'entry');
   const pl = exitValue - entryValue;
-  const plPct = trade.maxRisk && trade.maxRisk !== 0 ? (pl / Math.abs(trade.maxRisk)) * 100 : 0;
+  // Use corrected maxRisk (accounting for quantity)
+  const correctedMaxRisk = calculateMaxRisk(trade.legs, trade.strategy, currentSpot);
+  const plPct = correctedMaxRisk !== 0 ? (pl / Math.abs(correctedMaxRisk)) * 100 : 0;
 
   return updateTrackedTrade(tradeId, {
     status: 'exited',
@@ -508,6 +551,7 @@ export function manuallyExitTrade(
     exitValue,
     realizedPL: pl,
     realizedPLPct: plPct,
+    maxRisk: correctedMaxRisk,
     exitReason: 'manual',
     outcome: pl > 0.5 ? 'win' : pl < -0.5 ? 'loss' : 'breakeven',
   });
@@ -958,62 +1002,85 @@ function parseLegsFromStrikesText(
 
 /**
  * Estimate max risk for a given position structure.
- * Returns in dollar terms per contract(s).
+ * Returns in dollar terms for the TOTAL position (accounting for quantity).
  */
 function calculateMaxRisk(legs: TrackedLeg[], strategy: string, spotPrice: number): number {
   const stratLow = strategy.toLowerCase();
+  // Use the max quantity across legs (they should all be the same for a spread)
+  const qty = Math.max(1, ...legs.map(l => l.quantity));
 
-  // For defined-risk spreads, max risk = spread width × 100
+  // For defined-risk spreads, max risk = spread width × 100 × quantity
   const strikes = legs.map(l => l.strike).sort((a, b) => a - b);
   const hasMultipleLegs = legs.length >= 2;
 
-  // Iron condor / iron butterfly: max risk = wider wing × 100
+  // Iron condor / iron butterfly: max risk = wider wing × 100 × qty
   if (stratLow.includes('iron condor') || stratLow.includes('iron butterfly') || stratLow.includes('iron fly')) {
     if (strikes.length >= 4) {
       const putWingWidth = strikes[1] - strikes[0];
       const callWingWidth = strikes[3] - strikes[2];
-      return Math.max(putWingWidth, callWingWidth) * 100;
+      return Math.max(putWingWidth, callWingWidth) * 100 * qty;
     }
   }
 
-  // Vertical spreads (2 legs, same type): max risk = width × 100
+  // Vertical spreads (2 legs, same type): max risk = width × 100 × qty
   if (hasMultipleLegs && strikes.length >= 2) {
     const width = strikes[strikes.length - 1] - strikes[0];
     if (width > 0 && width <= 100) { // sanity check
-      // Credit spreads: max risk = width - credit received
-      // Debit spreads: max risk = debit paid
-      // Since we don't know exact prices yet, use width as conservative max risk
-      return width * 100;
+      return width * 100 * qty;
     }
   }
 
-  // Cash-secured put: max risk = strike × 100 (assigned at strike)
+  // Cash-secured put: max risk = strike × 100 × qty
   if (stratLow.includes('cash') && stratLow.includes('put')) {
     const putStrike = strikes[0] || spotPrice;
-    return putStrike * 100;
+    return putStrike * 100 * qty;
   }
 
   // Naked put / short put
   if ((stratLow.includes('naked') || stratLow.includes('short')) && stratLow.includes('put')) {
     const putStrike = strikes[0] || spotPrice;
-    return putStrike * 100;
+    return putStrike * 100 * qty;
   }
 
   // Single long option: max risk = premium paid (unknown, estimate from spot)
   if (legs.length === 1 && legs[0].side === 'long') {
-    // Conservative estimate: ~3% of spot price per contract for near-ATM
-    return spotPrice * 0.03 * 100;
+    return spotPrice * 0.03 * 100 * qty;
   }
 
   // Straddle/strangle: max risk = total premium paid
   if (stratLow.includes('straddle') || stratLow.includes('strangle')) {
     if (legs.every(l => l.side === 'long')) {
-      return spotPrice * 0.04 * 100; // ~4% of spot for straddle premium
+      return spotPrice * 0.04 * 100 * qty;
     }
   }
 
   // Fallback: conservative estimate based on spot
-  return spotPrice * 0.05 * 100;
+  return spotPrice * 0.05 * 100 * qty;
+}
+
+// ─── Purge Helpers ────────────────────────────────────────
+
+/**
+ * Remove all closed/expired/exited trades from localStorage and server.
+ * Returns only the remaining open trades.
+ */
+export function purgeClosedTrades(): TrackedTrade[] {
+  const all = loadTrackedTrades();
+  const open = all.filter(t => t.status === 'pending' || t.status === 'entered');
+  saveTrackedTrades(open);
+  return open;
+}
+
+/**
+ * Remove ALL tracked trades (full reset).
+ */
+export function purgeAllTrades(): TrackedTrade[] {
+  if (typeof window === 'undefined') return [];
+  localStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem(STORAGE_KEY + ':lastSave');
+  localStorage.removeItem(STORAGE_KEY + ':deletedIds');
+  syncTrackedTradesToServer([]).catch(() => {});
+  return [];
 }
 
 // ─── Paper Position Close Helper ──────────────────────────
