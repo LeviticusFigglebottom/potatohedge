@@ -22,6 +22,21 @@ import { scanMarketFlow, type FlowResult } from '@/lib/providers/polygonFlow';
 
 export const maxDuration = 60; // Briefing: scan 21 stocks + Claude analysis
 
+function isMarketOpenNow(): boolean {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric', minute: 'numeric', weekday: 'short', hour12: false,
+  });
+  const parts = fmt.formatToParts(new Date());
+  const get = (type: string) => parts.find(p => p.type === type)?.value || '';
+  const hours = parseInt(get('hour'), 10) || 0;
+  const minutes = parseInt(get('minute'), 10) || 0;
+  const dayName = get('weekday');
+  if (dayName === 'Sat' || dayName === 'Sun') return false;
+  const time = hours * 60 + minutes;
+  return time >= 570 && time <= 960; // 9:30 AM - 4:00 PM ET
+}
+
 // Stocks to analyze for the briefing
 const INDICES = ['SPY', 'QQQ', 'IWM'];
 const SECTOR_ETFS = ['XLF', 'XLE', 'XLK', 'XLV', 'XLI', 'XLRE', 'XLU', 'XLC', 'XLB', 'XLP', 'XLY'];
@@ -245,6 +260,7 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
       weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
       monthlyExp: nearExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
       correlationCtx,
+      isMarketOpen: isMarketOpenNow(),
     };
     const rec = generateRecommendations(input);
 
@@ -313,10 +329,21 @@ function buildBriefingPrompt(
     return lines.join('\n');
   };
 
-  let prompt = `You are a senior quantitative market strategist. Generate a comprehensive MORNING BRIEFING from live options flow and dealer positioning data across ${stocks.length} securities.
+  const marketOpen = isMarketOpenNow();
+  const marketNote = !marketOpen ? `
+** MARKET IS CURRENTLY CLOSED **
+All volume, flow, and intraday data below is from the LAST trading session — it is STALE.
+DO NOT treat zero or low volume metrics as bearish signals or as evidence of low conviction.
+DO NOT weight volume P/C ratios, options flow, or sweep/block data as current signals.
+FOCUS ON: OI-based dealer positioning (GEX, DEX, vanna, charm, gamma flip, walls, max pain), IV regime, skew, term structure, and structural levels.
+Momentum data reflects the prior session and may include after-hours moves.
+Frame your briefing as preparation for the NEXT session, not as live market commentary.
+` : '';
 
-Your analysis should be direct, opinionated, and actionable — like a trading desk morning note. Lead with the single most important headline. Use specific numbers. Identify the primary edge for today.
+  let prompt = `You are a senior quantitative market strategist. Generate a comprehensive ${marketOpen ? 'MORNING BRIEFING' : 'PRE-SESSION ANALYSIS'} from ${marketOpen ? 'live' : 'end-of-day'} options flow and dealer positioning data across ${stocks.length} securities.
 
+Your analysis should be direct, opinionated, and actionable — like a trading desk morning note. Lead with the single most important headline. Use specific numbers. Identify the primary edge for ${marketOpen ? 'today' : 'the next session'}.
+${marketNote}
 CRITICAL: You have second-order Greeks (vanna, charm) in addition to gamma. Use them:
 - VANNA: sensitivity of delta to implied vol changes. "Bullish vanna" means a vol drop forces dealers to buy stock. "Bearish vanna" means a vol drop forces dealers to sell.
 - CHARM: delta decay over time. "Bullish charm" means time passing forces dealers to buy. Charm is often the dominant flow on quiet days.
@@ -325,7 +352,7 @@ CRITICAL: You have second-order Greeks (vanna, charm) in addition to gamma. Use 
 - GAMMA SLOPE measures how rapidly dealer exposure changes near spot — higher slope = stronger pinning effect.
 
 ═══════════════════════════════════════════
-LIVE MARKET DATA — ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+${marketOpen ? 'LIVE' : 'END-OF-SESSION'} MARKET DATA — ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
 ═══════════════════════════════════════════
 
 VIX: ${vixPrice.toFixed(2)} (${vixChangePct >= 0 ? '+' : ''}${vixChangePct.toFixed(1)}%)

@@ -52,6 +52,7 @@ export interface RecommendationOutput {
   moveContext: string;
   stockContext: string;
   timestamp: number;
+  isMarketOpen?: boolean;
 }
 
 export interface RecommendationInput {
@@ -120,6 +121,8 @@ export interface RecommendationInput {
   flowAlertCount?: number;        // number of unusual flow alerts
   flowSweepCount?: number;        // number of sweep detections
   flowBlockCount?: number;        // number of block trades
+  // Market state — when false, volume/flow signals are stale and should be suppressed
+  isMarketOpen?: boolean;
 }
 
 // ─── Helpers ──────────────────────────────────────────────
@@ -156,6 +159,8 @@ function plerp(x: number, xs: number[], ys: number[]): number {
 function scoreSignals(input: RecommendationInput): Signal[] {
   const signals: Signal[] = [];
   const { spotPrice, dailySigma, atrPercent } = input;
+  // When market is closed, volume/flow data is stale — suppress those signals
+  const marketClosed = input.isMarketOpen === false;
 
   // Guard: spotPrice must be positive for all percentage calculations
   if (spotPrice <= 0) return signals;
@@ -287,29 +292,40 @@ function scoreSignals(input: RecommendationInput): Signal[] {
   //    Zero-weight when either side has <50 contracts (PCR is meaningless)
   //    Attenuate when total volume is thin (<2k contracts)
   //    Cap effective PCR to [0.05, 20] — values outside are data artifacts
+  //    SUPPRESSED when market is closed — volume data is stale/zero
   const totalOptVol = input.totalCallVol + input.totalPutVol;
   const minSideVol = Math.min(input.totalCallVol, input.totalPutVol);
-  const pcrReliable = minSideVol >= 50 && totalOptVol >= 500;
+  const pcrReliable = !marketClosed && minSideVol >= 50 && totalOptVol >= 500;
   const pcrConfidence = !pcrReliable ? 0 : totalOptVol < 2000 ? (totalOptVol - 500) / 1500 : 1;
   const effectivePCR = Math.max(0.05, Math.min(20, input.volumePCR));
 
-  // Continuous PCR weight: smoothly interpolates across the full range
-  // PCR 0.3→+0.25, 0.6→+0.10, 0.8→+0.03, 0.95→0, 1.05→0, 1.2→-0.08, 1.5→-0.20, 2.5→-0.30
-  const pcrWeight = plerp(effectivePCR,
-    [0.3, 0.6, 0.8, 0.95, 1.05, 1.2, 1.5, 2.5],
-    [0.25, 0.10, 0.03, 0.0, 0.0, -0.08, -0.20, -0.30]
-  ) * pcrConfidence;
-  if (Math.abs(pcrWeight) > 0.01) {
-    const reliabilityNote = !pcrReliable
-      ? ` (UNRELIABLE: ${minSideVol < 50 ? `only ${minSideVol} contracts on ${input.totalCallVol < input.totalPutVol ? 'call' : 'put'} side` : `low volume: ${totalOptVol}`})`
-      : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : '';
-    const pcrLabel = input.volumePCR > 20 ? '>20' : input.volumePCR < 0.05 ? '<0.05' : input.volumePCR.toFixed(2);
+  if (marketClosed && totalOptVol > 0) {
+    // Emit info-only signal when market is closed — zero weight, no score impact
     signals.push({
       name: 'Volume P/C Ratio',
-      direction: pcrWeight > 0 ? 'bullish' : 'bearish',
-      weight: pcrWeight,
-      description: `PCR ${pcrLabel}${reliabilityNote} — ${effectivePCR < 0.7 ? 'call-dominant, bullish flow' : effectivePCR > 1.5 ? 'heavy put buying, bearish/hedging' : effectivePCR > 1.0 ? 'slightly put-heavy' : 'slightly call-heavy'}`,
+      direction: 'neutral',
+      weight: 0,
+      description: `PCR ${input.volumePCR.toFixed(2)} (STALE — market closed, using last session's volume data; weight zeroed)`,
     });
+  } else {
+    // Continuous PCR weight: smoothly interpolates across the full range
+    // PCR 0.3→+0.25, 0.6→+0.10, 0.8→+0.03, 0.95→0, 1.05→0, 1.2→-0.08, 1.5→-0.20, 2.5→-0.30
+    const pcrWeight = plerp(effectivePCR,
+      [0.3, 0.6, 0.8, 0.95, 1.05, 1.2, 1.5, 2.5],
+      [0.25, 0.10, 0.03, 0.0, 0.0, -0.08, -0.20, -0.30]
+    ) * pcrConfidence;
+    if (Math.abs(pcrWeight) > 0.01) {
+      const reliabilityNote = !pcrReliable
+        ? ` (UNRELIABLE: ${minSideVol < 50 ? `only ${minSideVol} contracts on ${input.totalCallVol < input.totalPutVol ? 'call' : 'put'} side` : `low volume: ${totalOptVol}`})`
+        : pcrConfidence < 1 ? ` (low volume: ${totalOptVol} contracts)` : '';
+      const pcrLabel = input.volumePCR > 20 ? '>20' : input.volumePCR < 0.05 ? '<0.05' : input.volumePCR.toFixed(2);
+      signals.push({
+        name: 'Volume P/C Ratio',
+        direction: pcrWeight > 0 ? 'bullish' : 'bearish',
+        weight: pcrWeight,
+        description: `PCR ${pcrLabel}${reliabilityNote} — ${effectivePCR < 0.7 ? 'call-dominant, bullish flow' : effectivePCR > 1.5 ? 'heavy put buying, bearish/hedging' : effectivePCR > 1.0 ? 'slightly put-heavy' : 'slightly call-heavy'}`,
+      });
+    }
   }
 
   // 6. DEX Bias — scale weight by magnitude relative to GEX
@@ -466,24 +482,27 @@ function scoreSignals(input: RecommendationInput): Signal[] {
 
   // 11. Momentum — ATR-RELATIVE with continuous weight scaling
   // Weight ramps smoothly from 0 at 0.8σ to ±0.20 at 3σ+
+  // Halved when market is closed — change reflects after-hours/pre-market, less reliable
   const absChange = Math.abs(input.changePercent);
   const moveSigma = dailySigma > 0 ? absChange / dailySigma : 0;
   const moveATR = atrPercent > 0 ? absChange / atrPercent : 0;
+  const momScale = marketClosed ? 0.5 : 1;
 
   if (moveSigma > 0.8) {
     // Continuous: 0.8σ→0, 1.2σ→0.04, 2σ→0.10, 3σ→0.16, 4σ→0.20
-    const momMag = clamp(plerp(moveSigma, [0.8, 1.2, 2.0, 3.0, 4.0], [0.0, 0.04, 0.10, 0.16, 0.20]), 0, 0.20);
+    const momMag = clamp(plerp(moveSigma, [0.8, 1.2, 2.0, 3.0, 4.0], [0.0, 0.04, 0.10, 0.16, 0.20]), 0, 0.20) * momScale;
     const dir = input.changePercent > 0 ? 'bullish' : 'bearish';
     const sign = input.changePercent > 0 ? 1 : -1;
+    const staleNote = marketClosed ? ' (weight halved — after-hours/pre-market data)' : '';
     signals.push({
       name: 'Momentum',
       direction: momMag > 0.01 ? dir : 'neutral',
       weight: momMag * sign,
       description: moveSigma > 2
-        ? `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ move (${moveATR.toFixed(1)}x ATR) — statistically significant for this stock`
+        ? `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ move (${moveATR.toFixed(1)}x ATR) — statistically significant for this stock${staleNote}`
         : moveSigma > 1.2
-        ? `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ (${moveATR.toFixed(1)}x ATR) — above average for this stock's ${atrPercent.toFixed(1)}% daily ATR`
-        : `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ — within normal range (${atrPercent.toFixed(1)}% ATR)`,
+        ? `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ (${moveATR.toFixed(1)}x ATR) — above average for this stock's ${atrPercent.toFixed(1)}% daily ATR${staleNote}`
+        : `Today's ${input.changePercent > 0 ? '+' : ''}${input.changePercent.toFixed(1)}% = ${moveSigma.toFixed(1)}σ — within normal range (${atrPercent.toFixed(1)}% ATR)${staleNote}`,
     });
   } else if (absChange > 0.1) {
     signals.push({
@@ -548,44 +567,58 @@ function scoreSignals(input: RecommendationInput): Signal[] {
   }
 
   // 15. Options Flow — Institutional Positioning (from Polygon)
+  //     SUPPRESSED when market is closed — flow data reflects prior session
   if (input.flowNetPremium !== undefined && input.flowNetPremium !== 0) {
-    const netM = input.flowNetPremium / 1e6;
-    const absNetM = Math.abs(netM);
-
-    // Weight scales with magnitude: $1M → 0.03, $10M → 0.10, $50M → 0.18, $100M+ → 0.22
-    const flowWeight = plerp(absNetM,
-      [0.5, 1, 5, 10, 50, 100],
-      [0.01, 0.03, 0.08, 0.12, 0.18, 0.22]
-    ) * (input.flowNetPremium > 0 ? 1 : -1);
-
-    if (Math.abs(flowWeight) > 0.01) {
-      const dir: Direction = flowWeight > 0 ? 'bullish' : 'bearish';
-      const callM = (input.flowCallPremium || 0) / 1e6;
-      const putM = (input.flowPutPremium || 0) / 1e6;
-
-      let detail = `Net premium: ${netM > 0 ? '+' : ''}$${netM.toFixed(1)}M`;
-      if (callM > 0 || putM > 0) detail += ` (C: $${callM.toFixed(1)}M / P: $${putM.toFixed(1)}M)`;
-
-      const sweepNote = (input.flowSweepCount || 0) > 0 ? `, ${input.flowSweepCount} sweeps detected` : '';
-      const blockNote = (input.flowBlockCount || 0) > 0 ? `, ${input.flowBlockCount} block trades` : '';
-
+    if (marketClosed) {
+      const netM = input.flowNetPremium / 1e6;
       signals.push({
         name: 'Options Flow',
-        direction: dir,
-        weight: flowWeight,
-        description: `${detail}${sweepNote}${blockNote} — ${dir === 'bullish' ? 'institutional call buying dominates' : 'institutional put buying / hedging dominates'}`,
+        direction: 'neutral',
+        weight: 0,
+        description: `Net premium: ${netM > 0 ? '+' : ''}$${netM.toFixed(1)}M (STALE — market closed, prior session data; weight zeroed)`,
       });
+    } else {
+      const netM = input.flowNetPremium / 1e6;
+      const absNetM = Math.abs(netM);
+
+      // Weight scales with magnitude: $1M → 0.03, $10M → 0.10, $50M → 0.18, $100M+ → 0.22
+      const flowWeight = plerp(absNetM,
+        [0.5, 1, 5, 10, 50, 100],
+        [0.01, 0.03, 0.08, 0.12, 0.18, 0.22]
+      ) * (input.flowNetPremium > 0 ? 1 : -1);
+
+      if (Math.abs(flowWeight) > 0.01) {
+        const dir: Direction = flowWeight > 0 ? 'bullish' : 'bearish';
+        const callM = (input.flowCallPremium || 0) / 1e6;
+        const putM = (input.flowPutPremium || 0) / 1e6;
+
+        let detail = `Net premium: ${netM > 0 ? '+' : ''}$${netM.toFixed(1)}M`;
+        if (callM > 0 || putM > 0) detail += ` (C: $${callM.toFixed(1)}M / P: $${putM.toFixed(1)}M)`;
+
+        const sweepNote = (input.flowSweepCount || 0) > 0 ? `, ${input.flowSweepCount} sweeps detected` : '';
+        const blockNote = (input.flowBlockCount || 0) > 0 ? `, ${input.flowBlockCount} block trades` : '';
+
+        signals.push({
+          name: 'Options Flow',
+          direction: dir,
+          weight: flowWeight,
+          description: `${detail}${sweepNote}${blockNote} — ${dir === 'bullish' ? 'institutional call buying dominates' : 'institutional put buying / hedging dominates'}`,
+        });
+      }
     }
   }
 
   // 16. Flow Alerts — unusual activity confirmation
+  //     SUPPRESSED when market is closed
   if ((input.flowAlertCount || 0) >= 3 && input.flowSentiment && input.flowSentiment !== 'neutral') {
     const alertDir: Direction = input.flowSentiment;
     signals.push({
       name: 'Unusual Flow Activity',
-      direction: alertDir,
-      weight: alertDir === 'bullish' ? 0.05 : -0.05,
-      description: `${input.flowAlertCount} unusual flow alerts with ${alertDir} sentiment — confirms institutional positioning`,
+      direction: marketClosed ? 'neutral' : alertDir,
+      weight: marketClosed ? 0 : (alertDir === 'bullish' ? 0.05 : -0.05),
+      description: marketClosed
+        ? `${input.flowAlertCount} unusual flow alerts (STALE — market closed; weight zeroed)`
+        : `${input.flowAlertCount} unusual flow alerts with ${alertDir} sentiment — confirms institutional positioning`,
     });
   }
 
@@ -971,6 +1004,11 @@ export function generateRecommendations(input: RecommendationInput): Recommendat
 
   // ─── ATR-relative warnings ───
   const warnings: string[] = [];
+
+  if (input.isMarketOpen === false) {
+    warnings.push('Market is closed — volume/flow/momentum signals are stale and have been suppressed or attenuated. Scoring relies on OI-based positioning (GEX walls, dealer delta, max pain, skew) and IV regime. Treat bias score with lower confidence.');
+  }
+
   const moveSigma = input.dailySigma > 0 ? Math.abs(input.changePercent) / input.dailySigma : 0;
 
   if (input.nearestDTE <= 1) {
@@ -1018,6 +1056,7 @@ export function generateRecommendations(input: RecommendationInput): Recommendat
     moveContext,
     stockContext,
     timestamp: Date.now(),
+    isMarketOpen: input.isMarketOpen,
   };
 }
 

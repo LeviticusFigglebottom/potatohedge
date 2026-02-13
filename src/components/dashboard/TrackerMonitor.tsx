@@ -25,11 +25,17 @@ import {
  */
 
 function isMarketHours(): boolean {
-  const now = new Date();
-  const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  const day = et.getDay();
-  if (day === 0 || day === 6) return false;
-  const time = et.getHours() * 60 + et.getMinutes();
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric', minute: 'numeric', weekday: 'short', hour12: false,
+  });
+  const parts = fmt.formatToParts(new Date());
+  const get = (type: string) => parts.find(p => p.type === type)?.value || '';
+  const hours = parseInt(get('hour'), 10) || 0;
+  const minutes = parseInt(get('minute'), 10) || 0;
+  const dayName = get('weekday');
+  if (dayName === 'Sat' || dayName === 'Sun') return false;
+  const time = hours * 60 + minutes;
   // 9:30 AM - 4:15 PM ET (slightly after close for final settlement)
   return time >= 570 && time <= 975;
 }
@@ -63,7 +69,6 @@ async function handleTradeExit(trade: TrackedTrade, trigger: 'target' | 'stop') 
 
 export default function TrackerMonitor() {
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
-  const afterHoursRef = useRef<NodeJS.Timeout | null>(null);
   const runningRef = useRef(false);
 
   const evaluateTrackedTrades = useCallback(async () => {
@@ -188,18 +193,19 @@ export default function TrackerMonitor() {
     // Initial check after 10s delay (let the app settle)
     const startDelay = setTimeout(evaluateTrackedTrades, 10000);
 
-    // Market hours: check every 90s
-    intervalRef.current = setInterval(evaluateTrackedTrades, 90000);
-
-    // After hours: check every 5 minutes for expiration handling
-    afterHoursRef.current = setInterval(() => {
-      if (!isMarketHours()) evaluateTrackedTrades();
-    }, 300000);
+    // Single smart interval: 90s during market hours, 5 min outside
+    const tick = () => {
+      evaluateTrackedTrades();
+      // Re-schedule with appropriate interval
+      const nextDelay = isMarketHours() ? 90000 : 300000;
+      intervalRef.current = setTimeout(tick, nextDelay);
+    };
+    // Start the first scheduled tick
+    intervalRef.current = setTimeout(tick, isMarketHours() ? 90000 : 300000);
 
     return () => {
       clearTimeout(startDelay);
-      if (intervalRef.current) clearInterval(intervalRef.current);
-      if (afterHoursRef.current) clearInterval(afterHoursRef.current);
+      if (intervalRef.current) clearTimeout(intervalRef.current);
     };
   }, [evaluateTrackedTrades]);
 

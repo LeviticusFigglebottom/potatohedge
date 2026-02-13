@@ -1,6 +1,21 @@
 import { NextResponse } from 'next/server';
 import { getQuote, getExpirations, getOptionsChain } from '@/lib/providers/tradier';
 import { fetchEquityBars } from '@/lib/providers/equityBars';
+
+function isMarketOpenNow(): boolean {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric', minute: 'numeric', weekday: 'short', hour12: false,
+  });
+  const parts = fmt.formatToParts(new Date());
+  const get = (type: string) => parts.find(p => p.type === type)?.value || '';
+  const hours = parseInt(get('hour'), 10) || 0;
+  const minutes = parseInt(get('minute'), 10) || 0;
+  const dayName = get('weekday');
+  if (dayName === 'Sat' || dayName === 'Sun') return false;
+  const time = hours * 60 + minutes;
+  return time >= 570 && time <= 960;
+}
 import {
   computeDealerExposureFromChain,
   findGammaFlip,
@@ -406,6 +421,7 @@ export async function GET() {
           weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
           monthlyExp: nearExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
           correlationCtx,
+          isMarketOpen: isMarketOpenNow(),
         };
 
         const rec = generateRecommendations(input);
