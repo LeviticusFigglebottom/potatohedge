@@ -37,6 +37,7 @@ interface Position {
   currentValue: number;
   unrealizedPL: number;
   unrealizedPLPct: number;
+  priceUnavailable?: boolean;
   bid: number;
   ask: number;
 }
@@ -413,6 +414,7 @@ interface SpreadGroup {
   netPLPct: number;
   rule: TradeRule | undefined;
   spreadLabel: string;
+  partialPricing?: boolean; // true if any leg has no current quote
 }
 
 /** Group positions into spreads using trade rules. Ungrouped positions stay as single-leg groups. */
@@ -431,14 +433,17 @@ function groupPositionsIntoSpreads(positions: Position[]): SpreadGroup[] {
 
     for (const p of matched) assigned.add(p.id);
 
+    const partialPricing = matched.some(p => p.priceUnavailable);
     const netCost = matched.reduce((s, p) => s + p.cost_basis, 0);
     const netCurrentValue = matched.reduce((s, p) => {
       const sign = p.quantity > 0 ? 1 : -1;
       return s + p.currentPrice * Math.abs(p.quantity) * 100 * sign;
     }, 0);
+    // Only sum unrealizedPL for legs that have a real current price.
+    // Legs with priceUnavailable already have unrealizedPL=0 from the API.
     const netPL = matched.reduce((s, p) => s + p.unrealizedPL, 0);
     const absNetCost = Math.abs(netCost);
-    const netPLPct = absNetCost > 0 ? (netPL / absNetCost) * 100 : 0;
+    const netPLPct = (absNetCost > 0 && !partialPricing) ? (netPL / absNetCost) * 100 : 0;
 
     // Build spread label like "AAPL Bull Call $260/$265 ×10"
     const underlying = rule.underlying || matched[0]?.parsed?.underlying || '';
@@ -460,6 +465,7 @@ function groupPositionsIntoSpreads(positions: Position[]): SpreadGroup[] {
       netCostBasis: netCost,
       netCurrentValue,
       netPL,
+      partialPricing,
       netPLPct,
       rule,
       spreadLabel,
@@ -822,7 +828,9 @@ export default function PaperTradingTab() {
                           {/* Net P/L */}
                           <div className="text-right min-w-[120px]">
                             <div className="text-[10px] text-text-muted font-mono">Net P&L</div>
-                            <PLBadge value={group.netPL} pct={group.netPLPct} />
+                            {group.partialPricing
+                              ? <span className="text-[11px] font-mono text-yellow-400">Awaiting quotes</span>
+                              : <PLBadge value={group.netPL} pct={group.netPLPct} />}
                           </div>
 
                           {/* Exit progress */}

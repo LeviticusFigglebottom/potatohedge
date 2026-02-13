@@ -208,7 +208,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
   const [paperStatus, setPaperStatus] = useState<Record<number, string>>({});
   const [trackedIdeas, setTrackedIdeas] = useState<Set<number>>(new Set());
 
-  const handleTrack = async (idea: TradeIdea, idx: number) => {
+  const handleTrack = async (idea: TradeIdea, idx: number, paperQuotes?: Record<string, { bid: number; ask: number; mid: number; last: number }>) => {
     // Build the trade first (with pending legs)
     const tracked = buildTrackedTradeFromAlgo({
       symbol: idea.ticker,
@@ -243,24 +243,21 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
       source: 'ai-briefing',
       nearestExp: idea.nearestExp,
     });
-    // Fetch live prices and fill entry immediately so trade starts as 'entered'
+    // Fill entry prices: prefer paper fill prices (consistency with paper tab),
+    // then fall back to production API prices
     if (tracked.status === 'pending') {
       const occSymbols = tracked.legs.map(l => l.optionSymbol).filter(Boolean);
-      const { quotes } = await fetchEntryPrices(occSymbols, idea.ticker);
+      const quotes = (paperQuotes && Object.keys(paperQuotes).length > 0)
+        ? paperQuotes
+        : (await fetchEntryPrices(occSymbols, idea.ticker)).quotes;
       if (Object.keys(quotes).length > 0) {
         tracked.legs = fillEntryPrices(tracked.legs, quotes);
         const hasRealPrices = tracked.legs.length > 0 && tracked.legs.every(l => l.entryMid > 0);
         if (hasRealPrices) {
-          // Reject penny options: if avg mid < $0.10, don't mark as entered
-          const pricedLegs = tracked.legs.filter(l => l.entryMid > 0);
-          const avgMid = pricedLegs.reduce((s, l) => s + l.entryMid, 0) / pricedLegs.length;
-          if (avgMid >= 0.10) {
-            tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
-            tracked.status = 'entered';
-            tracked.enteredAt = Date.now();
-            tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
-          }
-          // If avgMid < $0.10, leave as pending — likely penny options that shouldn't be traded
+          tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
+          tracked.status = 'entered';
+          tracked.enteredAt = Date.now();
+          tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
         }
       }
     }
@@ -533,8 +530,21 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId} (TP: +${idea.profitTargetPct || 75}% / SL: -${idea.stopLossPct || 50}%)` }));
       }
+      // Fetch paper account fills so tracker uses the same entry prices
+      let paperQuotes: Record<string, { bid: number; ask: number; mid: number; last: number }> = {};
+      try {
+        await new Promise(r => setTimeout(r, 1500)); // wait for sandbox market fill
+        const accRes = await fetch('/api/paper/account', { signal: AbortSignal.timeout(5000) });
+        if (accRes.ok) {
+          const accData = await accRes.json();
+          for (const p of (accData.positions || []) as { symbol: string; costPerContract: number; bid: number; ask: number }[]) {
+            const price = Math.abs(p.costPerContract);
+            if (price > 0) paperQuotes[p.symbol] = { bid: p.bid || price, ask: p.ask || price, mid: price, last: price };
+          }
+        }
+      } catch { /* fall back to production API prices */ }
       // Auto-track the paper trade so TrackerMonitor monitors it
-      if (!trackedIdeas.has(idx)) handleTrack(idea, idx);
+      if (!trackedIdeas.has(idx)) handleTrack(idea, idx, paperQuotes);
     } catch (err) {
       setPaperStatus(s => ({ ...s, [idx]: `Error: ${err instanceof Error ? err.message : 'Failed'}` }));
     }
@@ -656,7 +666,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
   const [paperStatus, setPaperStatus] = useState<Record<number, string>>({});
   const [trackedIdeas, setTrackedIdeas] = useState<Set<number>>(new Set());
 
-  const handleTrack = async (idea: AITradeIdea, idx: number) => {
+  const handleTrack = async (idea: AITradeIdea, idx: number, paperQuotes?: Record<string, { bid: number; ask: number; mid: number; last: number }>) => {
     const dirLow = idea.direction.toLowerCase();
     const direction = dirLow.includes('bull') ? 'bullish' : dirLow.includes('bear') ? 'bearish' : 'neutral';
     const targetMatch = idea.target?.match(/(\d+)\s*%/);
@@ -694,23 +704,21 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
       source: 'ai-analysis',
       nearestExp: idea.nearestExp,
     });
-    // Fetch live prices and fill entry immediately
+    // Fill entry prices: prefer paper fill prices (consistency with paper tab),
+    // then fall back to production API prices
     if (tracked.status === 'pending') {
       const occSymbols = tracked.legs.map(l => l.optionSymbol).filter(Boolean);
-      const { quotes } = await fetchEntryPrices(occSymbols, idea.ticker);
+      const quotes = (paperQuotes && Object.keys(paperQuotes).length > 0)
+        ? paperQuotes
+        : (await fetchEntryPrices(occSymbols, idea.ticker)).quotes;
       if (Object.keys(quotes).length > 0) {
         tracked.legs = fillEntryPrices(tracked.legs, quotes);
         const hasRealPrices = tracked.legs.length > 0 && tracked.legs.every(l => l.entryMid > 0);
         if (hasRealPrices) {
-          // Reject penny options: if avg mid < $0.10, don't mark as entered
-          const pricedLegs = tracked.legs.filter(l => l.entryMid > 0);
-          const avgMid = pricedLegs.reduce((s, l) => s + l.entryMid, 0) / pricedLegs.length;
-          if (avgMid >= 0.10) {
-            tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
-            tracked.status = 'entered';
-            tracked.enteredAt = Date.now();
-            tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
-          }
+          tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
+          tracked.status = 'entered';
+          tracked.enteredAt = Date.now();
+          tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
         }
       }
     }
@@ -915,8 +923,21 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId}` }));
       }
+      // Fetch paper account fills so tracker uses the same entry prices
+      let paperQuotes: Record<string, { bid: number; ask: number; mid: number; last: number }> = {};
+      try {
+        await new Promise(r => setTimeout(r, 1500)); // wait for sandbox market fill
+        const accRes = await fetch('/api/paper/account', { signal: AbortSignal.timeout(5000) });
+        if (accRes.ok) {
+          const accData = await accRes.json();
+          for (const p of (accData.positions || []) as { symbol: string; costPerContract: number; bid: number; ask: number }[]) {
+            const price = Math.abs(p.costPerContract);
+            if (price > 0) paperQuotes[p.symbol] = { bid: p.bid || price, ask: p.ask || price, mid: price, last: price };
+          }
+        }
+      } catch { /* fall back to production API prices */ }
       // Auto-track the paper trade so TrackerMonitor monitors it
-      if (!trackedIdeas.has(idx)) handleTrack(idea, idx);
+      if (!trackedIdeas.has(idx)) handleTrack(idea, idx, paperQuotes);
     } catch (err) {
       setPaperStatus(s => ({ ...s, [idx]: `Error: ${err instanceof Error ? err.message : 'Failed'}` }));
     }

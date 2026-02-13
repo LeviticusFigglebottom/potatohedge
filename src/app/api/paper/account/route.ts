@@ -32,15 +32,23 @@ export async function GET() {
       const parsed = parseOCCSymbol(p.symbol);
       const quote = liveQuotes.get(p.symbol);
       const costPerContract = p.quantity !== 0 ? p.cost_basis / (Math.abs(p.quantity) * 100) : 0;
-      const currentPrice = quote?.last ?? 0;
+      const hasQuote = !!quote && (quote.last > 0 || quote.bid > 0 || quote.ask > 0);
+      // Use last > 0 preferentially; fall back to mid of bid/ask; else 0
+      const currentPrice = hasQuote
+        ? (quote!.last > 0 ? quote!.last : ((quote!.bid + quote!.ask) / 2))
+        : 0;
       const currentValue = currentPrice * Math.abs(p.quantity) * 100;
-      // For long positions: P/L = current_value - cost_basis
-      // For short positions: Tradier's cost_basis is negative (credit received),
-      // so P/L = |cost_basis| - current_value (credit received minus cost to close)
-      const unrealizedPL = p.quantity > 0
-        ? currentValue - p.cost_basis
-        : Math.abs(p.cost_basis) - currentValue;
-      const unrealizedPLPct = p.cost_basis !== 0 ? (unrealizedPL / Math.abs(p.cost_basis)) * 100 : 0;
+      // Only compute unrealizedPL when we have a real current price.
+      // When price is unavailable, set P/L to 0 to avoid showing bogus max-loss figures.
+      let unrealizedPL: number;
+      if (!hasQuote) {
+        unrealizedPL = 0;
+      } else if (p.quantity > 0) {
+        unrealizedPL = currentValue - p.cost_basis;
+      } else {
+        unrealizedPL = Math.abs(p.cost_basis) - currentValue;
+      }
+      const unrealizedPLPct = (p.cost_basis !== 0 && hasQuote) ? (unrealizedPL / Math.abs(p.cost_basis)) * 100 : 0;
 
       return {
         ...p,
@@ -50,6 +58,7 @@ export async function GET() {
         currentValue,
         unrealizedPL,
         unrealizedPLPct,
+        priceUnavailable: !hasQuote,
         bid: quote?.bid ?? 0,
         ask: quote?.ask ?? 0,
       };
