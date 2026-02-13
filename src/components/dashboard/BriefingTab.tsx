@@ -72,6 +72,40 @@ function calcQty(spot: number, strategy: string, legs: { strike: number; type: '
   return sizePosition(trackerLegs, strategy, spot);
 }
 
+/** Resolve the best expiration date for a trade.
+ *  Algorithm trades: use targetExp from recommendation engine (already resolved).
+ *  AI trades: parse DTE from expiration text, pick best available exp.
+ */
+function resolveExpiration(opts: {
+  targetExp?: string;
+  expirationText?: string;
+  nearestExp: string;
+  weeklyExp?: string;
+  monthlyExp?: string;
+}): string {
+  // If we have an explicit targetExp from the algorithm, use it
+  if (opts.targetExp) return opts.targetExp;
+
+  // For AI trades, try to parse DTE from the expiration text
+  if (opts.expirationText) {
+    const dteMatch = opts.expirationText.match(/(\d+)\s*(?:DTE|dte|days?)/i);
+    const dte = dteMatch ? parseInt(dteMatch[1]) : 0;
+    // Also check for "30-45 DTE" range format
+    const rangeMatch = opts.expirationText.match(/(\d+)\s*[-–]\s*(\d+)\s*DTE/i);
+    const maxDTE = rangeMatch ? parseInt(rangeMatch[2]) : dte;
+
+    if (maxDTE >= 25 && opts.monthlyExp) return opts.monthlyExp;
+    if (maxDTE >= 25 && opts.weeklyExp) return opts.weeklyExp; // fallback
+    if (maxDTE >= 10 && opts.weeklyExp) return opts.weeklyExp;
+
+    // Also try to parse a date directly (e.g., "2025-02-21")
+    const dateMatch = opts.expirationText.match(/(\d{4}-\d{2}-\d{2})/);
+    if (dateMatch) return dateMatch[1];
+  }
+
+  return opts.nearestExp;
+}
+
 function buildOCC(symbol: string, expiration: string, type: 'C' | 'P', strike: number): string {
   const d = new Date(expiration + 'T12:00:00');
   const yy = String(d.getFullYear()).slice(-2);
@@ -93,6 +127,7 @@ interface TradeIdea {
   score: number;
   strikes: string;
   expiration: string;
+  targetExp: string;
   entry: string;
   risk: string;
   reasoning: string[];
@@ -101,6 +136,8 @@ interface TradeIdea {
   stopLossPct: number;
   nearestExp: string;
   nearestDTE: number;
+  weeklyExp?: string;
+  monthlyExp?: string;
   ivRank: number;
   currentIV: number;
   gammaFlip: number | null;
@@ -124,6 +161,8 @@ interface AITradeIdea {
   spot: number;
   nearestExp: string;
   nearestDTE: number;
+  weeklyExp?: string;
+  monthlyExp?: string;
   gammaFlip: number | null;
   callWall: number | null;
   putWall: number | null;
@@ -209,6 +248,13 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
   const [trackedIdeas, setTrackedIdeas] = useState<Set<number>>(new Set());
 
   const handleTrack = async (idea: TradeIdea, idx: number, paperQuotes?: Record<string, { bid: number; ask: number; mid: number; last: number }>) => {
+    // Use the algorithm's resolved targetExp (matches the recommended DTE)
+    const exp = resolveExpiration({
+      targetExp: idea.targetExp,
+      nearestExp: idea.nearestExp,
+      weeklyExp: idea.weeklyExp,
+      monthlyExp: idea.monthlyExp,
+    });
     // Build the trade first (with pending legs)
     const tracked = buildTrackedTradeFromAlgo({
       symbol: idea.ticker,
@@ -241,7 +287,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
         gammaRegime: 'neutral',
       },
       source: 'ai-briefing',
-      nearestExp: idea.nearestExp,
+      nearestExp: exp,
     });
     // Fill entry prices: prefer paper fill prices (consistency with paper tab),
     // then fall back to production API prices
@@ -286,7 +332,13 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
       const sellStrikes = [...idea.strikes.matchAll(/sell\s+\$(\d+(?:\.\d+)?)/gi)].map(m => parseFloat(m[1]));
       const buyStrikes = [...idea.strikes.matchAll(/buy\s+\$(\d+(?:\.\d+)?)/gi)].map(m => parseFloat(m[1]));
 
-      const exp = idea.nearestExp;
+      // Use the algorithm's resolved targetExp (matches the recommended DTE)
+      const exp = resolveExpiration({
+        targetExp: idea.targetExp,
+        nearestExp: idea.nearestExp,
+        weeklyExp: idea.weeklyExp,
+        monthlyExp: idea.monthlyExp,
+      });
       const thesis = `${idea.strategy} — ${idea.reasoning[0] || ''}`;
       let qty = parseQuantity(idea.strikes);
 
@@ -595,7 +647,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
                     <div><span className="text-text-muted">Strategy:</span> <span className="text-text-primary">{idea.strategy}</span></div>
                     <div><span className="text-text-muted">Strikes:</span> <span className="text-text-primary">{idea.strikes}</span></div>
-                    <div><span className="text-text-muted">Exp:</span> <span className="text-text-primary">{idea.expiration} ({idea.nearestDTE}d)</span></div>
+                    <div><span className="text-text-muted">Exp:</span> <span className="text-text-primary">{idea.targetExp || idea.nearestExp} ({idea.expiration})</span></div>
                     <div><span className="text-text-muted">Spot:</span> <span className="text-text-primary">${idea.spot.toFixed(2)}</span></div>
                   </div>
                   <div className="text-xs font-mono text-text-muted">
@@ -671,6 +723,13 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
     const direction = dirLow.includes('bull') ? 'bullish' : dirLow.includes('bear') ? 'bearish' : 'neutral';
     const targetMatch = idea.target?.match(/(\d+)\s*%/);
     const stopMatch = idea.stopMaxLoss?.match(/(\d+)\s*%/);
+    // Resolve expiration: use AI's stated DTE or fall back to available expirations
+    const exp = resolveExpiration({
+      expirationText: idea.expiration,
+      nearestExp: idea.nearestExp,
+      weeklyExp: idea.weeklyExp,
+      monthlyExp: idea.monthlyExp,
+    });
     const tracked = buildTrackedTradeFromAlgo({
       symbol: idea.ticker,
       spotPrice: idea.spot,
@@ -702,7 +761,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
         gammaRegime: 'neutral',
       },
       source: 'ai-analysis',
-      nearestExp: idea.nearestExp,
+      nearestExp: exp,
     });
     // Fill entry prices: prefer paper fill prices (consistency with paper tab),
     // then fall back to production API prices
@@ -752,7 +811,13 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
       for (const s of stratSell) if (!sellStrikes.includes(s)) sellStrikes.push(s);
       for (const b of stratBuy) if (!buyStrikes.includes(b)) buyStrikes.push(b);
 
-      const exp = idea.nearestExp;
+      // Resolve expiration: use AI's stated DTE or fall back to available expirations
+      const exp = resolveExpiration({
+        expirationText: idea.expiration,
+        nearestExp: idea.nearestExp,
+        weeklyExp: idea.weeklyExp,
+        monthlyExp: idea.monthlyExp,
+      });
       const thesis = `[AI] ${idea.title} — ${idea.thesis || idea.strategy}`;
       let qty = parseQuantity(idea.strikes);
 

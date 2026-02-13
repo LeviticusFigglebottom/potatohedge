@@ -81,6 +81,14 @@ interface StockScan {
   trades: TradeIdea[];
   nearestExp: string;
   nearestDTE: number;
+  weeklyExp?: string;
+  monthlyExp?: string;
+  // Intraday price action
+  open: number;
+  high: number;
+  low: number;
+  volume: number;
+  avgVolume: number;
 }
 
 function computeQuickCorrelationCtx(
@@ -246,6 +254,12 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
     const profile = computeStockProfile(historyBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c })), spotPrice, hvCurrent);
     const correlationCtx = computeQuickCorrelationCtx(historyBars, hvCurrent);
 
+    // Resolve expiration dates from the full list (not just the 3 we fetched chains for)
+    // This ensures we can find a monthly expiration even if it's not in nearExps
+    const weeklyExp = expirations.find(e => e.dte >= 5 && e.dte <= 10)?.date;
+    const monthlyExp = expirations.find(e => e.dte >= 25 && e.dte <= 50)?.date
+      || expirations.find(e => e.dte >= 14 && e.dte <= 24)?.date; // fallback to 2-3 week if no monthly
+
     const input: RecommendationInput = {
       symbol: ticker, spotPrice, totalGEX, totalDEX, gammaFlip, callWall, putWall,
       maxPain: maxPainResult.strike, volumePCR, oiPCR,
@@ -257,8 +271,8 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
       atr14: profile.atr14, atrPercent: profile.atrPercent,
       dailySigma: profile.dailySigma, avgDailyRangePct: profile.avgDailyRangePct,
       nearestExp: nearExps[0]?.date || '', nearestDTE: nearExps[0]?.dte || 0,
-      weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
-      monthlyExp: nearExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
+      weeklyExp,
+      monthlyExp,
       correlationCtx,
       isMarketOpen: isMarketOpenNow(),
     };
@@ -282,6 +296,14 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
       trades: rec.trades.slice(0, 3), // top 3 trade ideas per stock
       nearestExp: nearExps[0]?.date || '',
       nearestDTE: nearExps[0]?.dte || 0,
+      weeklyExp,
+      monthlyExp,
+      // Intraday price action
+      open: quote.open,
+      high: quote.high,
+      low: quote.low,
+      volume: quote.volume,
+      avgVolume: quote.avgVolume,
     };
   } catch {
     return null;
@@ -313,9 +335,14 @@ function buildBriefingPrompt(
   const fmtStock = (s: StockScan) => {
     const gexLabel = s.totalGEX >= 0 ? `+${abbr(s.totalGEX)}` : abbr(s.totalGEX);
     const dexLabel = s.totalDEX >= 0 ? `+${abbr(s.totalDEX)}` : abbr(s.totalDEX);
+    // Intraday context
+    const range = s.high > 0 && s.low > 0 ? s.high - s.low : 0;
+    const rangePos = range > 0 ? ((s.price - s.low) / range * 100).toFixed(0) : '—';
+    const relVol = s.avgVolume > 0 ? (s.volume / s.avgVolume * 100).toFixed(0) : '—';
     const lines = [
       `${s.symbol}: $${s.price.toFixed(2)} (${s.changePct >= 0 ? '+' : ''}${s.changePct.toFixed(2)}%) | Bias: ${s.biasScore > 0 ? '+' : ''}${s.biasScore} ${s.bias} | Gamma: ${s.gammaRegime} | IV: ${s.volRegime} (rank ${s.ivRank}, ${(s.currentIV * 100).toFixed(0)}% IV vs ${(s.hvCurrent * 100).toFixed(0)}% HV) | PCR: ${s.volumePCR.toFixed(2)} | Skew: ${s.skewBias}`,
       `  GEX: ${gexLabel} | DEX: ${dexLabel} | Vanna: ${s.vannaRegime} | Charm: ${s.charmRegime} | ATR: ${s.atrPercent.toFixed(1)}% | Daily 1σ: ${(s.dailySigma * 100).toFixed(2)}%`,
+      `  Intraday: O=$${s.open.toFixed(2)} H=$${s.high.toFixed(2)} L=$${s.low.toFixed(2)} | Range: $${range.toFixed(2)} (${rangePos}% from low) | Vol: ${(s.volume / 1e6).toFixed(1)}M (${relVol}% of avg)`,
       `  Levels: γFlip=${s.gammaFlip ? '$' + s.gammaFlip.toFixed(0) : 'N/A'} CW=${s.callWall ? '$' + s.callWall.toFixed(0) : 'N/A'} PW=${s.putWall ? '$' + s.putWall.toFixed(0) : 'N/A'} MaxPain=$${s.maxPain.toFixed(0)}`,
       `  Top signals: ${s.topSignals.join(' | ') || 'none'}`,
     ];
@@ -344,7 +371,7 @@ Frame your briefing as preparation for the NEXT session, not as live market comm
 
 Your analysis should be direct, opinionated, and actionable — like a trading desk morning note. Lead with the single most important headline. Use specific numbers. Identify the primary edge for ${marketOpen ? 'today' : 'the next session'}.
 ${marketNote}
-CRITICAL: You have second-order Greeks (vanna, charm) in addition to gamma. Use them:
+CRITICAL: You have intraday price action data (open, high, low, volume vs average) and second-order Greeks (vanna, charm) in addition to gamma. Use ALL of them:
 - VANNA: sensitivity of delta to implied vol changes. "Bullish vanna" means a vol drop forces dealers to buy stock. "Bearish vanna" means a vol drop forces dealers to sell.
 - CHARM: delta decay over time. "Bullish charm" means time passing forces dealers to buy. Charm is often the dominant flow on quiet days.
 - When vanna and charm DIVERGE (one bullish, one bearish), that creates conflict in dealer hedging — discuss which dominates and why.
@@ -465,7 +492,7 @@ ${regSHOList.length} securities: ${regSHOList.slice(0, 25).join(', ')}${regSHOLi
 
   // Algorithm-generated trade ideas from the recommendation engine
   const allTrades = stocks
-    .flatMap(s => s.trades.map(t => ({ ...t, ticker: s.symbol, spot: s.price, bias: s.bias, biasScore: s.biasScore, nearestExp: s.nearestExp, nearestDTE: s.nearestDTE, ivRank: s.ivRank, currentIV: s.currentIV, gammaFlip: s.gammaFlip, callWall: s.callWall, putWall: s.putWall })))
+    .flatMap(s => s.trades.map(t => ({ ...t, ticker: s.symbol, spot: s.price, bias: s.bias, biasScore: s.biasScore, nearestExp: s.nearestExp, nearestDTE: s.nearestDTE, weeklyExp: s.weeklyExp, monthlyExp: s.monthlyExp, ivRank: s.ivRank, currentIV: s.currentIV, gammaFlip: s.gammaFlip, callWall: s.callWall, putWall: s.putWall })))
     .sort((a, b) => b.score - a.score);
 
   if (allTrades.length > 0) {
@@ -491,15 +518,17 @@ YOUR TASK — Write the morning briefing. Start with one bold headline sentence 
 
 Then analyze:
 
-1. **GAMMA + VANNA + CHARM REGIME** — What's the gamma regime for SPY/QQQ/IWM? Crucially, analyze the VANNA and CHARM readings: which direction do they push dealer hedging? Do they confirm or contradict the gamma signal? If vanna and charm diverge, explain which dominates in the current vol regime (VIX level). Reference gamma flip levels and what happens if breached.
+1. **INTRADAY PRICE ACTION & VOLUME** — Where is price relative to today's open and range? Is volume running above or below average (use the relative volume % data)? Any key reversals from the high/low? How does today's intraday move compare to the ATR? Are we seeing expansion or contraction? Reference specific OHLV numbers.
 
-2. **INDEX DIVERGENCES** — Are SPY, QQQ, IWM aligned or divergent? What does the split mean? Is this rotation or broad trend? Which index has the cleanest directional setup based on gamma+vanna+charm alignment?
+2. **GAMMA + VANNA + CHARM REGIME** — What's the gamma regime for SPY/QQQ/IWM? Crucially, analyze the VANNA and CHARM readings: which direction do they push dealer hedging? Do they confirm or contradict the gamma signal? If vanna and charm diverge, explain which dominates in the current vol regime (VIX level). Reference gamma flip levels and what happens if breached.
 
-3. **MAGNIFICENT 7 BREAKDOWN** — For each Mag7 stock with notable positioning, state the directional lean and which Greek(s) drive it. Flag any that diverge from their index. Count how many are long vs short — does narrow leadership make QQQ vulnerable?
+3. **INDEX DIVERGENCES** — Are SPY, QQQ, IWM aligned or divergent? What does the split mean? Is this rotation or broad trend? Which index has the cleanest directional setup based on gamma+vanna+charm alignment?
 
-${flowData.flow.tickersScanned > 0 ? '4. **OPTIONS FLOW ANALYSIS** — Analyze the real-time options premium flow. What does the net premium tell us? Which tickers have the most aggressive institutional positioning? Are sweeps/blocks confirming or diverging from dealer gamma positioning? Cross-reference flow direction with GEX regime for each ticker.\n\n' : ''}${swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0 ? '5. **SWAP MATURITIES** — Interpret swap maturities. Extreme clusters create forced dealer rebalancing. Cross-reference with flow alerts: are institutions positioning ahead of maturity unwinds?\n\n' : ''}${regSHOList.length > 0 || shortInterestData.length > 0 ? '6. **SHORT INTEREST / REG SHO** — Notable names with persistent FTDs or high days-to-cover. Cross-reference with options flow: are shorts being squeezed (bullish flow + high SI)?\n\n' : ''}7. **KEY LEVELS** — For SPY specifically: gamma flip, call wall, put wall, max pain. What happens at each level.
+4. **MAGNIFICENT 7 BREAKDOWN** — For each Mag7 stock with notable positioning, state the directional lean and which Greek(s) drive it. Flag any that diverge from their index. Count how many are long vs short — does narrow leadership make QQQ vulnerable?
 
-8. **OPTIONS TRADE IDEAS** — This is critical. Using all available data (dealer Greeks, flow, IV regime, key levels, algorithm trade ideas above), present **3-5 specific, actionable short-term options plays**. For EACH trade, provide ALL of these fields in a structured format:
+${flowData.flow.tickersScanned > 0 ? '5. **OPTIONS FLOW ANALYSIS** — Analyze the real-time options premium flow. What does the net premium tell us? Which tickers have the most aggressive institutional positioning? Are sweeps/blocks confirming or diverging from dealer gamma positioning? Cross-reference flow direction with GEX regime for each ticker.\n\n' : ''}${swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0 ? '6. **SWAP MATURITIES** — Interpret swap maturities. Extreme clusters create forced dealer rebalancing. Cross-reference with flow alerts: are institutions positioning ahead of maturity unwinds?\n\n' : ''}${regSHOList.length > 0 || shortInterestData.length > 0 ? '7. **SHORT INTEREST / REG SHO** — Notable names with persistent FTDs or high days-to-cover. Cross-reference with options flow: are shorts being squeezed (bullish flow + high SI)?\n\n' : ''}8. **KEY LEVELS** — For SPY specifically: gamma flip, call wall, put wall, max pain. What happens at each level.
+
+9. **OPTIONS TRADE IDEAS** — This is critical. Using all available data (dealer Greeks, flow, IV regime, key levels, intraday price action, algorithm trade ideas above), present **3-5 specific, actionable short-term options plays**. For EACH trade, provide ALL of these fields in a structured format:
 
 | Field | Required Detail |
 |-------|----------------|
@@ -521,6 +550,7 @@ ${flowData.flow.tickersScanned > 0 ? '4. **OPTIONS FLOW ANALYSIS** — Analyze t
 4. **Credit spreads**: Short strike should be ~0.5-1 ATR from spot (near a support/resistance level). The premium collected should be 20-40% of the spread width.
 5. **Debit spreads**: Long strike should be ATM or slightly ITM. Short strike should be 1-2 ATR away. The debit paid should be 30-60% of the spread width.
 6. **Position value floor**: Each contract in the position must have a notional value of at least $100 (i.e., option mid price × 100 shares ≥ $100, so mid ≥ $1.00 per leg for single-leg trades, or net spread premium ≥ $0.50).
+7. **Expiration selection**: Credit strategies (iron condors, credit spreads) MUST use 30-45 DTE for meaningful premium — NEVER use weekly expirations for premium-selling strategies (near-expiry OTM options are worth pennies). Debit strategies can use 14-21 DTE. Only event plays (gamma flip straddle, expiration pin) should use weekly/0DTE. State the DTE clearly in your expiration field.
 
 Prioritize trades where multiple signals converge: gamma positioning + flow direction + key level proximity + IV regime. Prefer defined-risk strategies (spreads) over naked options. Reference the algorithm trade ideas data above — use their ATR-derived strikes as the foundation, then adjust based on key levels and flow data.
 
@@ -804,6 +834,7 @@ export async function POST() {
         score: t.score,
         strikes: t.strikes,
         expiration: t.expiration,
+        targetExp: t.targetExp,
         entry: t.entry,
         risk: t.risk,
         reasoning: t.reasoning,
@@ -812,6 +843,8 @@ export async function POST() {
         stopLossPct: t.stopLossPct,
         nearestExp: s.nearestExp,
         nearestDTE: s.nearestDTE,
+        weeklyExp: s.weeklyExp,
+        monthlyExp: s.monthlyExp,
         ivRank: s.ivRank,
         currentIV: s.currentIV,
         gammaFlip: s.gammaFlip,
@@ -833,6 +866,8 @@ export async function POST() {
         spot: scan?.price ?? 0,
         nearestExp: scan?.nearestExp ?? '',
         nearestDTE: scan?.nearestDTE ?? 0,
+        weeklyExp: scan?.weeklyExp,
+        monthlyExp: scan?.monthlyExp,
         gammaFlip: scan?.gammaFlip ?? null,
         callWall: scan?.callWall ?? null,
         putWall: scan?.putWall ?? null,

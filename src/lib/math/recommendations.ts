@@ -28,6 +28,7 @@ export interface TradeIdea {
   confidence: Confidence;
   score: number;
   expiration: string;
+  targetExp: string;         // actual YYYY-MM-DD expiration date (resolved from nearestExp/weeklyExp/monthlyExp)
   strikes: string;
   entry: string;
   risk: string;
@@ -839,6 +840,12 @@ function generateTrades(
   const medDTE = '14-21 DTE';
   const longDTE = '30-45 DTE';
 
+  // Resolve actual expiration dates for each DTE bucket
+  // Fall back through the chain: long → monthly → weekly → nearest
+  const shortExp = input.nearestExp;
+  const medExp = input.weeklyExp || input.nearestExp;
+  const longExp = input.monthlyExp || input.weeklyExp || input.nearestExp;
+
   // ─── HIGH IV: Sell Premium ───
   if (volRegime === 'high') {
     if (bias === 'bullish' || bias === 'neutral') {
@@ -853,6 +860,7 @@ function generateTrades(
         confidence: bias === 'bullish' ? 'high' : 'medium',
         score: bias === 'bullish' ? 80 : 65,
         expiration: longDTE,
+        targetExp: longExp,
         strikes: `${qty}x Sell $${sellStrike} put, buy $${buyStrike} put — ${putWall ? `anchored to put wall support` : `~1 ATR below spot`}`,
         entry: 'Enter on up days when IV is still elevated. Target ~1/3 width of spread in credit.',
         risk: `Max loss $${(maxRiskPer * qty).toFixed(0)} (${qty} × $${maxRiskPer.toFixed(0)}) minus credit received.`,
@@ -881,6 +889,7 @@ function generateTrades(
         confidence: bias === 'bearish' ? 'high' : 'medium',
         score: bias === 'bearish' ? 80 : 65,
         expiration: longDTE,
+        targetExp: longExp,
         strikes: `${qty}x Sell $${sellStrike} call, buy $${buyStrike} call — ${callWall ? `anchored to call wall resistance` : `~1 ATR above spot`}`,
         entry: 'Enter on down days when IV pops. Target ~1/3 width in credit.',
         risk: `Max loss $${(maxRiskPer * qty).toFixed(0)} (${qty} × $${maxRiskPer.toFixed(0)}) minus credit received.`,
@@ -915,6 +924,7 @@ function generateTrades(
         confidence: 'high',
         score: 85,
         expiration: longDTE,
+        targetExp: longExp,
         strikes: `${qty}x Sell $${sellCall}C / $${sellPut}P. Wings ~$${wingWidth} beyond. Range: $${sellPut} - $${sellCall} (${((sellCall - sellPut) / atr14).toFixed(1)} ATR wide).`,
         entry: 'Enter when IV is above 30d MA. Collect both sides of credit.',
         risk: `Max loss $${(maxRiskPer * qty).toFixed(0)} per side (${qty} × $${maxRiskPer.toFixed(0)}). Close at 50% profit. Roll tested side at 2x credit.`,
@@ -948,6 +958,7 @@ function generateTrades(
         confidence: Math.abs(biasScore) > 30 ? 'high' : 'medium',
         score: Math.abs(biasScore) > 30 ? 75 : 60,
         expiration: medDTE,
+        targetExp: medExp,
         strikes: `${qty}x Buy $${buyStrike} call, sell $${targetStrike} call — ${callWall ? `targeting call wall` : `~2 ATR target`}. Width: $${width.toFixed(0)}`,
         entry: 'Enter on pullbacks to support. IV is cheap — time decay less punishing.',
         risk: `Max risk $${(maxRiskPer * qty).toFixed(0)} (${qty} × $${maxRiskPer.toFixed(0)} debit). Take profit at 50-100%.`,
@@ -977,6 +988,7 @@ function generateTrades(
         confidence: Math.abs(biasScore) > 30 ? 'high' : 'medium',
         score: Math.abs(biasScore) > 30 ? 75 : 60,
         expiration: medDTE,
+        targetExp: medExp,
         strikes: `${qty}x Buy $${buyStrike} put, sell $${targetStrike} put — ${putWall ? `targeting put wall` : `~2 ATR target`}. Width: $${width.toFixed(0)}`,
         entry: 'Enter on failed rallies or rejection at resistance.',
         risk: `Max risk $${(maxRiskPer * qty).toFixed(0)} (${qty} × $${maxRiskPer.toFixed(0)} debit). Take profit at 50-100%.`,
@@ -1010,6 +1022,7 @@ function generateTrades(
         confidence: input.ivHvRatio < 0.85 ? 'high' : 'medium',
         score: input.ivHvRatio < 0.85 ? 80 : 60,
         expiration: medDTE,
+        targetExp: medExp,
         strikes: `${qty}x ATM straddle at $${straddleStrike} or strangle $${stranglePut}P / $${strangleCall}C (0.5 ATR wings)`,
         entry: `Enter when IV is near 52w lows. Need ~${movePctNeeded.toFixed(1)}% move to break even (~${(movePctNeeded / atrPercent).toFixed(1)} ATR).`,
         risk: `Max risk $${(maxRiskPer * qty).toFixed(0)} (${qty} × ~$${maxRiskPer.toFixed(0)} premium). Close if IV compresses further. Manage at 21 DTE.`,
@@ -1042,6 +1055,7 @@ function generateTrades(
         confidence: Math.abs(biasScore) > 40 ? 'high' : 'medium',
         score: Math.min(75, 50 + Math.abs(biasScore)),
         expiration: medDTE,
+        targetExp: medExp,
         strikes: `${qty}x Buy $${buyStrike} call, sell $${targetStrike} call — ${callWall ? `call wall target` : '1.5 ATR target'}. Width: $${width.toFixed(0)}`,
         entry: `Enter on pullbacks. Stock's daily range is ~${atrPercent.toFixed(1)}%.`,
         risk: `Max risk $${(maxRiskPer * qty).toFixed(0)} (${qty} × $${maxRiskPer.toFixed(0)} debit). Target 50-100% return.`,
@@ -1070,6 +1084,7 @@ function generateTrades(
         confidence: Math.abs(biasScore) > 40 ? 'high' : 'medium',
         score: Math.min(75, 50 + Math.abs(biasScore)),
         expiration: medDTE,
+        targetExp: medExp,
         strikes: `${qty}x Buy $${buyStrike} put, sell $${targetStrike} put — ${putWall ? `put wall target` : '1.5 ATR target'}. Width: $${width.toFixed(0)}`,
         entry: 'Enter on failed rallies or breakdown below support.',
         risk: `Max risk $${(maxRiskPer * qty).toFixed(0)} (${qty} × $${maxRiskPer.toFixed(0)} debit). Target 50-100% return.`,
@@ -1101,6 +1116,7 @@ function generateTrades(
         confidence: 'medium',
         score: 65,
         expiration: shortDTE,
+        targetExp: shortExp,
         strikes: `${gfQty}x ATM straddle at $${gfStrike} — ${flipDistATR.toFixed(2)} ATR from gamma flip`,
         entry: `Enter when spot is within 0.5 ATR ($${(atr14 * 0.5).toFixed(1)}) of gamma flip. Expect explosive move.`,
         risk: `Max risk ~$${(gfMaxRisk * gfQty).toFixed(0)} (${gfQty} × ~$${gfMaxRisk.toFixed(0)} premium). Short-dated = high theta. Close same/next day.`,
@@ -1135,6 +1151,7 @@ function generateTrades(
         confidence: mpDistATR < 1.5 ? 'medium' : 'low',
         score: mpDistATR < 1.5 ? 60 : 45,
         expiration: shortDTE,
+        targetExp: shortExp,
         strikes: mpDir === 'bullish'
           ? `${mpQty}x Buy $${mpBuyStrike} call, sell $${mpSellStrike} call`
           : `${mpQty}x Buy $${mpBuyStrike} put, sell $${mpSellStrike} put`,
