@@ -11,6 +11,35 @@ type SortKey = 'symbol' | 'biasScore' | 'spotPrice' | 'changePercent' | 'ivRank'
 type SortDir = 'asc' | 'desc';
 type BiasFilter = 'all' | 'bullish' | 'bearish' | 'extreme';
 
+const SCREENER_CACHE_KEY = 'optix-screener-cache';
+
+function loadScreenerCache(): { results: ScreenerResult[]; timestamp: number } | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(SCREENER_CACHE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function saveScreenerCache(results: ScreenerResult[]): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(SCREENER_CACHE_KEY, JSON.stringify({ results, timestamp: Date.now() }));
+  } catch { /* storage full or unavailable */ }
+}
+
+function formatAge(timestamp: number): string {
+  const ms = Date.now() - timestamp;
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h ago`;
+}
+
 export default function ScreenerTab() {
   const { loadSymbol, setActiveTab } = useDashboardStore();
 
@@ -21,15 +50,20 @@ export default function ScreenerTab() {
   const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [biasFilter, setBiasFilter] = useState<BiasFilter>('all');
   const [minScore, setMinScore] = useState(0);
-  const [lastScanTime, setLastScanTime] = useState<string | null>(null);
+  const [scanTimestamp, setScanTimestamp] = useState<number | null>(null);
   const [trackedSymbols, setTrackedSymbols] = useState<Set<string>>(new Set());
   const [includeRetail, setIncludeRetail] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
-  // Load already-tracked symbols on mount
+  // Load cached screener results + tracked symbols on mount
   useState(() => {
     const existing = loadSignals();
     setTrackedSymbols(new Set(existing.map(s => s.symbol)));
+    const cached = loadScreenerCache();
+    if (cached && cached.results.length > 0) {
+      setResults(cached.results);
+      setScanTimestamp(cached.timestamp);
+    }
   });
 
   // Process one SSE stream chunk, accumulating results
@@ -86,7 +120,7 @@ export default function ScreenerTab() {
     }
   }, []);
 
-  const CHUNK_SIZE = 100; // ~100 stocks per request fits within 60s Hobby timeout
+  const CHUNK_SIZE = 50; // ~50 stocks per request reliably fits within 60s Hobby timeout
 
   const startScan = useCallback(async () => {
     if (scanning) {
@@ -126,12 +160,13 @@ export default function ScreenerTab() {
         }
       }
 
-      // Finalize
+      // Finalize and persist
       if (accumulated.length > 0) {
         const sorted = accumulated.sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
         setResults(sorted);
+        saveScreenerCache(sorted);
       }
-      setLastScanTime(new Date().toLocaleString());
+      setScanTimestamp(Date.now());
     } catch (err) {
       if ((err as Error).name === 'AbortError') { /* expected */ }
     } finally {
@@ -367,9 +402,10 @@ export default function ScreenerTab() {
               />
               +Retail
             </label>
-            {lastScanTime && (
-              <span className="text-xs text-text-muted font-mono">
-                Last scan: {lastScanTime}
+            {scanTimestamp && (
+              <span className={`text-xs font-mono ${Date.now() - scanTimestamp > 3600000 ? 'text-yellow-400' : 'text-text-muted'}`}
+                title={new Date(scanTimestamp).toLocaleString()}>
+                Scanned: {formatAge(scanTimestamp)}
               </span>
             )}
             <button

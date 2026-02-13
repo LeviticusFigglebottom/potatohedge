@@ -191,6 +191,17 @@ interface BriefingResponse {
   aiTradeIdeas?: AITradeIdea[];
 }
 
+function formatAge(timestamp: number): string {
+  const ms = Date.now() - timestamp;
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h ago`;
+}
+
 function ChangeChip({ pct }: { pct: number }) {
   const color = pct > 0.3 ? 'text-green-400' : pct < -0.3 ? 'text-red-400' : 'text-text-muted';
   const Icon = pct > 0.3 ? TrendingUp : pct < -0.3 ? TrendingDown : Minus;
@@ -1234,8 +1245,9 @@ export default function BriefingTab() {
             <Newspaper className="w-4 h-4 text-accent-cyan" />
             <span className="panel-title">AI Daily Briefing</span>
             {data && (
-              <span className="text-xs text-text-muted font-mono">
-                {data.stocksScanned} stocks &bull; {new Date(data.timestamp).toLocaleTimeString()}
+              <span className={`text-xs font-mono ${Date.now() - data.timestamp > 3600000 ? 'text-yellow-400' : 'text-text-muted'}`}
+                title={new Date(data.timestamp).toLocaleString()}>
+                {data.stocksScanned} stocks &bull; {formatAge(data.timestamp)}
               </span>
             )}
           </div>

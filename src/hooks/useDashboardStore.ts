@@ -133,6 +133,29 @@ interface DashboardStore {
   runDiagnostics: () => Promise<void>;
 }
 
+// ─── Briefing persistence helpers ─────────────────────────
+const BRIEFING_CACHE_KEY = 'optix-briefing-cache';
+
+function loadBriefingCache(): BriefingCache | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(BRIEFING_CACHE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function saveBriefingCache(data: BriefingCache | null): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (data) {
+      localStorage.setItem(BRIEFING_CACHE_KEY, JSON.stringify(data));
+    } else {
+      localStorage.removeItem(BRIEFING_CACHE_KEY);
+    }
+  } catch { /* storage full or unavailable */ }
+}
+
 const api = async (path: string) => {
   const res = await fetch(path);
   if (!res.ok) {
@@ -159,9 +182,9 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
   metricHistory: [],
   loading: {}, error: null, errors: [], diagnostics: null, lastUpdate: 0,
 
-  // AI-generated content cache — persists across tab switches
-  briefingCache: null,
-  setBriefingCache: (data) => set({ briefingCache: data }),
+  // AI-generated content cache — persists to localStorage across page reloads
+  briefingCache: loadBriefingCache(),
+  setBriefingCache: (data) => { saveBriefingCache(data); set({ briefingCache: data }); },
   aiAnalysisCache: null,
   setAiAnalysisCache: (data) => set({ aiAnalysisCache: data }),
 
