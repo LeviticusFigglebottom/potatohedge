@@ -147,11 +147,25 @@ export function loadTrackedTrades(): TrackedTrade[] {
  * This handles the case where TrackerMonitor didn't run during expiration
  * (e.g., weekend expiration, after-hours, app not loaded).
  */
+const PENDING_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes max for pending trades
+
 function autoExpireStale(trades: TrackedTrade[]): TrackedTrade[] {
   const now = Date.now();
   let changed = false;
   for (const t of trades) {
     if (t.status === 'exited' || t.status === 'expired') continue;
+
+    // Expire pending trades stuck for >30 minutes without ever getting priced
+    if (t.status === 'pending' && now - t.trackedAt > PENDING_TIMEOUT_MS) {
+      t.status = 'expired';
+      t.exitedAt = now;
+      t.exitReason = 'failed-entry';
+      t.outcome = null;
+      t.notes = (t.notes ? t.notes + ' | ' : '') + 'Auto-expired: unable to get entry prices within 30 minutes';
+      changed = true;
+      continue;
+    }
+
     const expDate = new Date(t.expirationDate + 'T16:00:00-05:00').getTime();
     // Auto-expire if more than 1 hour past expiration
     if (now > expDate + 3600000) {
@@ -442,10 +456,13 @@ export function evaluateTrade(
 
     const pricedCount = entryLegs.filter(l => l.entryMid > 0).length;
     const totalLegs = entryLegs.length;
+    const pendingMinutes = (now - trade.trackedAt) / 60000;
 
     // Enter if MOST legs have prices (≥50%) — don't wait forever for illiquid legs.
     // For single-leg trades, still require the leg to be priced.
-    const minRequired = totalLegs <= 2 ? totalLegs : Math.ceil(totalLegs * 0.5);
+    // After 15 min pending, relax to just 1 priced leg to avoid getting stuck.
+    const normalMin = totalLegs <= 2 ? totalLegs : Math.ceil(totalLegs * 0.5);
+    const minRequired = pendingMinutes > 15 ? Math.min(normalMin, 1) : normalMin;
     if (pricedCount < minRequired) {
       return null;
     }

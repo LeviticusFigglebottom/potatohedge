@@ -7,6 +7,17 @@ import {
   Activity, Trash2, ChevronDown, ChevronUp, Eraser,
 } from 'lucide-react';
 
+/** Safely extract an error message from a fetch Response that may not be JSON. */
+async function safeErrorMsg(res: Response, fallback: string): Promise<string> {
+  try {
+    const data = await res.json();
+    return data?.error || fallback;
+  } catch {
+    const text = await res.text().catch(() => '');
+    return text.slice(0, 200) || `${fallback} (HTTP ${res.status})`;
+  }
+}
+
 interface ParsedOCC {
   underlying: string;
   expDate: string;
@@ -516,8 +527,8 @@ export default function PaperTradingTab() {
         return;
       }
 
-      if (!accRes.ok) throw new Error((await accRes.json()).error || 'Account fetch failed');
-      if (!ordRes.ok) throw new Error((await ordRes.json()).error || 'Orders fetch failed');
+      if (!accRes.ok) throw new Error(await safeErrorMsg(accRes, 'Account fetch failed'));
+      if (!ordRes.ok) throw new Error(await safeErrorMsg(ordRes, 'Orders fetch failed'));
 
       const accData = await accRes.json();
       setAccount(accData);
@@ -546,7 +557,8 @@ export default function PaperTradingTab() {
         body: JSON.stringify(trade),
       });
 
-      const data = await res.json();
+      let data;
+      try { data = await res.json(); } catch { throw new Error(await safeErrorMsg(res, 'Trade failed')); }
       if (!res.ok) throw new Error(data.error || 'Trade failed');
 
       // Save exit rules if target/stop were specified
@@ -575,7 +587,7 @@ export default function PaperTradingTab() {
   const handleCancel = async (orderId: number) => {
     try {
       const res = await fetch(`/api/paper/orders?id=${orderId}`, { method: 'DELETE' });
-      if (!res.ok) throw new Error((await res.json()).error || 'Cancel failed');
+      if (!res.ok) throw new Error(await safeErrorMsg(res, 'Cancel failed'));
       setTimeout(refresh, 500);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Cancel failed');
@@ -589,7 +601,8 @@ export default function PaperTradingTab() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol: position.symbol, quantity: position.quantity }),
       });
-      const data = await res.json();
+      let data;
+      try { data = await res.json(); } catch { throw new Error(await safeErrorMsg(res, 'Close failed')); }
       if (!res.ok) throw new Error(data.error || 'Close failed');
       setTradeStatus(`Closing order placed: #${data.orderId}`);
       setTimeout(refresh, 1000);
