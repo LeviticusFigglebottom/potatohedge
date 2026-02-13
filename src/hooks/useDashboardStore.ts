@@ -47,7 +47,7 @@ export interface SnapshotData {
   snapshotCount: number;
 }
 
-export type TabId = 'overview' | 'chain' | 'dealer' | 'volatility' | 'analytics' | 'screener' | 'institutional' | 'briefing' | 'paper' | 'tracker' | 'diagnostics';
+export type TabId = 'overview' | 'chain' | 'dealer' | 'volatility' | 'analytics' | 'screener' | 'institutional' | 'briefing' | 'paper' | 'tracker' | 'signals' | 'diagnostics';
 
 // ─── AI-generated content cache (survives tab switches) ───
 

@@ -3,8 +3,9 @@
 import { useState, useCallback, useRef } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import { STOCK_UNIVERSE } from '@/lib/stockUniverse';
-import { Radar, Download, ArrowUpDown, Filter, Loader2, AlertTriangle, TrendingUp, TrendingDown, Minus } from 'lucide-react';
+import { Radar, Download, ArrowUpDown, Filter, Loader2, AlertTriangle, TrendingUp, TrendingDown, Minus, Crosshair, CheckCircle2 } from 'lucide-react';
 import type { ScreenerResult } from '@/app/api/market/screener/route';
+import { addSignal, loadSignals } from '@/lib/signalTracker';
 
 type SortKey = 'symbol' | 'biasScore' | 'spotPrice' | 'changePercent' | 'ivRank' | 'currentIV' | 'volumePCR';
 type SortDir = 'asc' | 'desc';
@@ -21,7 +22,14 @@ export default function ScreenerTab() {
   const [biasFilter, setBiasFilter] = useState<BiasFilter>('all');
   const [minScore, setMinScore] = useState(0);
   const [lastScanTime, setLastScanTime] = useState<string | null>(null);
+  const [trackedSymbols, setTrackedSymbols] = useState<Set<string>>(new Set());
   const abortRef = useRef<AbortController | null>(null);
+
+  // Load already-tracked symbols on mount
+  useState(() => {
+    const existing = loadSignals().filter(s => !s.closed);
+    setTrackedSymbols(new Set(existing.map(s => s.symbol)));
+  });
 
   const startScan = useCallback(async () => {
     if (scanning) {
@@ -103,6 +111,25 @@ export default function ScreenerTab() {
     loadSymbol(symbol);
     setActiveTab('overview');
   }, [loadSymbol, setActiveTab]);
+
+  const handleTrackSignal = useCallback((r: ScreenerResult, e: React.MouseEvent) => {
+    e.stopPropagation();
+    addSignal({
+      symbol: r.symbol,
+      entryPrice: r.spotPrice,
+      bias: r.overallBias,
+      biasScore: r.biasScore,
+      gammaRegime: r.gammaRegime,
+      volRegime: r.volRegime,
+      ivRank: r.ivRank,
+      topSignal: r.topSignal,
+      gammaFlip: r.gammaFlip,
+      callWall: r.callWall,
+      putWall: r.putWall,
+      source: 'screener',
+    });
+    setTrackedSymbols(prev => new Set(prev).add(r.symbol));
+  }, []);
 
   // Sort + filter
   const filteredResults = results
@@ -341,6 +368,7 @@ export default function ScreenerTab() {
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Key Levels</th>
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Swaps</th>
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">SI/DTC</th>
+                  <th className="px-3 py-2 text-center text-xs font-mono text-text-muted w-16">Track</th>
                 </tr>
               </thead>
               <tbody>
@@ -457,6 +485,19 @@ export default function ScreenerTab() {
                           </span>
                         )}
                       </div>
+                    </td>
+                    <td className="px-3 py-2 text-center">
+                      {trackedSymbols.has(r.symbol) ? (
+                        <span className="text-accent-cyan"><CheckCircle2 className="w-3.5 h-3.5 inline" /></span>
+                      ) : (
+                        <button
+                          onClick={(e) => handleTrackSignal(r, e)}
+                          title={`Track ${r.symbol} signal`}
+                          className="p-1 rounded hover:bg-accent-cyan/15 text-text-muted hover:text-accent-cyan transition-colors"
+                        >
+                          <Crosshair className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))}

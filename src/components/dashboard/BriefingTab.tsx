@@ -4,9 +4,10 @@ import { useState, useCallback } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import {
   Newspaper, Loader2, AlertTriangle, TrendingUp, TrendingDown, Minus,
-  Wallet, ChevronDown, ChevronUp, CheckCircle2, Sparkles, Eye,
+  Wallet, ChevronDown, ChevronUp, CheckCircle2, Sparkles, Eye, Crosshair,
 } from 'lucide-react';
 import { buildTrackedTradeFromAlgo, addTrackedTrade, sizePosition, fetchEntryPrices, fillEntryPrices, calculatePositionValue, validateAndClampStrikes, type TrackedLeg } from '@/lib/tradeTracker';
+import { addSignal, loadSignals } from '@/lib/signalTracker';
 
 // ─── Trade rule storage (shared with PaperTradingTab + PaperMonitor) ───
 interface TradeRule {
@@ -1118,6 +1119,28 @@ export default function BriefingTab() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [phase, setPhase] = useState('');
+  const [trackedSignals, setTrackedSignals] = useState<Set<string>>(() => {
+    const existing = loadSignals().filter(s => !s.closed);
+    return new Set(existing.map(s => s.symbol));
+  });
+
+  const handleTrackSignal = useCallback((idx: { symbol: string; price: number; bias: string; biasScore: number; gammaRegime: string; volRegime: string; ivRank: number }) => {
+    addSignal({
+      symbol: idx.symbol,
+      entryPrice: idx.price,
+      bias: idx.bias as 'bullish' | 'bearish' | 'neutral',
+      biasScore: idx.biasScore,
+      gammaRegime: idx.gammaRegime,
+      volRegime: idx.volRegime,
+      ivRank: idx.ivRank,
+      topSignal: '',
+      gammaFlip: null,
+      callWall: null,
+      putWall: null,
+      source: 'briefing',
+    });
+    setTrackedSignals(prev => new Set(prev).add(idx.symbol));
+  }, []);
 
   const data = briefingCache as BriefingResponse | null;
 
@@ -1242,13 +1265,26 @@ export default function BriefingTab() {
                   <div key={idx.symbol} className="bg-bg-secondary px-4 py-3">
                     <div className="flex items-center justify-between mb-1">
                       <span className="text-xs font-mono text-text-muted">{idx.symbol}</span>
-                      <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
-                        idx.bias === 'bullish' ? 'bg-green-500/15 text-green-400' :
-                        idx.bias === 'bearish' ? 'bg-red-500/15 text-red-400' :
-                        'bg-bg-tertiary text-text-muted'
-                      }`}>
-                        {idx.biasScore > 0 ? '+' : ''}{idx.biasScore}
-                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
+                          idx.bias === 'bullish' ? 'bg-green-500/15 text-green-400' :
+                          idx.bias === 'bearish' ? 'bg-red-500/15 text-red-400' :
+                          'bg-bg-tertiary text-text-muted'
+                        }`}>
+                          {idx.biasScore > 0 ? '+' : ''}{idx.biasScore}
+                        </span>
+                        {trackedSignals.has(idx.symbol) ? (
+                          <Crosshair className="w-3 h-3 text-accent-cyan" />
+                        ) : (
+                          <button
+                            onClick={() => handleTrackSignal(idx)}
+                            title={`Track ${idx.symbol} signal`}
+                            className="p-0.5 rounded hover:bg-accent-cyan/15 text-text-muted/40 hover:text-accent-cyan transition-colors"
+                          >
+                            <Crosshair className="w-3 h-3" />
+                          </button>
+                        )}
+                      </div>
                     </div>
                     <div className="text-sm font-mono font-semibold text-text-primary">${idx.price.toFixed(2)}</div>
                     <div className="flex items-center justify-between mt-0.5">

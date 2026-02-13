@@ -20,6 +20,7 @@ import BriefingTab from '@/components/dashboard/BriefingTab';
 import InstitutionalTab from '@/components/dashboard/InstitutionalTab';
 import PaperTradingTab from '@/components/dashboard/PaperTradingTab';
 import TrackedTradesTab from '@/components/dashboard/TrackedTradesTab';
+import SignalTrackerTab from '@/components/dashboard/SignalTrackerTab';
 import DiagnosticsTab from '@/components/dashboard/DiagnosticsTab';
 import PaperMonitor from '@/components/dashboard/PaperMonitor';
 import TrackerMonitor from '@/components/dashboard/TrackerMonitor';
@@ -141,6 +142,7 @@ export default function DashboardPage() {
           {activeTab === 'institutional' && <InstitutionalTab />}
           {activeTab === 'briefing' && <BriefingTab />}
           {activeTab === 'tracker' && <TrackedTradesTab />}
+          {activeTab === 'signals' && <SignalTrackerTab />}
           {activeTab === 'paper' && <PaperTradingTab />}
           {activeTab === 'diagnostics' && <DiagnosticsTab />}
           {activeTab === 'chain' && <ChainTab />}
