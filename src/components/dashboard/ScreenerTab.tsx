@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useRef } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
-import { STOCK_UNIVERSE, getTop500Symbols } from '@/lib/stockUniverse';
+import { STOCK_UNIVERSE, getTop500Symbols, getUniverseSymbols } from '@/lib/stockUniverse';
 import { Radar, Download, ArrowUpDown, Filter, Loader2, AlertTriangle, TrendingUp, TrendingDown, Minus, Crosshair, CheckCircle2, ListChecks } from 'lucide-react';
 import type { ScreenerResult } from '@/app/api/market/screener/route';
 import { addSignal, loadSignals } from '@/lib/signalTracker';
@@ -32,9 +32,64 @@ export default function ScreenerTab() {
     setTrackedSymbols(new Set(existing.map(s => s.symbol)));
   });
 
+  // Process one SSE stream chunk, accumulating results
+  const processStream = useCallback(async (
+    res: Response,
+    accumulated: ScreenerResult[],
+    globalOffset: number,
+    globalTotal: number,
+    signal: AbortSignal,
+  ) => {
+    if (!res.body) return;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      if (signal.aborted) { reader.cancel(); break; }
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const data = JSON.parse(line.slice(6));
+
+          if (data.type === 'progress') {
+            setProgress({
+              completed: globalOffset + data.completed,
+              total: globalTotal,
+              current: data.current,
+            });
+            if (data.result && data.result.symbol) {
+              accumulated.push(data.result as ScreenerResult);
+              // Live-update displayed results every 10 stocks
+              if (accumulated.length % 10 === 0) {
+                const sorted = [...accumulated].sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
+                setResults(sorted);
+              }
+            }
+          } else if (data.type === 'done' && data.results) {
+            // Server sent final sorted results for this chunk — merge any we missed
+            for (const r of data.results as ScreenerResult[]) {
+              if (!accumulated.some(a => a.symbol === r.symbol)) {
+                accumulated.push(r);
+              }
+            }
+          }
+        } catch { /* skip malformed events */ }
+      }
+    }
+  }, []);
+
+  const CHUNK_SIZE = 100; // ~100 stocks per request fits within 60s Hobby timeout
+
   const startScan = useCallback(async () => {
     if (scanning) {
-      // Abort current scan
       abortRef.current?.abort();
       setScanning(false);
       return;
@@ -42,72 +97,47 @@ export default function ScreenerTab() {
 
     setScanning(true);
     setResults([]);
-    setProgress({ completed: 0, total: 0, current: '' });
 
     const controller = new AbortController();
     abortRef.current = controller;
 
+    const allSymbols = includeRetail ? getUniverseSymbols() : getTop500Symbols();
+    setProgress({ completed: 0, total: allSymbols.length, current: '' });
+
+    const accumulated: ScreenerResult[] = [];
+
     try {
-      const scanUrl = includeRetail ? '/api/market/screener?tier=all' : '/api/market/screener';
-      const res = await fetch(scanUrl, { signal: controller.signal });
-      if (!res.ok || !res.body) throw new Error('Screener API error');
+      // Split into chunks that each fit within the 60s serverless timeout
+      for (let i = 0; i < allSymbols.length; i += CHUNK_SIZE) {
+        if (controller.signal.aborted) break;
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      // Accumulate results from progress events so partial scans still
-      // show data even if the serverless function times out before 'done'
-      const accumulated: ScreenerResult[] = [];
-      let gotDone = false;
+        const chunk = allSymbols.slice(i, i + CHUNK_SIZE);
+        const scanUrl = `/api/market/screener?symbols=${chunk.join(',')}`;
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
+        try {
+          const res = await fetch(scanUrl, { signal: controller.signal });
+          if (!res.ok || !res.body) continue;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          try {
-            const data = JSON.parse(line.slice(6));
-
-            if (data.type === 'start') {
-              setProgress(p => ({ ...p, total: data.total }));
-            } else if (data.type === 'progress') {
-              setProgress({ completed: data.completed, total: data.total, current: data.current });
-              // Accumulate full results as they stream in
-              if (data.result && data.result.symbol) {
-                accumulated.push(data.result as ScreenerResult);
-                // Update displayed results every 10 stocks so user sees live progress
-                if (accumulated.length % 10 === 0) {
-                  const sorted = [...accumulated].sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
-                  setResults(sorted);
-                }
-              }
-            } else if (data.type === 'done') {
-              // Final sorted results from server (if we get here)
-              gotDone = true;
-              setResults(data.results);
-              setLastScanTime(new Date().toLocaleString());
-            }
-          } catch { /* skip malformed events */ }
+          await processStream(res, accumulated, i, allSymbols.length, controller.signal);
+        } catch (err) {
+          if ((err as Error).name === 'AbortError') break;
+          // If a chunk fails (timeout etc), continue with next chunk
+          console.warn(`Screener chunk ${i}-${i + chunk.length} failed, continuing...`);
         }
       }
 
-      // If stream ended without 'done' (serverless timeout), finalize accumulated results
-      if (!gotDone && accumulated.length > 0) {
+      // Finalize
+      if (accumulated.length > 0) {
         const sorted = accumulated.sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
         setResults(sorted);
-        setLastScanTime(`${new Date().toLocaleString()} (partial: ${accumulated.length} stocks)`);
       }
+      setLastScanTime(new Date().toLocaleString());
     } catch (err) {
       if ((err as Error).name === 'AbortError') { /* expected */ }
     } finally {
       setScanning(false);
     }
-  }, [scanning, includeRetail]);
+  }, [scanning, includeRetail, processStream]);
 
   const navigateToStock = useCallback((symbol: string) => {
     loadSymbol(symbol);
@@ -183,7 +213,8 @@ export default function ScreenerTab() {
   };
 
   const handleTrackAll = useCallback(async () => {
-    const untracked = filteredResults.filter(r => !trackedSymbols.has(r.symbol));
+    // Only track high-conviction signals: |score| >= 50
+    const untracked = filteredResults.filter(r => !trackedSymbols.has(r.symbol) && Math.abs(r.biasScore) >= 50);
     if (untracked.length === 0) return;
 
     setTrackingAll(true);
@@ -429,11 +460,12 @@ export default function ScreenerTab() {
 
             <button
               onClick={handleTrackAll}
-              disabled={trackingAll || filteredResults.every(r => trackedSymbols.has(r.symbol))}
+              disabled={trackingAll || filteredResults.filter(r => !trackedSymbols.has(r.symbol) && Math.abs(r.biasScore) >= 50).length === 0}
               className="px-3 py-1.5 rounded-md text-xs font-mono bg-accent-cyan/10 border border-accent-cyan/20 text-accent-cyan hover:bg-accent-cyan/20 transition-all flex items-center gap-1.5 disabled:opacity-40"
+              title="Track all stocks with |Score| >= 50"
             >
               <ListChecks className="w-3.5 h-3.5" />
-              {trackingAll ? 'Tracking...' : `Track All (${filteredResults.filter(r => !trackedSymbols.has(r.symbol)).length})`}
+              {trackingAll ? 'Tracking...' : `Track |50|+ (${filteredResults.filter(r => !trackedSymbols.has(r.symbol) && Math.abs(r.biasScore) >= 50).length})`}
             </button>
             <button
               onClick={exportCSV}
@@ -629,7 +661,7 @@ export default function ScreenerTab() {
               Start Full Scan
             </button>
             <p className="text-xs text-text-muted/40 mt-3 font-mono">
-              Takes ~2-4 minutes depending on API response times
+              Takes ~3-5 minutes — scans in chunks to avoid serverless timeouts
             </p>
           </div>
         </div>
