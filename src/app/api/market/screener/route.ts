@@ -30,7 +30,7 @@ import {
   computeStockProfile,
 } from '@/lib/math/analytics';
 import { generateRecommendations, type RecommendationInput } from '@/lib/math/recommendations';
-import { getUniverseSymbols } from '@/lib/stockUniverse';
+import { getUniverseSymbols, getTop500Symbols } from '@/lib/stockUniverse';
 import type { EquityBar } from '@/lib/providers/equityBars';
 import { fetchSwapData, type SwapData } from '@/lib/providers/dtcc';
 import { fetchRegSHOThreshold, fetchShortInterest, type ShortInterestData } from '@/lib/providers/finra';
@@ -335,9 +335,10 @@ export async function GET(request: NextRequest) {
   const symbolsParam = request.nextUrl.searchParams.get('symbols');
   const minScore = parseInt(request.nextUrl.searchParams.get('minScore') || '0');
 
+  const tierParam = request.nextUrl.searchParams.get('tier');
   const symbols = symbolsParam
     ? symbolsParam.split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
-    : getUniverseSymbols();
+    : tierParam === 'all' ? getUniverseSymbols() : getTop500Symbols();
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({

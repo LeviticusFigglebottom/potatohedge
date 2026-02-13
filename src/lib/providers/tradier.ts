@@ -58,6 +58,48 @@ export async function getQuote(symbol: string): Promise<Quote> {
   };
 }
 
+// ─── Multi-Quote (batch) ──────────────────────────────────────────
+
+export async function getQuotes(symbols: string[]): Promise<Quote[]> {
+  if (symbols.length === 0) return [];
+  if (symbols.length === 1) return [await getQuote(symbols[0])];
+
+  const token = process.env.TRADIER_API_KEY!;
+  const res = await fetch(
+    `${getBaseUrl()}/markets/quotes?symbols=${encodeURIComponent(symbols.join(','))}&greeks=false`,
+    { headers: getHeaders(token), next: { revalidate: 5 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) }
+  );
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Tradier quotes error: ${res.status} ${body.slice(0, 200)}`);
+  }
+  const data = await res.json();
+
+  const q = data.quotes?.quote;
+  if (!q) return [];
+
+  const quotes = Array.isArray(q) ? q : [q];
+  return quotes.map((quote: Record<string, unknown>) => ({
+    symbol: quote.symbol as string,
+    last: (quote.last as number) ?? (quote.close as number) ?? 0,
+    change: (quote.change as number) ?? 0,
+    changePct: (quote.change_percentage as number) ?? 0,
+    open: (quote.open as number) ?? 0,
+    high: (quote.high as number) ?? 0,
+    low: (quote.low as number) ?? 0,
+    close: (quote.close as number) ?? 0,
+    prevClose: (quote.prevclose as number) ?? 0,
+    volume: (quote.volume as number) ?? 0,
+    avgVolume: (quote.average_volume as number) ?? 0,
+    bid: (quote.bid as number) ?? 0,
+    ask: (quote.ask as number) ?? 0,
+    bidSize: (quote.bidsize as number) ?? 0,
+    askSize: (quote.asksize as number) ?? 0,
+    timestamp: Date.now(),
+  }));
+}
+
 // ─── History ───────────────────────────────────────────────────────
 
 const INTERVAL_MAP: Record<Interval, { interval: string; filter?: string }> = {

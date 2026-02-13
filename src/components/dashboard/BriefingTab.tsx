@@ -1124,10 +1124,20 @@ export default function BriefingTab() {
     return new Set(existing.map(s => s.symbol));
   });
 
-  const handleTrackSignal = useCallback((idx: { symbol: string; price: number; bias: string; biasScore: number; gammaRegime: string; volRegime: string; ivRank: number }) => {
+  const handleTrackSignal = useCallback(async (idx: { symbol: string; price: number; bias: string; biasScore: number; gammaRegime: string; volRegime: string; ivRank: number }) => {
+    // Fetch fresh quote so entry price is current, not stale briefing cache
+    let entryPrice = idx.price;
+    try {
+      const res = await fetch(`/api/market/quote?symbol=${idx.symbol}`, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const q = await res.json();
+        if (q.last > 0) entryPrice = q.last;
+      }
+    } catch { /* fall back to cached briefing price */ }
+
     addSignal({
       symbol: idx.symbol,
-      entryPrice: idx.price,
+      entryPrice,
       bias: idx.bias as 'bullish' | 'bearish' | 'neutral',
       biasScore: idx.biasScore,
       gammaRegime: idx.gammaRegime,

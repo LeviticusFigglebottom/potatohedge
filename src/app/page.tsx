@@ -25,7 +25,8 @@ import DiagnosticsTab from '@/components/dashboard/DiagnosticsTab';
 import PaperMonitor from '@/components/dashboard/PaperMonitor';
 import TrackerMonitor from '@/components/dashboard/TrackerMonitor';
 import CorrelationPanel from '@/components/dashboard/CorrelationPanel';
-import { Activity, Zap, AlertTriangle, X } from 'lucide-react';
+import { Activity, Zap, AlertTriangle, X, Crosshair, CheckCircle2 } from 'lucide-react';
+import { addSignal, loadSignals } from '@/lib/signalTracker';
 
 function ErrorBanner() {
   const { errors, diagnostics } = useDashboardStore();
@@ -65,9 +66,62 @@ function ErrorBanner() {
   );
 }
 
+function SignalTrackButton() {
+  const { symbol, quote, recommendations, snapshot, multiGEX } = useDashboardStore();
+  const [tracked, setTracked] = useState(false);
+
+  // Check on mount / symbol change
+  useEffect(() => {
+    const existing = loadSignals().filter(s => !s.closed);
+    setTracked(existing.some(s => s.symbol === symbol));
+  }, [symbol]);
+
+  const handleTrack = async () => {
+    if (tracked || !quote) return;
+    const recs = recommendations;
+    const snap = snapshot;
+    const gex = multiGEX;
+
+    addSignal({
+      symbol,
+      entryPrice: quote.last,
+      bias: (recs?.overallBias || 'neutral') as 'bullish' | 'bearish' | 'neutral',
+      biasScore: recs?.biasScore || 0,
+      gammaRegime: recs?.gammaRegime || 'neutral',
+      volRegime: recs?.volRegime || 'mid',
+      ivRank: snap?.iv?.ivRank || 0,
+      topSignal: recs?.signals?.[0]?.name || '',
+      gammaFlip: gex?.aggregated?.gammaFlip || null,
+      callWall: gex?.aggregated?.callWall || null,
+      putWall: gex?.aggregated?.putWall || null,
+      source: 'manual',
+    });
+    setTracked(true);
+  };
+
+  return (
+    <button
+      onClick={handleTrack}
+      disabled={tracked || !quote}
+      title={tracked ? `${symbol} already tracked` : `Track ${symbol} signal at current price`}
+      className={`px-3 py-1.5 rounded-md text-xs font-mono border transition-all flex items-center gap-1.5 ${
+        tracked
+          ? 'bg-accent-cyan/10 border-accent-cyan/20 text-accent-cyan cursor-default'
+          : 'bg-bg-tertiary border-border/30 text-text-secondary hover:border-accent-cyan/30 hover:text-accent-cyan'
+      } disabled:opacity-50`}
+    >
+      {tracked ? <CheckCircle2 className="w-3.5 h-3.5" /> : <Crosshair className="w-3.5 h-3.5" />}
+      {tracked ? 'Signal Tracked' : 'Track Signal'}
+    </button>
+  );
+}
+
 function OverviewTab() {
   return (
     <div className="space-y-4 animate-fade-in">
+      <div className="flex items-center justify-end">
+        <SignalTrackButton />
+      </div>
       <AnalyticsCards />
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="lg:col-span-2 min-h-[400px]">

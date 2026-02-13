@@ -55,27 +55,25 @@ export default function SignalTrackerTab() {
 
     setRefreshing(true);
     try {
-      // Fetch current quotes for all tracked symbols
       const symbols = [...new Set(open.map(s => s.symbol))];
       const updates: Record<string, number> = {};
 
-      // Batch fetch quotes (max 20 symbols per request to Tradier)
-      for (let i = 0; i < symbols.length; i += 20) {
-        const batch = symbols.slice(i, i + 20);
-        const res = await fetch(`/api/market/quote?symbol=${batch.join(',')}`, {
-          signal: AbortSignal.timeout(10000),
-        });
-        if (res.ok) {
-          const data = await res.json();
-          // Handle single vs array response
-          if (Array.isArray(data)) {
-            for (const q of data) {
-              if (q.symbol && q.last > 0) updates[q.symbol] = q.last;
+      // Batch fetch quotes via multi-quote endpoint (max 50 per request)
+      for (let i = 0; i < symbols.length; i += 50) {
+        const batch = symbols.slice(i, i + 50);
+        try {
+          const res = await fetch(`/api/market/quotes?symbols=${batch.join(',')}`, {
+            signal: AbortSignal.timeout(10000),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (Array.isArray(data)) {
+              for (const q of data) {
+                if (q.symbol && q.last > 0) updates[q.symbol] = q.last;
+              }
             }
-          } else if (data.symbol && data.last > 0) {
-            updates[data.symbol] = data.last;
           }
-        }
+        } catch { /* skip batch on error */ }
       }
 
       if (Object.keys(updates).length > 0) {

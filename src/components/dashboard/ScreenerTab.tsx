@@ -2,8 +2,8 @@
 
 import { useState, useCallback, useRef } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
-import { STOCK_UNIVERSE } from '@/lib/stockUniverse';
-import { Radar, Download, ArrowUpDown, Filter, Loader2, AlertTriangle, TrendingUp, TrendingDown, Minus, Crosshair, CheckCircle2 } from 'lucide-react';
+import { STOCK_UNIVERSE, getTop500Symbols } from '@/lib/stockUniverse';
+import { Radar, Download, ArrowUpDown, Filter, Loader2, AlertTriangle, TrendingUp, TrendingDown, Minus, Crosshair, CheckCircle2, ListChecks } from 'lucide-react';
 import type { ScreenerResult } from '@/app/api/market/screener/route';
 import { addSignal, loadSignals } from '@/lib/signalTracker';
 
@@ -23,6 +23,7 @@ export default function ScreenerTab() {
   const [minScore, setMinScore] = useState(0);
   const [lastScanTime, setLastScanTime] = useState<string | null>(null);
   const [trackedSymbols, setTrackedSymbols] = useState<Set<string>>(new Set());
+  const [includeRetail, setIncludeRetail] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
   // Load already-tracked symbols on mount
@@ -47,7 +48,8 @@ export default function ScreenerTab() {
     abortRef.current = controller;
 
     try {
-      const res = await fetch('/api/market/screener', { signal: controller.signal });
+      const scanUrl = includeRetail ? '/api/market/screener?tier=all' : '/api/market/screener';
+      const res = await fetch(scanUrl, { signal: controller.signal });
       if (!res.ok || !res.body) throw new Error('Screener API error');
 
       const reader = res.body.getReader();
@@ -105,18 +107,28 @@ export default function ScreenerTab() {
     } finally {
       setScanning(false);
     }
-  }, [scanning]);
+  }, [scanning, includeRetail]);
 
   const navigateToStock = useCallback((symbol: string) => {
     loadSymbol(symbol);
     setActiveTab('overview');
   }, [loadSymbol, setActiveTab]);
 
-  const handleTrackSignal = useCallback((r: ScreenerResult, e: React.MouseEvent) => {
+  const handleTrackSignal = useCallback(async (r: ScreenerResult, e: React.MouseEvent) => {
     e.stopPropagation();
+    // Fetch fresh quote so entry price is current, not stale scan data
+    let entryPrice = r.spotPrice;
+    try {
+      const res = await fetch(`/api/market/quote?symbol=${r.symbol}`, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const q = await res.json();
+        if (q.last > 0) entryPrice = q.last;
+      }
+    } catch { /* fall back to scan price */ }
+
     addSignal({
       symbol: r.symbol,
-      entryPrice: r.spotPrice,
+      entryPrice,
       bias: r.overallBias,
       biasScore: r.biasScore,
       gammaRegime: r.gammaRegime,
@@ -130,6 +142,8 @@ export default function ScreenerTab() {
     });
     setTrackedSymbols(prev => new Set(prev).add(r.symbol));
   }, []);
+
+  const [trackingAll, setTrackingAll] = useState(false);
 
   // Sort + filter
   const filteredResults = results
@@ -162,6 +176,53 @@ export default function ScreenerTab() {
       setSortDir('desc');
     }
   };
+
+  const handleTrackAll = useCallback(async () => {
+    const untracked = filteredResults.filter(r => !trackedSymbols.has(r.symbol));
+    if (untracked.length === 0) return;
+
+    setTrackingAll(true);
+    try {
+      // Batch-fetch fresh quotes for all untracked symbols
+      const symbols = untracked.map(r => r.symbol);
+      const freshPrices: Record<string, number> = {};
+      try {
+        const res = await fetch(`/api/market/quotes?symbols=${symbols.join(',')}`, {
+          signal: AbortSignal.timeout(10000),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data)) {
+            for (const q of data) {
+              if (q.symbol && q.last > 0) freshPrices[q.symbol] = q.last;
+            }
+          }
+        }
+      } catch { /* use scan prices as fallback */ }
+
+      const newTracked = new Set(trackedSymbols);
+      for (const r of untracked) {
+        addSignal({
+          symbol: r.symbol,
+          entryPrice: freshPrices[r.symbol] || r.spotPrice,
+          bias: r.overallBias,
+          biasScore: r.biasScore,
+          gammaRegime: r.gammaRegime,
+          volRegime: r.volRegime,
+          ivRank: r.ivRank,
+          topSignal: r.topSignal,
+          gammaFlip: r.gammaFlip,
+          callWall: r.callWall,
+          putWall: r.putWall,
+          source: 'screener',
+        });
+        newTracked.add(r.symbol);
+      }
+      setTrackedSymbols(newTracked);
+    } finally {
+      setTrackingAll(false);
+    }
+  }, [filteredResults, trackedSymbols]);
 
   const exportCSV = useCallback(() => {
     if (filteredResults.length === 0) return;
@@ -241,10 +302,20 @@ export default function ScreenerTab() {
             <Radar className="w-4 h-4 text-accent-cyan" />
             <span className="panel-title">Market Screener</span>
             <span className="text-xs text-text-muted font-mono">
-              {STOCK_UNIVERSE.length} stocks
+              {includeRetail ? STOCK_UNIVERSE.length : getTop500Symbols().length} stocks
             </span>
           </div>
           <div className="flex items-center gap-3">
+            <label className="flex items-center gap-1.5 text-xs font-mono text-text-muted cursor-pointer select-none" title="Include smaller-cap retail favorites (adds ~50 stocks)">
+              <input
+                type="checkbox"
+                checked={includeRetail}
+                onChange={(e) => setIncludeRetail(e.target.checked)}
+                disabled={scanning}
+                className="accent-accent-cyan"
+              />
+              +Retail
+            </label>
             {lastScanTime && (
               <span className="text-xs text-text-muted font-mono">
                 Last scan: {lastScanTime}
@@ -336,6 +407,14 @@ export default function ScreenerTab() {
               {filteredResults.length}/{results.length} shown
             </span>
 
+            <button
+              onClick={handleTrackAll}
+              disabled={trackingAll || filteredResults.every(r => trackedSymbols.has(r.symbol))}
+              className="px-3 py-1.5 rounded-md text-xs font-mono bg-accent-cyan/10 border border-accent-cyan/20 text-accent-cyan hover:bg-accent-cyan/20 transition-all flex items-center gap-1.5 disabled:opacity-40"
+            >
+              <ListChecks className="w-3.5 h-3.5" />
+              {trackingAll ? 'Tracking...' : `Track All (${filteredResults.filter(r => !trackedSymbols.has(r.symbol)).length})`}
+            </button>
             <button
               onClick={exportCSV}
               className="px-3 py-1.5 rounded-md text-xs font-mono bg-bg-tertiary border border-border/30 text-text-secondary hover:border-accent-cyan/30 hover:text-accent-cyan transition-all flex items-center gap-1.5"
@@ -514,7 +593,7 @@ export default function ScreenerTab() {
             <Radar className="w-12 h-12 text-text-muted/30 mb-4" />
             <h3 className="text-lg font-semibold text-text-secondary mb-2">Market Screener</h3>
             <p className="text-sm text-text-muted max-w-md mb-1">
-              Scan {STOCK_UNIVERSE.length} stocks across all sectors for extreme directional signals.
+              Scan {getTop500Symbols().length} top market-cap stocks across all sectors for extreme directional signals.
               Identifies the strongest bullish and bearish setups based on GEX positioning,
               options flow, IV regime, and dealer exposure.
             </p>
