@@ -53,6 +53,7 @@ export default function ScreenerTab() {
   const [scanTimestamp, setScanTimestamp] = useState<number | null>(null);
   const [trackedSymbols, setTrackedSymbols] = useState<Set<string>>(new Set());
   const [includeRetail, setIncludeRetail] = useState(false);
+  const [scanLog, setScanLog] = useState<{ chunk: number; sent: number; received: number; ms: number; error?: string }[]>([]);
   const abortRef = useRef<AbortController | null>(null);
 
   // Load cached screener results + tracked symbols on mount
@@ -120,7 +121,7 @@ export default function ScreenerTab() {
     }
   }, []);
 
-  const CHUNK_SIZE = 50; // ~50 stocks per request reliably fits within 60s Hobby timeout
+  const CHUNK_SIZE = 25; // 25 stocks per request — safely within 60s Hobby timeout
 
   const startScan = useCallback(async () => {
     if (scanning) {
@@ -131,6 +132,7 @@ export default function ScreenerTab() {
 
     setScanning(true);
     setResults([]);
+    setScanLog([]);
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -139,6 +141,7 @@ export default function ScreenerTab() {
     setProgress({ completed: 0, total: allSymbols.length, current: '' });
 
     const accumulated: ScreenerResult[] = [];
+    const chunkLog: typeof scanLog = [];
 
     try {
       // Split into chunks that each fit within the 60s serverless timeout
@@ -146,17 +149,31 @@ export default function ScreenerTab() {
         if (controller.signal.aborted) break;
 
         const chunk = allSymbols.slice(i, i + CHUNK_SIZE);
+        const chunkIdx = Math.floor(i / CHUNK_SIZE) + 1;
+        const totalChunks = Math.ceil(allSymbols.length / CHUNK_SIZE);
         const scanUrl = `/api/market/screener?symbols=${chunk.join(',')}`;
+        const beforeCount = accumulated.length;
+        const chunkStart = Date.now();
 
         try {
           const res = await fetch(scanUrl, { signal: controller.signal });
-          if (!res.ok || !res.body) continue;
+          if (!res.ok || !res.body) {
+            chunkLog.push({ chunk: chunkIdx, sent: chunk.length, received: 0, ms: Date.now() - chunkStart, error: `HTTP ${res.status}` });
+            setScanLog([...chunkLog]);
+            continue;
+          }
 
           await processStream(res, accumulated, i, allSymbols.length, controller.signal);
+          const received = accumulated.length - beforeCount;
+          chunkLog.push({ chunk: chunkIdx, sent: chunk.length, received, ms: Date.now() - chunkStart });
+          setScanLog([...chunkLog]);
+          console.log(`[Screener] Chunk ${chunkIdx}/${totalChunks}: ${received}/${chunk.length} stocks in ${Date.now() - chunkStart}ms`);
         } catch (err) {
           if ((err as Error).name === 'AbortError') break;
-          // If a chunk fails (timeout etc), continue with next chunk
-          console.warn(`Screener chunk ${i}-${i + chunk.length} failed, continuing...`);
+          const received = accumulated.length - beforeCount;
+          chunkLog.push({ chunk: chunkIdx, sent: chunk.length, received, ms: Date.now() - chunkStart, error: (err as Error).message });
+          setScanLog([...chunkLog]);
+          console.warn(`[Screener] Chunk ${chunkIdx}/${totalChunks} failed after ${received}/${chunk.length} stocks (${Date.now() - chunkStart}ms): ${(err as Error).message}`);
         }
       }
 
@@ -448,6 +465,29 @@ export default function ScreenerTab() {
             <span className="text-xs font-mono text-accent-cyan">
               Analyzing {progress.current}...
             </span>
+          </div>
+        )}
+
+        {/* Chunk Log (scan debugging) */}
+        {scanLog.length > 0 && (
+          <div className="px-4 pb-3 border-t border-border/20 pt-2">
+            <details className="text-xs font-mono">
+              <summary className="text-text-muted cursor-pointer hover:text-text-secondary">
+                Scan Log: {scanLog.reduce((s, c) => s + c.received, 0)} stocks from {scanLog.length} chunks
+                {scanLog.some(c => c.error) && <span className="text-yellow-400 ml-2">({scanLog.filter(c => c.error).length} errors)</span>}
+              </summary>
+              <div className="mt-1.5 space-y-0.5">
+                {scanLog.map((c, i) => (
+                  <div key={i} className={`flex items-center gap-2 ${c.error ? 'text-yellow-400' : c.received === c.sent ? 'text-text-muted' : 'text-amber-400/70'}`}>
+                    <span>Chunk {c.chunk}:</span>
+                    <span>{c.received}/{c.sent}</span>
+                    <span className="text-text-muted/50">{(c.ms / 1000).toFixed(1)}s</span>
+                    {c.error && <span className="text-red-400 truncate">{c.error}</span>}
+                    {!c.error && c.received < c.sent && <span className="text-amber-400/50">(partial — timeout?)</span>}
+                  </div>
+                ))}
+              </div>
+            </details>
           </div>
         )}
 
