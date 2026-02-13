@@ -98,7 +98,8 @@ export function updateSignalPrices(updates: Record<string, number>): TrackedSign
   let changed = false;
 
   for (const sig of signals) {
-    if (sig.closed) continue;
+    // Update ALL signals — never skip based on closed status.
+    // Signals keep updating until physically removed.
     const price = updates[sig.symbol];
     if (price == null || price <= 0) continue;
 

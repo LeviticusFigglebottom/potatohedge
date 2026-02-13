@@ -28,7 +28,7 @@ export default function ScreenerTab() {
 
   // Load already-tracked symbols on mount
   useState(() => {
-    const existing = loadSignals().filter(s => !s.closed);
+    const existing = loadSignals();
     setTrackedSymbols(new Set(existing.map(s => s.symbol)));
   });
 
@@ -116,15 +116,20 @@ export default function ScreenerTab() {
 
   const handleTrackSignal = useCallback(async (r: ScreenerResult, e: React.MouseEvent) => {
     e.stopPropagation();
-    // Fetch fresh quote so entry price is current, not stale scan data
-    let entryPrice = r.spotPrice;
+    // Fetch fresh quote — entry price MUST be current
+    let entryPrice = 0;
     try {
-      const res = await fetch(`/api/market/quote?symbol=${r.symbol}`, { signal: AbortSignal.timeout(5000) });
+      const res = await fetch(`/api/market/quote?symbol=${r.symbol}`, { signal: AbortSignal.timeout(8000) });
       if (res.ok) {
         const q = await res.json();
         if (q.last > 0) entryPrice = q.last;
       }
-    } catch { /* fall back to scan price */ }
+    } catch { /* will check below */ }
+
+    if (entryPrice <= 0) {
+      console.warn(`Signal Tracker: could not get fresh price for ${r.symbol}, skipping`);
+      return;
+    }
 
     addSignal({
       symbol: r.symbol,
@@ -183,28 +188,40 @@ export default function ScreenerTab() {
 
     setTrackingAll(true);
     try {
-      // Batch-fetch fresh quotes for all untracked symbols
+      // Batch-fetch fresh quotes — 40 symbols per request to stay within API limits
       const symbols = untracked.map(r => r.symbol);
       const freshPrices: Record<string, number> = {};
-      try {
-        const res = await fetch(`/api/market/quotes?symbols=${symbols.join(',')}`, {
-          signal: AbortSignal.timeout(10000),
-        });
-        if (res.ok) {
-          const data = await res.json();
-          if (Array.isArray(data)) {
-            for (const q of data) {
-              if (q.symbol && q.last > 0) freshPrices[q.symbol] = q.last;
+      const BATCH_SIZE = 40;
+
+      for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
+        const batch = symbols.slice(i, i + BATCH_SIZE);
+        try {
+          const res = await fetch(`/api/market/quotes?symbols=${batch.join(',')}`, {
+            signal: AbortSignal.timeout(15000),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (Array.isArray(data)) {
+              for (const q of data) {
+                if (q.symbol && q.last > 0) freshPrices[q.symbol] = q.last;
+              }
             }
           }
-        }
-      } catch { /* use scan prices as fallback */ }
+        } catch { /* continue with next batch */ }
+      }
 
       const newTracked = new Set(trackedSymbols);
+      let skippedNoPrice = 0;
       for (const r of untracked) {
+        const price = freshPrices[r.symbol];
+        // Only track if we got a fresh price — never use stale scan data
+        if (!price || price <= 0) {
+          skippedNoPrice++;
+          continue;
+        }
         addSignal({
           symbol: r.symbol,
-          entryPrice: freshPrices[r.symbol] || r.spotPrice,
+          entryPrice: price,
           bias: r.overallBias,
           biasScore: r.biasScore,
           gammaRegime: r.gammaRegime,
@@ -217,6 +234,9 @@ export default function ScreenerTab() {
           source: 'screener',
         });
         newTracked.add(r.symbol);
+      }
+      if (skippedNoPrice > 0) {
+        console.warn(`Signal Tracker: skipped ${skippedNoPrice} stocks (no fresh price available)`);
       }
       setTrackedSymbols(newTracked);
     } finally {

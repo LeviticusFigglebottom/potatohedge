@@ -1120,20 +1120,25 @@ export default function BriefingTab() {
   const [error, setError] = useState<string | null>(null);
   const [phase, setPhase] = useState('');
   const [trackedSignals, setTrackedSignals] = useState<Set<string>>(() => {
-    const existing = loadSignals().filter(s => !s.closed);
+    const existing = loadSignals();
     return new Set(existing.map(s => s.symbol));
   });
 
   const handleTrackSignal = useCallback(async (idx: { symbol: string; price: number; bias: string; biasScore: number; gammaRegime: string; volRegime: string; ivRank: number }) => {
-    // Fetch fresh quote so entry price is current, not stale briefing cache
-    let entryPrice = idx.price;
+    // Entry price MUST be current — never use stale briefing cache
+    let entryPrice = 0;
     try {
-      const res = await fetch(`/api/market/quote?symbol=${idx.symbol}`, { signal: AbortSignal.timeout(5000) });
+      const res = await fetch(`/api/market/quote?symbol=${idx.symbol}`, { signal: AbortSignal.timeout(8000) });
       if (res.ok) {
         const q = await res.json();
         if (q.last > 0) entryPrice = q.last;
       }
-    } catch { /* fall back to cached briefing price */ }
+    } catch { /* will check below */ }
+
+    if (entryPrice <= 0) {
+      console.warn(`Signal Tracker: could not get fresh price for ${idx.symbol}, skipping`);
+      return;
+    }
 
     addSignal({
       symbol: idx.symbol,

@@ -72,7 +72,7 @@ function SignalTrackButton() {
 
   // Check on mount / symbol change
   useEffect(() => {
-    const existing = loadSignals().filter(s => !s.closed);
+    const existing = loadSignals();
     setTracked(existing.some(s => s.symbol === symbol));
   }, [symbol]);
 

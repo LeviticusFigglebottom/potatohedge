@@ -23,7 +23,7 @@ export async function getQuote(symbol: string): Promise<Quote> {
   const token = process.env.TRADIER_API_KEY!;
   const res = await fetch(
     `${getBaseUrl()}/markets/quotes?symbols=${encodeURIComponent(symbol)}&greeks=false`,
-    { headers: getHeaders(token), next: { revalidate: 5 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) }
+    { headers: getHeaders(token), cache: 'no-store', signal: AbortSignal.timeout(FETCH_TIMEOUT) }
   );
 
   if (!res.ok) {
@@ -67,7 +67,7 @@ export async function getQuotes(symbols: string[]): Promise<Quote[]> {
   const token = process.env.TRADIER_API_KEY!;
   const res = await fetch(
     `${getBaseUrl()}/markets/quotes?symbols=${encodeURIComponent(symbols.join(','))}&greeks=false`,
-    { headers: getHeaders(token), next: { revalidate: 5 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) }
+    { headers: getHeaders(token), cache: 'no-store', signal: AbortSignal.timeout(FETCH_TIMEOUT) }
   );
 
   if (!res.ok) {
