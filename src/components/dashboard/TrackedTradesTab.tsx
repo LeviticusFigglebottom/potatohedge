@@ -9,7 +9,7 @@ import {
 import {
   loadTrackedTrades, loadTrackedTradesWithSync, removeTrackedTrade,
   purgeClosedTrades, purgeAllTrades, resizeExistingTrades,
-  computeAnalytics, type TrackedTrade, type TradeAnalytics, type TradeStatus,
+  computeAnalytics, calcPLPct, type TrackedTrade, type TradeAnalytics, type TradeStatus,
 } from '@/lib/tradeTracker';
 
 // ─── Filter Types ───────────────────────────────────────────
@@ -217,7 +217,9 @@ function TradeRow({ trade, onRemove }: { trade: TrackedTrade; onRemove: (id: str
   if (isOpen && hasPricingData && lastSnapshot) {
     const currentValue = lastSnapshot.positionValue;
     unrealizedPL = currentValue - (trade.entryDebit ?? 0);
-    unrealizedPLPct = trade.maxRisk && trade.maxRisk !== 0 ? (unrealizedPL / Math.abs(trade.maxRisk)) * 100 : null;
+    // Use cost basis for P/L% — consistent with evaluateTrade exit logic
+    const pct = calcPLPct(unrealizedPL, trade.entryDebit, trade.maxRisk);
+    unrealizedPLPct = pct !== 0 || unrealizedPL === 0 ? pct : null;
   }
 
   const displayPL = isOpen ? unrealizedPL : trade.realizedPL;
@@ -347,17 +349,21 @@ function TradeRow({ trade, onRemove }: { trade: TrackedTrade; onRemove: (id: str
           </div>
 
           {/* Targets */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono">
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-xs font-mono">
             <div>
               <span className="text-text-muted block">Profit Target</span>
-              <span className="text-accent-green">+{trade.profitTargetPct}%</span>
+              <span className="text-accent-green">+{trade.profitTargetPct}% of cost</span>
             </div>
             <div>
               <span className="text-text-muted block">Stop Loss</span>
-              <span className="text-accent-red">-{trade.stopLossPct}%</span>
+              <span className="text-accent-red">-{trade.stopLossPct}% of cost</span>
             </div>
             <div>
-              <span className="text-text-muted block">Max Risk</span>
+              <span className="text-text-muted block">Entry Cost</span>
+              <span className="text-text-primary">{trade.entryDebit !== null ? `${trade.entryDebit < 0 ? 'Credit ' : 'Debit '}$${Math.abs(trade.entryDebit).toFixed(0)}` : '—'}</span>
+            </div>
+            <div>
+              <span className="text-text-muted block">Max Risk (width)</span>
               <span className="text-text-primary">{trade.maxRisk !== null ? `$${Math.abs(trade.maxRisk).toFixed(0)}` : '—'}</span>
             </div>
             <div>

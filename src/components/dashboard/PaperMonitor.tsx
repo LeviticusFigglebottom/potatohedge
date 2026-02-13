@@ -4,6 +4,7 @@ import { useEffect, useRef, useCallback } from 'react';
 import {
   loadTrackedTrades,
   updateTrackedTrade,
+  calcPLPct,
   type TrackedTrade,
 } from '@/lib/tradeTracker';
 
@@ -12,6 +13,9 @@ import {
  * Runs at the app level (page.tsx) — checks positions regardless of active tab.
  * Polls every 60s during market hours, checks grouped spread P&L against exit rules.
  * Supports both new grouped rules (spreads) and legacy single-symbol rules.
+ *
+ * IMPORTANT: Skips rules where isAITracked=true — those are managed by TrackerMonitor
+ * to prevent dual-monitor exit race conditions and P/L% calculation divergence.
  *
  * When it closes a position, it also updates the corresponding TrackedTrade
  * so both tracking systems stay in sync.
@@ -29,6 +33,7 @@ interface TradeRule {
   createdAt: string;
   exitTriggered?: 'target' | 'stop' | null;
   exitOrderId?: number;
+  isAITracked?: boolean; // true = managed by TrackerMonitor, skip in PaperMonitor
   // Legacy single-position fields
   occSymbol?: string;
   targetPrice?: number | null;
@@ -64,7 +69,8 @@ function isMarketHours(): boolean {
 }
 
 /**
- * When PaperMonitor closes positions, find the matching TrackedTrade and mark it exited.
+ * When PaperMonitor closes positions for a MANUAL trade, sync TrackedTrade if one exists.
+ * Uses calcPLPct for consistent P/L% calculation (cost-basis denominator).
  */
 function syncTrackedTradeOnClose(
   occSymbols: string[],
@@ -83,7 +89,7 @@ function syncTrackedTradeOnClose(
 
     const now = Date.now();
     const totalPL = matched.reduce((s, p) => s + p.unrealizedPL, 0);
-    const plPct = match.maxRisk && match.maxRisk !== 0 ? (totalPL / Math.abs(match.maxRisk)) * 100 : 0;
+    const plPct = calcPLPct(totalPL, match.entryDebit, match.maxRisk);
 
     updateTrackedTrade(match.id, {
       status: 'exited',
@@ -106,7 +112,8 @@ export default function PaperMonitor() {
     if (runningRef.current) return;
 
     const rules = loadRules();
-    const activeRules = rules.filter(r => r.autoExit && !r.exitTriggered);
+    // Skip AI-tracked rules — TrackerMonitor is the sole authority for those
+    const activeRules = rules.filter(r => r.autoExit && !r.exitTriggered && !r.isAITracked);
     if (activeRules.length === 0) return;
     if (!isMarketHours()) return;
 

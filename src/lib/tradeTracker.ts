@@ -179,7 +179,7 @@ function autoExpireStale(trades: TrackedTrade[]): TrackedTrade[] {
           const pl = lastSnap.positionValue - t.entryDebit;
           t.exitValue = lastSnap.positionValue;
           t.realizedPL = pl;
-          t.realizedPLPct = t.maxRisk && t.maxRisk !== 0 ? (pl / Math.abs(t.maxRisk)) * 100 : 0;
+          t.realizedPLPct = calcPLPct(pl, t.entryDebit, t.maxRisk);
           t.outcome = pl > 0.5 ? 'win' : pl < -0.5 ? 'loss' : 'breakeven';
         } else {
           t.outcome = 'loss';
@@ -395,6 +395,22 @@ export function calculatePositionValue(legs: TrackedLeg[], useMid: 'entry' | 'ex
 }
 
 /**
+ * Compute P/L% using cost basis (abs of entry debit/credit) as denominator.
+ * This matches the recommendation engine's intent: profitTargetPct and stopLossPct
+ * are defined as "% of cost" — e.g., 50 means take profit at +50% of premium paid
+ * (debit) or +50% of credit received (credit spreads).
+ *
+ * Falls back to maxRisk (spread width) when cost basis is too small (<$25)
+ * to avoid wild percentage swings on near-zero-cost positions.
+ */
+export function calcPLPct(pl: number, entryDebit: number | null, maxRisk: number | null): number {
+  const costBasis = Math.abs(entryDebit ?? 0);
+  if (costBasis > 25) return (pl / costBasis) * 100;
+  if (maxRisk && maxRisk !== 0) return (pl / Math.abs(maxRisk)) * 100;
+  return 0;
+}
+
+/**
  * Check a tracked trade against current market data and update its status.
  * Returns the updated trade if any changes were made, null otherwise.
  */
@@ -420,9 +436,8 @@ export function evaluateTrade(
     const exitValue = calculatePositionValue(exitLegs, 'exit');
     const entryValue = trade.entryDebit ?? calculatePositionValue(trade.legs, 'entry');
     const pl = exitValue - entryValue;
-    // Recalculate maxRisk with quantity correction
     const correctedMaxRisk = calculateMaxRisk(trade.legs, trade.strategy, currentSpot);
-    const plPct = correctedMaxRisk !== 0 ? (pl / Math.abs(correctedMaxRisk)) * 100 : 0;
+    const plPct = calcPLPct(pl, entryValue, correctedMaxRisk);
 
     updates.status = 'expired';
     updates.exitedAt = now;
@@ -513,7 +528,9 @@ export function evaluateTrade(
     }
 
     const unrealizedPL = currentValue - entryValue;
-    const plPct = correctedMaxRisk !== 0 ? (unrealizedPL / Math.abs(correctedMaxRisk)) * 100 : 0;
+    // Use cost basis (abs of entry debit/credit) for P/L% — matches recommendation
+    // engine intent where profitTargetPct/stopLossPct are "% of cost/credit".
+    const plPct = calcPLPct(unrealizedPL, entryValue, correctedMaxRisk);
 
     // Always add a price snapshot — even with partial pricing.
     // This ensures P/L shows something rather than perpetual "—".
@@ -570,9 +587,8 @@ export function manuallyExitTrade(
   const exitValue = calculatePositionValue(exitLegs, 'exit');
   const entryValue = trade.entryDebit ?? calculatePositionValue(trade.legs, 'entry');
   const pl = exitValue - entryValue;
-  // Use corrected maxRisk (accounting for quantity)
   const correctedMaxRisk = calculateMaxRisk(trade.legs, trade.strategy, currentSpot);
-  const plPct = correctedMaxRisk !== 0 ? (pl / Math.abs(correctedMaxRisk)) * 100 : 0;
+  const plPct = calcPLPct(pl, entryValue, correctedMaxRisk);
 
   return updateTrackedTrade(tradeId, {
     status: 'exited',

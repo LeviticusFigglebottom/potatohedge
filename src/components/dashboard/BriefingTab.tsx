@@ -21,6 +21,7 @@ interface TradeRule {
   createdAt: string;
   exitTriggered?: 'target' | 'stop' | null;
   exitOrderId?: number;
+  isAITracked?: boolean; // true = managed by TrackerMonitor, PaperMonitor will skip
   // Legacy single-position fields (kept for backward compat)
   occSymbol?: string;
   targetPrice?: number | null;
@@ -347,7 +348,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
           ],
           underlying: idea.ticker, strategy: idea.strategy, thesis,
           profitTargetPct: idea.profitTargetPct, stopLossPct: idea.stopLossPct,
-          autoExit: true, createdAt: new Date().toISOString(),
+          autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed IC #${data.orderId} (TP: +${idea.profitTargetPct}% / SL: -${idea.stopLossPct}%)` }));
 
@@ -424,7 +425,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
           occSymbols: [buildOCC(idea.ticker, exp, optType, leg1Strike), buildOCC(idea.ticker, exp, optType, leg2Strike)],
           underlying: idea.ticker, strategy: idea.strategy, thesis,
           profitTargetPct: idea.profitTargetPct, stopLossPct: idea.stopLossPct,
-          autoExit: true, createdAt: new Date().toISOString(),
+          autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed spread #${data.orderId} (TP: +${idea.profitTargetPct}% / SL: -${idea.stopLossPct}%)` }));
 
@@ -458,7 +459,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
           occSymbols: [buildOCC(idea.ticker, exp, 'C', strike), buildOCC(idea.ticker, exp, 'P', strike)],
           underlying: idea.ticker, strategy: idea.strategy, thesis,
           profitTargetPct: idea.profitTargetPct, stopLossPct: idea.stopLossPct,
-          autoExit: true, createdAt: new Date().toISOString(),
+          autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed straddle #${data.orderId} (TP: +${idea.profitTargetPct}% / SL: -${idea.stopLossPct}%)` }));
 
@@ -493,7 +494,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
           occSymbols: [buildOCC(idea.ticker, exp, 'P', putStrike), buildOCC(idea.ticker, exp, 'C', callStrike)],
           underlying: idea.ticker, strategy: idea.strategy, thesis,
           profitTargetPct: idea.profitTargetPct, stopLossPct: idea.stopLossPct,
-          autoExit: true, createdAt: new Date().toISOString(),
+          autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed strangle #${data.orderId} (TP: +${idea.profitTargetPct}% / SL: -${idea.stopLossPct}%)` }));
 
@@ -528,7 +529,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
           occSymbols: [buildOCC(idea.ticker, exp, optionType, strike)],
           underlying: idea.ticker, strategy: idea.strategy, thesis,
           profitTargetPct: idea.profitTargetPct || 75, stopLossPct: idea.stopLossPct || 50,
-          autoExit: true, createdAt: new Date().toISOString(),
+          autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId} (TP: +${idea.profitTargetPct || 75}% / SL: -${idea.stopLossPct || 50}%)` }));
       }
@@ -788,7 +789,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           id: `ai-ic-${idea.ticker}-${exp}-${Date.now()}`,
           occSymbols: [buildOCC(idea.ticker, exp, 'C', sellCall), buildOCC(idea.ticker, exp, 'C', sellCall + wingWidth), buildOCC(idea.ticker, exp, 'P', sellPut), buildOCC(idea.ticker, exp, 'P', sellPut - wingWidth)],
           underlying: idea.ticker, strategy: `[AI] ${idea.strategy}`, thesis,
-          profitTargetPct: 50, stopLossPct: 100, autoExit: true, createdAt: new Date().toISOString(),
+          profitTargetPct: 50, stopLossPct: 100, autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed IC ${qty}x #${data.orderId}` }));
 
@@ -848,7 +849,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           id: `ai-spread-${idea.ticker}-${exp}-${Date.now()}`,
           occSymbols: [buildOCC(idea.ticker, exp, optType, leg1Strike), buildOCC(idea.ticker, exp, optType, leg2Strike)],
           underlying: idea.ticker, strategy: `[AI] ${idea.strategy}`, thesis,
-          profitTargetPct: 50, stopLossPct: 50, autoExit: true, createdAt: new Date().toISOString(),
+          profitTargetPct: 50, stopLossPct: 50, autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed spread #${data.orderId}` }));
 
@@ -882,7 +883,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           id: `ai-vol-${idea.ticker}-${exp}-${Date.now()}`,
           occSymbols: [buildOCC(idea.ticker, exp, 'C', callStrike), buildOCC(idea.ticker, exp, 'P', putStrike)],
           underlying: idea.ticker, strategy: `[AI] ${idea.strategy}`, thesis,
-          profitTargetPct: 50, stopLossPct: 40, autoExit: true, createdAt: new Date().toISOString(),
+          profitTargetPct: 50, stopLossPct: 40, autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed ${isStraddle ? 'straddle' : 'strangle'} ${qty}x #${data.orderId}` }));
 
@@ -910,7 +911,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           id: `ai-single-${idea.ticker}-${exp}-${Date.now()}`,
           occSymbols: [buildOCC(idea.ticker, exp, optionType, strike)],
           underlying: idea.ticker, strategy: `[AI] ${idea.strategy}`, thesis,
-          profitTargetPct: 75, stopLossPct: 50, autoExit: true, createdAt: new Date().toISOString(),
+          profitTargetPct: 75, stopLossPct: 50, autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId}` }));
       }
