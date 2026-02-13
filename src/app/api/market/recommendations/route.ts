@@ -33,6 +33,7 @@ import { generateRecommendations } from '@/lib/math/recommendations';
 import { getSwapDataForTicker } from '@/lib/providers/dtcc';
 import { fetchRegSHOThreshold, getShortInterestForTicker } from '@/lib/providers/finra';
 import { scanTickerFlow } from '@/lib/providers/polygonFlow';
+import { getMarketIndicators } from '@/lib/providers/fred';
 
 export const maxDuration = 30;
 
@@ -153,6 +154,12 @@ export async function GET(request: NextRequest) {
         existing.netDEX += e.netDEX;
         existing.callGEX += e.callGEX;
         existing.putGEX += e.putGEX;
+        existing.netVanna += e.netVanna;
+        existing.callVanna += e.callVanna;
+        existing.putVanna += e.putVanna;
+        existing.netCharm += e.netCharm;
+        existing.callCharm += e.callCharm;
+        existing.putCharm += e.putCharm;
       } else {
         byStrike.set(e.strike, { ...e });
       }
@@ -215,12 +222,45 @@ export async function GET(request: NextRequest) {
     const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
       Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 
+    // Compute aggregate vanna & charm from exposure data (already calculated above)
+    const totalVanna = aggExposures.reduce((s, e) => s + e.netVanna, 0);
+    const totalCharm = aggExposures.reduce((s, e) => s + e.netCharm, 0);
+
+    // IV term structure: compare ATM IV of nearest expiration vs next
+    let nearTermIV: number | undefined;
+    let nextTermIV: number | undefined;
+    if (chains.length >= 2) {
+      const getATMIV = (chain: typeof chains[0]) => {
+        const atm = [...chain.calls, ...chain.puts]
+          .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < atmTolerance && o.impliedVolatility > 0.01)
+          .sort((a, b) => Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice));
+        return atm.length > 0 ? atm.slice(0, 4).reduce((s, o) => s + o.impliedVolatility, 0) / Math.min(4, atm.length) : 0;
+      };
+      nearTermIV = getATMIV(chains[0]);
+      nextTermIV = getATMIV(chains[1]);
+      if (nearTermIV === 0) nearTermIV = undefined;
+      if (nextTermIV === 0) nextTermIV = undefined;
+    }
+
+    // OI Concentration — top 3 call + put strikes as % of total
+    const callsByOI = [...nearChain.calls].sort((a, b) => b.openInterest - a.openInterest);
+    const putsByOI = [...nearChain.puts].sort((a, b) => b.openInterest - a.openInterest);
+    const top3CallOI = callsByOI.slice(0, 3).reduce((s, c) => s + c.openInterest, 0);
+    const top3PutOI = putsByOI.slice(0, 3).reduce((s, p) => s + p.openInterest, 0);
+    const totalCallOIForConc = nearChain.calls.reduce((s, c) => s + c.openInterest, 0);
+    const totalPutOIForConc = nearChain.puts.reduce((s, p) => s + p.openInterest, 0);
+    const oiConcentration = (totalCallOIForConc + totalPutOIForConc) > 0
+      ? ((top3CallOI / Math.max(1, totalCallOIForConc)) * 100 + (top3PutOI / Math.max(1, totalPutOIForConc)) * 100) / 2
+      : undefined;
+
     const emptyFlow = { tickerFlow: { ticker, netPremium: 0, callPremium: 0, putPremium: 0, callVolume: 0, putVolume: 0, contractsActive: 0 }, alerts: [] as { tradeType: string; sentiment: string }[] };
-    const [swapData, regSHOSet, siData, flowData] = await Promise.all([
+    const emptyIndicators = { vix: null, skew: null };
+    const [swapData, regSHOSet, siData, flowData, indicators] = await Promise.all([
       raceTimeout(getSwapDataForTicker(ticker).catch(() => null), 4000, null),
       raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
       raceTimeout(getShortInterestForTicker(ticker).catch(() => null), 5000, null),
       raceTimeout(scanTickerFlow(ticker).catch(() => emptyFlow), 5000, emptyFlow),
+      raceTimeout(getMarketIndicators().catch(() => emptyIndicators), 3000, emptyIndicators),
     ]);
 
     const input = {
@@ -270,6 +310,16 @@ export async function GET(request: NextRequest) {
       flowAlertCount: flowData.alerts.length || undefined,
       flowSweepCount: flowData.alerts.filter(a => a.tradeType === 'sweep').length || undefined,
       flowBlockCount: flowData.alerts.filter(a => a.tradeType === 'block').length || undefined,
+      // Greeks-derived dealer flow
+      totalVanna: totalVanna || undefined,
+      totalCharm: totalCharm || undefined,
+      // IV term structure
+      nearTermIV,
+      nextTermIV,
+      // OI concentration
+      oiConcentration,
+      // VIX level
+      vixLevel: indicators.vix?.current ?? undefined,
       isMarketOpen: isMarketOpenNow(),
     };
 

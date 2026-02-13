@@ -121,6 +121,16 @@ export interface RecommendationInput {
   flowAlertCount?: number;        // number of unusual flow alerts
   flowSweepCount?: number;        // number of sweep detections
   flowBlockCount?: number;        // number of block trades
+  // Greeks-derived dealer flow (from chain exposure calculations)
+  totalVanna?: number;            // aggregate net vanna exposure across strikes
+  totalCharm?: number;            // aggregate net charm exposure across strikes
+  // IV term structure
+  nearTermIV?: number;            // ATM IV of nearest expiration
+  nextTermIV?: number;            // ATM IV of next expiration
+  // OI concentration — top 3 strikes as % of total OI (0-100)
+  oiConcentration?: number;
+  // VIX level for market-wide regime context
+  vixLevel?: number;
   // Market state — when false, volume/flow signals are stale and should be suppressed
   isMarketOpen?: boolean;
 }
@@ -375,20 +385,28 @@ function scoreSignals(input: RecommendationInput): Signal[] {
     });
   }
 
-  // 8. IV/HV Divergence — key for premium pricing
+  // 8. IV/HV Divergence — premium pricing AND mean-reversion signal
+  //    When IV is significantly above HV, vol tends to compress → options overpriced → sell premium
+  //    When IV is below HV, vol expansion likely → options underpriced → buy premium
+  //    Small directional contribution: high IV/HV historically precedes calmer periods (slightly bullish)
+  //    low IV/HV historically precedes vol expansion (slightly bearish/volatile)
   if (input.ivHvRatio > 1.3) {
+    // Vol overpricing → expect compression → mildly bullish (calm markets tend to drift up)
+    const ivhvWeight = Math.min(0.08, (input.ivHvRatio - 1.3) * 0.15);
     signals.push({
       name: 'IV/HV Spread',
-      direction: 'neutral',
-      weight: 0,
-      description: `IV/HV ${input.ivHvRatio.toFixed(2)} — implied ${((input.ivHvRatio - 1) * 100).toFixed(0)}% above realized. Options overpriced vs actual movement — edge in selling`,
+      direction: 'bullish',
+      weight: ivhvWeight,
+      description: `IV/HV ${input.ivHvRatio.toFixed(2)} — implied ${((input.ivHvRatio - 1) * 100).toFixed(0)}% above realized. Options overpriced; vol compression likely favors calm (bullish drift). Edge in selling premium.`,
     });
   } else if (input.ivHvRatio > 0 && input.ivHvRatio < 0.85) {
+    // Vol underpricing → expect expansion → mildly bearish (vol expansion often accompanies selloffs)
+    const ivhvWeight = -Math.min(0.08, (0.85 - input.ivHvRatio) * 0.2);
     signals.push({
       name: 'IV/HV Spread',
-      direction: 'neutral',
-      weight: 0,
-      description: `IV/HV ${input.ivHvRatio.toFixed(2)} — implied ${((1 - input.ivHvRatio) * 100).toFixed(0)}% below realized. Options underpriced — edge in buying`,
+      direction: 'bearish',
+      weight: ivhvWeight,
+      description: `IV/HV ${input.ivHvRatio.toFixed(2)} — implied ${((1 - input.ivHvRatio) * 100).toFixed(0)}% below realized. Vol expansion likely (stock moving more than options imply). Edge in buying premium.`,
     });
   }
 
@@ -514,15 +532,20 @@ function scoreSignals(input: RecommendationInput): Signal[] {
   }
 
   // 12. DTCC Swap Maturity Pressure
+  //     Note: DTCC data is T+1 delayed (published next business day after settlement).
+  //     Maturity dates are forward-looking so the DATES are reliable, but the count
+  //     may not reflect today's actual opens. Treat as background context, not primary signal.
+  //     Weights reduced vs real-time signals to reflect this latency.
   if (input.swapMaturitiesToday && input.swapMaturitiesToday > 0) {
     const notionalM = (input.swapNotionalToday || 0) / 1e6;
     const isHeavy = input.swapMaturitiesToday > 100 || notionalM > 50;
-    const weight = isHeavy ? -0.10 : -0.05; // headwind — dealer rebalancing creates friction
+    // Reduced weights: -0.05 heavy (was -0.10), 0 minor (was -0.05) — T+1 delay reduces reliability
+    const weight = isHeavy ? -0.05 : 0;
     signals.push({
       name: 'Swap Maturity',
       direction: isHeavy ? 'bearish' : 'neutral',
-      weight: isHeavy ? weight : 0,
-      description: `${input.swapMaturitiesToday} swap${input.swapMaturitiesToday > 1 ? 's' : ''} ($${notionalM.toFixed(0)}M notional) maturing today — ${isHeavy ? 'heavy dealer rebalancing pressure' : 'minor dealer flow'}`,
+      weight,
+      description: `${input.swapMaturitiesToday} swap${input.swapMaturitiesToday > 1 ? 's' : ''} ($${notionalM.toFixed(0)}M notional) maturing today — ${isHeavy ? 'dealer rebalancing pressure (T+1 delayed data, treat as context)' : 'minor dealer flow (T+1 delayed)'}`,
     });
   }
   if (input.swapMaturitiesWeek && input.swapMaturitiesWeek > (input.swapMaturitiesToday || 0)) {
@@ -530,9 +553,9 @@ function scoreSignals(input: RecommendationInput): Signal[] {
     if (input.swapMaturitiesWeek > 200 || weekNotionalM > 100) {
       signals.push({
         name: 'Swap Maturity (Week)',
-        direction: 'bearish',
-        weight: -0.05,
-        description: `${input.swapMaturitiesWeek} swaps ($${weekNotionalM.toFixed(0)}M) maturing this week — persistent rebalancing headwind`,
+        direction: 'neutral',
+        weight: 0, // info-only — weekly view from T+1 data is too stale for directional weight
+        description: `${input.swapMaturitiesWeek} swaps ($${weekNotionalM.toFixed(0)}M) maturing this week — watch for cluster rebalancing (T+1 delayed, context only)`,
       });
     }
   }
@@ -620,6 +643,163 @@ function scoreSignals(input: RecommendationInput): Signal[] {
         ? `${input.flowAlertCount} unusual flow alerts (STALE — market closed; weight zeroed)`
         : `${input.flowAlertCount} unusual flow alerts with ${alertDir} sentiment — confirms institutional positioning`,
     });
+  }
+
+  // 17. Vanna Exposure — dealer delta sensitivity to IV changes
+  //     When IV drops (common in rallies): positive vanna → dealers buy → supportive
+  //     When IV rises (common in selloffs): positive vanna → dealers sell → amplifies
+  //     OI-based, so works even when market is closed (unlike volume signals)
+  if (input.totalVanna !== undefined && input.totalVanna !== 0) {
+    const vannaAbs = Math.abs(input.totalVanna);
+    // Normalize by total OI — only meaningful with sufficient positioning
+    const vannaConfidence = totalOI > 5000 ? Math.min(1, totalOI / 50000) : 0;
+    if (vannaConfidence > 0) {
+      // Positive vanna = delta increases as IV drops (bullish in calm markets)
+      // The direction depends on the current vol regime:
+      // - In high IV that's mean-reverting down → positive vanna is bullish (dealers will buy as IV drops)
+      // - In low IV that may expand → positive vanna is a headwind (dealers will sell as IV rises)
+      const ivTrending = input.ivRank > 60 ? 'high' : input.ivRank < 30 ? 'low' : 'mid';
+      let vannaDir: Direction = 'neutral';
+      let vannaWeight = 0;
+
+      if (input.totalVanna > 0) {
+        if (ivTrending === 'high') {
+          // IV likely to mean-revert down → dealers buy → bullish
+          vannaDir = 'bullish';
+          vannaWeight = Math.min(0.12, 0.06 * vannaConfidence);
+        } else if (ivTrending === 'low') {
+          // IV may expand → dealers sell → bearish headwind
+          vannaDir = 'bearish';
+          vannaWeight = -Math.min(0.08, 0.04 * vannaConfidence);
+        }
+      } else {
+        if (ivTrending === 'high') {
+          vannaDir = 'bearish';
+          vannaWeight = -Math.min(0.12, 0.06 * vannaConfidence);
+        } else if (ivTrending === 'low') {
+          vannaDir = 'bullish';
+          vannaWeight = Math.min(0.08, 0.04 * vannaConfidence);
+        }
+      }
+
+      if (vannaWeight !== 0) {
+        signals.push({
+          name: 'Vanna Exposure',
+          direction: vannaDir,
+          weight: vannaWeight,
+          description: `Net vanna ${input.totalVanna > 0 ? 'positive' : 'negative'} (${abbr(input.totalVanna)}) — ${
+            vannaDir === 'bullish'
+              ? 'dealers will buy as IV normalizes, supportive flow'
+              : 'dealers will sell as IV shifts, creates headwind'
+          }${ivTrending === 'mid' ? ' (mid-range IV — vanna effect muted)' : ` (IV rank ${input.ivRank} — ${ivTrending} vol regime amplifies vanna)`}`,
+        });
+      }
+    }
+  }
+
+  // 18. Charm Exposure — dealer delta drift from time passage
+  //     Positive charm = dealers gaining delta as time passes → need to sell to stay hedged → headwind
+  //     Negative charm = dealers losing delta → need to buy → supportive
+  //     Most relevant near expiration (theta accelerates)
+  //     OI-based — works regardless of market hours
+  if (input.totalCharm !== undefined && input.totalCharm !== 0) {
+    const charmConfidence = totalOI > 5000 ? Math.min(1, totalOI / 50000) : 0;
+    const nearExpiry = input.nearestDTE <= 5; // charm matters most near expiration
+
+    if (charmConfidence > 0) {
+      const dteFactor = nearExpiry ? 1.5 : 1; // amplify near expiry
+      // Negative charm = delta decays → dealers must buy → bullish
+      // Positive charm = delta grows → dealers must sell → bearish
+      const charmDir: Direction = input.totalCharm < 0 ? 'bullish' : 'bearish';
+      const charmWeight = clamp(
+        (input.totalCharm < 0 ? 1 : -1) * Math.min(0.10, 0.05 * dteFactor) * charmConfidence,
+        -0.10, 0.10
+      );
+
+      if (Math.abs(charmWeight) > 0.01) {
+        signals.push({
+          name: 'Charm Exposure',
+          direction: charmDir,
+          weight: charmWeight,
+          description: `Net charm ${input.totalCharm > 0 ? 'positive' : 'negative'} (${abbr(input.totalCharm)}) — ${
+            charmDir === 'bullish'
+              ? 'time decay forces dealers to buy underlying (delta decaying)'
+              : 'time decay forces dealers to sell underlying (delta growing)'
+          }${nearExpiry ? ` — amplified with ${input.nearestDTE}d to expiration` : ''}`,
+        });
+      }
+    }
+  }
+
+  // 19. IV Term Structure Slope — contango vs backwardation
+  //     Backwardation (near IV > far IV) = market pricing imminent risk/event
+  //     Contango (near IV < far IV) = normal conditions, no near-term catalyst priced
+  //     Measured as (near IV - next IV) / next IV to normalize
+  if (input.nearTermIV !== undefined && input.nextTermIV !== undefined && input.nextTermIV > 0.01) {
+    const slope = (input.nearTermIV - input.nextTermIV) / input.nextTermIV;
+    const slopePct = slope * 100;
+
+    if (Math.abs(slopePct) > 5) { // only signal when meaningfully inverted or steep
+      // Backwardation (positive slope > 5%) = near-term event risk priced in
+      // → vol likely to compress post-event → bullish (if event passes without incident)
+      // → but also means near-term options expensive (avoid buying short-dated)
+      // Contango (negative slope < -5%) = term structure normal, no catalyst
+      const tsDir: Direction = slopePct > 10 ? 'neutral' : 'neutral'; // not directional per se
+      const tsWeight = 0; // info-only: the direction depends on the event, not the slope itself
+
+      signals.push({
+        name: 'IV Term Structure',
+        direction: tsDir,
+        weight: tsWeight,
+        description: slopePct > 5
+          ? `Backwardation: near-term IV ${slopePct.toFixed(0)}% above next term (${(input.nearTermIV * 100).toFixed(0)}% vs ${(input.nextTermIV * 100).toFixed(0)}%) — event risk priced in, avoid buying short-dated premium`
+          : `Steep contango: near-term IV ${Math.abs(slopePct).toFixed(0)}% below next term — no near-term catalyst, short-dated options may be relatively cheap`,
+      });
+    }
+  }
+
+  // 20. OI Concentration — pinning/magnet effect
+  //     When top 3 strikes hold >50% of total OI, those strikes act as strong magnets
+  //     Strengthens max pain / pinning thesis, supports range-bound strategies
+  if (input.oiConcentration !== undefined && input.oiConcentration > 40) {
+    const isHigh = input.oiConcentration > 60;
+    signals.push({
+      name: 'OI Concentration',
+      direction: 'neutral',
+      weight: 0, // info-only: supports strategy selection, not directional
+      description: isHigh
+        ? `High OI concentration (${input.oiConcentration.toFixed(0)}%) — top strikes act as strong magnets, pinning likely. Favors range-bound strategies.`
+        : `Moderate OI concentration (${input.oiConcentration.toFixed(0)}%) — some magnet effect from top strikes.`,
+    });
+  }
+
+  // 21. VIX Regime — market-wide volatility context
+  //     Provides regime awareness but not per-ticker directional signal
+  //     VIX > 25 = elevated fear, wide ranges, premium selling edge
+  //     VIX < 15 = complacency, options cheap, potential for vol expansion
+  if (input.vixLevel !== undefined && input.vixLevel > 0) {
+    if (input.vixLevel > 30) {
+      signals.push({
+        name: 'VIX Regime',
+        direction: 'neutral',
+        weight: 0,
+        description: `VIX at ${input.vixLevel.toFixed(1)} — extreme fear. Expect wide intraday ranges. Premium selling has edge but size conservatively.`,
+      });
+    } else if (input.vixLevel > 20) {
+      signals.push({
+        name: 'VIX Regime',
+        direction: 'neutral',
+        weight: 0,
+        description: `VIX at ${input.vixLevel.toFixed(1)} — elevated. Options are rich; favor premium selling. Market may be range-bound at elevated vol.`,
+      });
+    } else if (input.vixLevel < 13) {
+      signals.push({
+        name: 'VIX Regime',
+        direction: 'neutral',
+        weight: 0,
+        description: `VIX at ${input.vixLevel.toFixed(1)} — extreme complacency. Options are cheap. Watch for vol expansion catalyst.`,
+      });
+    }
   }
 
   return signals;
