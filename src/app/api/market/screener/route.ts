@@ -62,7 +62,7 @@ export interface ScreenerResult {
   regSHO: boolean;
 }
 
-const CONCURRENCY = 8; // maximize stocks scanned within 60s Hobby timeout
+const CONCURRENCY = 5; // reduced from 8 — Tradier rate-limits at ~500 calls/window
 
 async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -365,6 +365,7 @@ export async function GET(request: NextRequest) {
 
       const results: ScreenerResult[] = [];
       let completed = 0;
+      let nullStreak = 0; // Track consecutive null results (rate limit indicator)
 
       // Process in batches with concurrency control
       for (let i = 0; i < symbols.length; i += CONCURRENCY) {
@@ -387,13 +388,31 @@ export async function GET(request: NextRequest) {
           })
         );
 
+        const batchNulls = batchResults.filter(r => r === null).length;
+        if (batchNulls === batch.length) {
+          nullStreak += batch.length;
+        } else {
+          nullStreak = 0;
+        }
+
         for (const r of batchResults) {
           if (r) results.push(r);
         }
 
-        // Small delay between batches to avoid rate limit spikes
+        // Adaptive delay: slow down when hitting rate limits
         if (i + CONCURRENCY < symbols.length) {
-          await sleep(100);
+          if (nullStreak >= 10) {
+            // Heavily rate-limited — long pause to let window reset
+            send({ type: 'progress', completed, total: symbols.length, current: '(rate limited — pausing 15s)' });
+            await sleep(15000);
+            nullStreak = 0; // reset after pause
+          } else if (batchNulls > 0) {
+            // Some failures — moderate pause
+            await sleep(2000);
+          } else {
+            // All good — small delay to stay under rate limits
+            await sleep(500);
+          }
         }
       }
 

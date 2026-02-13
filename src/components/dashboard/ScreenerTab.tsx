@@ -144,6 +144,8 @@ export default function ScreenerTab() {
     const chunkLog: typeof scanLog = [];
 
     try {
+      let consecutiveEmpty = 0;
+
       // Split into chunks that each fit within the 60s serverless timeout
       for (let i = 0; i < allSymbols.length; i += CHUNK_SIZE) {
         if (controller.signal.aborted) break;
@@ -168,12 +170,39 @@ export default function ScreenerTab() {
           chunkLog.push({ chunk: chunkIdx, sent: chunk.length, received, ms: Date.now() - chunkStart });
           setScanLog([...chunkLog]);
           console.log(`[Screener] Chunk ${chunkIdx}/${totalChunks}: ${received}/${chunk.length} stocks in ${Date.now() - chunkStart}ms`);
+
+          // Adaptive rate limit handling
+          if (received === 0) {
+            consecutiveEmpty++;
+          } else if (received < chunk.length * 0.5) {
+            consecutiveEmpty = Math.max(1, consecutiveEmpty); // at least partial
+          } else {
+            consecutiveEmpty = 0;
+          }
         } catch (err) {
           if ((err as Error).name === 'AbortError') break;
           const received = accumulated.length - beforeCount;
           chunkLog.push({ chunk: chunkIdx, sent: chunk.length, received, ms: Date.now() - chunkStart, error: (err as Error).message });
           setScanLog([...chunkLog]);
           console.warn(`[Screener] Chunk ${chunkIdx}/${totalChunks} failed after ${received}/${chunk.length} stocks (${Date.now() - chunkStart}ms): ${(err as Error).message}`);
+          consecutiveEmpty++;
+        }
+
+        // Inter-chunk delay based on rate limit state
+        if (i + CHUNK_SIZE < allSymbols.length && !controller.signal.aborted) {
+          if (consecutiveEmpty >= 2) {
+            // Heavily rate-limited: pause 30s to let Tradier window reset
+            setProgress(p => ({ ...p, current: `Rate limited — pausing 30s (${accumulated.length} stocks so far)` }));
+            await new Promise(r => setTimeout(r, 30000));
+            consecutiveEmpty = 0; // reset after pause
+          } else if (consecutiveEmpty === 1) {
+            // Partially rate-limited: short pause
+            setProgress(p => ({ ...p, current: `Approaching rate limit — pausing 10s...` }));
+            await new Promise(r => setTimeout(r, 10000));
+          } else {
+            // Healthy: small delay to stay under limits
+            await new Promise(r => setTimeout(r, 2000));
+          }
         }
       }
 
@@ -737,7 +766,7 @@ export default function ScreenerTab() {
               Start Full Scan
             </button>
             <p className="text-xs text-text-muted/40 mt-3 font-mono">
-              Takes ~3-5 minutes — scans in chunks to avoid serverless timeouts
+              Takes ~5-10 minutes — throttled to stay within API rate limits
             </p>
           </div>
         </div>
