@@ -62,7 +62,7 @@ export interface ScreenerResult {
   regSHO: boolean;
 }
 
-const CONCURRENCY = 5; // reduced from 8 — Tradier rate-limits at ~500 calls/window
+const CONCURRENCY = 3; // reduced from 5 — each stock makes ~4 Tradier calls, keep burst small
 
 async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -400,18 +400,20 @@ export async function GET(request: NextRequest) {
         }
 
         // Adaptive delay: slow down when hitting rate limits
+        // Tradier allows ~120 req/min (free) or ~500/min (sandbox)
+        // Each stock = ~4 calls, so 3 concurrent = ~12 calls per batch
         if (i + CONCURRENCY < symbols.length) {
-          if (nullStreak >= 10) {
+          if (nullStreak >= 6) {
             // Heavily rate-limited — long pause to let window reset
-            send({ type: 'progress', completed, total: symbols.length, current: '(rate limited — pausing 15s)' });
-            await sleep(15000);
+            send({ type: 'progress', completed, total: symbols.length, current: '(rate limited — pausing 20s)' });
+            await sleep(20000);
             nullStreak = 0; // reset after pause
           } else if (batchNulls > 0) {
             // Some failures — moderate pause
-            await sleep(2000);
+            await sleep(3000);
           } else {
-            // All good — small delay to stay under rate limits
-            await sleep(500);
+            // All good — steady pace to avoid bursting
+            await sleep(1200);
           }
         }
       }

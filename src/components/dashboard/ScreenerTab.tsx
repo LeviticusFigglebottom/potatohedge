@@ -53,7 +53,7 @@ export default function ScreenerTab() {
   const [scanTimestamp, setScanTimestamp] = useState<number | null>(null);
   const [trackedSymbols, setTrackedSymbols] = useState<Set<string>>(new Set());
   const [includeRetail, setIncludeRetail] = useState(false);
-  const [scanLog, setScanLog] = useState<{ chunk: number; sent: number; received: number; ms: number; error?: string }[]>([]);
+  const [scanLog, setScanLog] = useState<{ chunk: number; sent: number; received: number; ms: number; error?: string; retry?: number }[]>([]);
   const abortRef = useRef<AbortController | null>(null);
 
   // Load cached screener results + tracked symbols on mount
@@ -121,7 +121,47 @@ export default function ScreenerTab() {
     }
   }, []);
 
-  const CHUNK_SIZE = 25; // 25 stocks per request — safely within 60s Hobby timeout
+  const CHUNK_SIZE = 20; // 20 stocks per request — keeps Tradier calls per chunk under ~80
+
+  /**
+   * Scan a single chunk of symbols, returning the number of results received.
+   * Appends results to `accumulated`, logs to `chunkLog`, and updates state.
+   */
+  const scanChunk = useCallback(async (
+    symbols: string[],
+    chunkIdx: number,
+    accumulated: ScreenerResult[],
+    chunkLog: { chunk: number; sent: number; received: number; ms: number; error?: string; retry?: number }[],
+    globalOffset: number,
+    globalTotal: number,
+    controller: AbortController,
+    retryPass?: number,
+  ): Promise<number> => {
+    const scanUrl = `/api/market/screener?symbols=${symbols.join(',')}`;
+    const beforeCount = accumulated.length;
+    const chunkStart = Date.now();
+
+    try {
+      const res = await fetch(scanUrl, { signal: controller.signal });
+      if (!res.ok || !res.body) {
+        chunkLog.push({ chunk: chunkIdx, sent: symbols.length, received: 0, ms: Date.now() - chunkStart, error: `HTTP ${res.status}`, retry: retryPass });
+        setScanLog([...chunkLog]);
+        return 0;
+      }
+
+      await processStream(res, accumulated, globalOffset, globalTotal, controller.signal);
+      const received = accumulated.length - beforeCount;
+      chunkLog.push({ chunk: chunkIdx, sent: symbols.length, received, ms: Date.now() - chunkStart, retry: retryPass });
+      setScanLog([...chunkLog]);
+      return received;
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') throw err;
+      const received = accumulated.length - beforeCount;
+      chunkLog.push({ chunk: chunkIdx, sent: symbols.length, received, ms: Date.now() - chunkStart, error: (err as Error).message, retry: retryPass });
+      setScanLog([...chunkLog]);
+      return received;
+    }
+  }, [processStream]);
 
   const startScan = useCallback(async () => {
     if (scanning) {
@@ -141,72 +181,120 @@ export default function ScreenerTab() {
     setProgress({ completed: 0, total: allSymbols.length, current: '' });
 
     const accumulated: ScreenerResult[] = [];
-    const chunkLog: typeof scanLog = [];
+    const chunkLog: { chunk: number; sent: number; received: number; ms: number; error?: string; retry?: number }[] = [];
+    let chunkCounter = 0;
 
     try {
+      // ═══════════════════════════════════════════════════
+      // PASS 1: Initial scan of all symbols
+      // ═══════════════════════════════════════════════════
       let consecutiveEmpty = 0;
 
-      // Split into chunks that each fit within the 60s serverless timeout
       for (let i = 0; i < allSymbols.length; i += CHUNK_SIZE) {
         if (controller.signal.aborted) break;
 
         const chunk = allSymbols.slice(i, i + CHUNK_SIZE);
-        const chunkIdx = Math.floor(i / CHUNK_SIZE) + 1;
+        chunkCounter++;
         const totalChunks = Math.ceil(allSymbols.length / CHUNK_SIZE);
-        const scanUrl = `/api/market/screener?symbols=${chunk.join(',')}`;
-        const beforeCount = accumulated.length;
-        const chunkStart = Date.now();
 
-        try {
-          const res = await fetch(scanUrl, { signal: controller.signal });
-          if (!res.ok || !res.body) {
-            chunkLog.push({ chunk: chunkIdx, sent: chunk.length, received: 0, ms: Date.now() - chunkStart, error: `HTTP ${res.status}` });
-            setScanLog([...chunkLog]);
-            continue;
-          }
+        const received = await scanChunk(chunk, chunkCounter, accumulated, chunkLog, i, allSymbols.length, controller);
+        console.log(`[Screener] Chunk ${chunkCounter}/${totalChunks}: ${received}/${chunk.length} in pass 1`);
 
-          await processStream(res, accumulated, i, allSymbols.length, controller.signal);
-          const received = accumulated.length - beforeCount;
-          chunkLog.push({ chunk: chunkIdx, sent: chunk.length, received, ms: Date.now() - chunkStart });
-          setScanLog([...chunkLog]);
-          console.log(`[Screener] Chunk ${chunkIdx}/${totalChunks}: ${received}/${chunk.length} stocks in ${Date.now() - chunkStart}ms`);
-
-          // Adaptive rate limit handling
-          if (received === 0) {
-            consecutiveEmpty++;
-          } else if (received < chunk.length * 0.5) {
-            consecutiveEmpty = Math.max(1, consecutiveEmpty); // at least partial
-          } else {
-            consecutiveEmpty = 0;
-          }
-        } catch (err) {
-          if ((err as Error).name === 'AbortError') break;
-          const received = accumulated.length - beforeCount;
-          chunkLog.push({ chunk: chunkIdx, sent: chunk.length, received, ms: Date.now() - chunkStart, error: (err as Error).message });
-          setScanLog([...chunkLog]);
-          console.warn(`[Screener] Chunk ${chunkIdx}/${totalChunks} failed after ${received}/${chunk.length} stocks (${Date.now() - chunkStart}ms): ${(err as Error).message}`);
+        // Adaptive rate limit tracking
+        if (received === 0) {
           consecutiveEmpty++;
+        } else if (received < chunk.length * 0.5) {
+          consecutiveEmpty = Math.max(1, consecutiveEmpty);
+        } else {
+          consecutiveEmpty = 0;
         }
 
-        // Inter-chunk delay based on rate limit state
+        // Inter-chunk delay — much more conservative to avoid alternating failures
         if (i + CHUNK_SIZE < allSymbols.length && !controller.signal.aborted) {
           if (consecutiveEmpty >= 2) {
-            // Heavily rate-limited: pause 30s to let Tradier window reset
-            setProgress(p => ({ ...p, current: `Rate limited — pausing 30s (${accumulated.length} stocks so far)` }));
+            setProgress(p => ({ ...p, current: `Rate limited — cooling down 30s (${accumulated.length} stocks so far)` }));
             await new Promise(r => setTimeout(r, 30000));
-            consecutiveEmpty = 0; // reset after pause
+            consecutiveEmpty = 0;
           } else if (consecutiveEmpty === 1) {
-            // Partially rate-limited: short pause
-            setProgress(p => ({ ...p, current: `Approaching rate limit — pausing 10s...` }));
-            await new Promise(r => setTimeout(r, 10000));
+            setProgress(p => ({ ...p, current: `Rate limit detected — pausing 15s...` }));
+            await new Promise(r => setTimeout(r, 15000));
           } else {
-            // Healthy: small delay to stay under limits
-            await new Promise(r => setTimeout(r, 2000));
+            // Healthy: 5s between chunks to stay well under burst limit
+            await new Promise(r => setTimeout(r, 5000));
           }
         }
       }
 
+      // ═══════════════════════════════════════════════════
+      // PASS 2+3: Retry any missed symbols
+      // ═══════════════════════════════════════════════════
+      const MAX_RETRY_PASSES = 2;
+
+      for (let retryPass = 1; retryPass <= MAX_RETRY_PASSES; retryPass++) {
+        if (controller.signal.aborted) break;
+
+        // Find symbols that weren't in any accumulated result
+        const scannedSymbols = new Set(accumulated.map(r => r.symbol));
+        const missed = allSymbols.filter(s => !scannedSymbols.has(s));
+
+        if (missed.length === 0) {
+          console.log(`[Screener] All ${allSymbols.length} symbols scanned — no retry needed`);
+          break;
+        }
+
+        console.log(`[Screener] Retry pass ${retryPass}: ${missed.length} missed symbols`);
+        setProgress(p => ({
+          ...p,
+          current: `Retrying ${missed.length} missed stocks (pass ${retryPass}/${MAX_RETRY_PASSES}) — cooling down 20s...`,
+        }));
+
+        // Cooldown before retry pass to let rate limits fully reset
+        await new Promise(r => setTimeout(r, 20000));
+
+        consecutiveEmpty = 0;
+        for (let i = 0; i < missed.length; i += CHUNK_SIZE) {
+          if (controller.signal.aborted) break;
+
+          const chunk = missed.slice(i, i + CHUNK_SIZE);
+          chunkCounter++;
+
+          const received = await scanChunk(chunk, chunkCounter, accumulated, chunkLog, 0, allSymbols.length, controller, retryPass);
+          console.log(`[Screener] Retry ${retryPass} chunk: ${received}/${chunk.length}`);
+
+          // Update live results
+          if (accumulated.length > 0 && accumulated.length % 5 === 0) {
+            const sorted = [...accumulated].sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
+            setResults(sorted);
+          }
+
+          if (received === 0) consecutiveEmpty++;
+          else consecutiveEmpty = 0;
+
+          // More conservative delays during retries
+          if (i + CHUNK_SIZE < missed.length && !controller.signal.aborted) {
+            if (consecutiveEmpty >= 2) {
+              setProgress(p => ({ ...p, current: `Still rate limited — pausing 30s (retry ${retryPass})` }));
+              await new Promise(r => setTimeout(r, 30000));
+              consecutiveEmpty = 0;
+            } else {
+              // Always wait 8s between retry chunks
+              await new Promise(r => setTimeout(r, 8000));
+            }
+          }
+        }
+
+        setProgress(p => ({ ...p, completed: accumulated.length }));
+      }
+
+      // ═══════════════════════════════════════════════════
       // Finalize and persist
+      // ═══════════════════════════════════════════════════
+      const scannedFinal = new Set(accumulated.map(r => r.symbol));
+      const stillMissed = allSymbols.filter(s => !scannedFinal.has(s));
+      if (stillMissed.length > 0) {
+        console.warn(`[Screener] ${stillMissed.length} symbols still missed after retries: ${stillMissed.slice(0, 10).join(', ')}...`);
+      }
+
       if (accumulated.length > 0) {
         const sorted = accumulated.sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
         setResults(sorted);
@@ -218,7 +306,7 @@ export default function ScreenerTab() {
     } finally {
       setScanning(false);
     }
-  }, [scanning, includeRetail, processStream]);
+  }, [scanning, includeRetail, scanChunk]);
 
   const navigateToStock = useCallback((symbol: string) => {
     loadSymbol(symbol);
@@ -503,16 +591,17 @@ export default function ScreenerTab() {
             <details className="text-xs font-mono">
               <summary className="text-text-muted cursor-pointer hover:text-text-secondary">
                 Scan Log: {scanLog.reduce((s, c) => s + c.received, 0)} stocks from {scanLog.length} chunks
+                {scanLog.some(c => c.retry) && <span className="text-accent-cyan ml-2">(+{scanLog.filter(c => c.retry).length} retries)</span>}
                 {scanLog.some(c => c.error) && <span className="text-yellow-400 ml-2">({scanLog.filter(c => c.error).length} errors)</span>}
               </summary>
               <div className="mt-1.5 space-y-0.5">
                 {scanLog.map((c, i) => (
                   <div key={i} className={`flex items-center gap-2 ${c.error ? 'text-yellow-400' : c.received === c.sent ? 'text-text-muted' : 'text-amber-400/70'}`}>
-                    <span>Chunk {c.chunk}:</span>
+                    <span>{c.retry ? `Retry${c.retry}` : 'Chunk'} {c.chunk}:</span>
                     <span>{c.received}/{c.sent}</span>
                     <span className="text-text-muted/50">{(c.ms / 1000).toFixed(1)}s</span>
                     {c.error && <span className="text-red-400 truncate">{c.error}</span>}
-                    {!c.error && c.received < c.sent && <span className="text-amber-400/50">(partial — timeout?)</span>}
+                    {!c.error && c.received < c.sent && <span className="text-amber-400/50">(rate limited)</span>}
                   </div>
                 ))}
               </div>
@@ -843,7 +932,7 @@ export default function ScreenerTab() {
               Start Full Scan
             </button>
             <p className="text-xs text-text-muted/40 mt-3 font-mono">
-              Takes ~5-10 minutes — throttled to stay within API rate limits
+              Takes ~10-15 minutes — throttled with retries to ensure all stocks are scanned
             </p>
           </div>
         </div>
