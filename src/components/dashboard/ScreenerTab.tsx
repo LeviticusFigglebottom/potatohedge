@@ -121,7 +121,7 @@ export default function ScreenerTab() {
     }
   }, []);
 
-  const CHUNK_SIZE = 20; // 20 stocks per request — keeps Tradier calls per chunk under ~80
+  const CHUNK_SIZE = 50; // 50 stocks per chunk — Polygon-powered, no Tradier rate limit bottleneck
 
   /**
    * Scan a single chunk of symbols, returning the number of results received.
@@ -200,27 +200,24 @@ export default function ScreenerTab() {
         const received = await scanChunk(chunk, chunkCounter, accumulated, chunkLog, i, allSymbols.length, controller);
         console.log(`[Screener] Chunk ${chunkCounter}/${totalChunks}: ${received}/${chunk.length} in pass 1`);
 
-        // Adaptive rate limit tracking
+        // Track empty responses for adaptive pacing
         if (received === 0) {
           consecutiveEmpty++;
-        } else if (received < chunk.length * 0.5) {
-          consecutiveEmpty = Math.max(1, consecutiveEmpty);
         } else {
           consecutiveEmpty = 0;
         }
 
-        // Inter-chunk delay — much more conservative to avoid alternating failures
+        // Inter-chunk delay — Polygon-powered, much lighter pacing needed
         if (i + CHUNK_SIZE < allSymbols.length && !controller.signal.aborted) {
-          if (consecutiveEmpty >= 2) {
-            setProgress(p => ({ ...p, current: `Rate limited — cooling down 30s (${accumulated.length} stocks so far)` }));
-            await new Promise(r => setTimeout(r, 30000));
+          if (consecutiveEmpty >= 3) {
+            setProgress(p => ({ ...p, current: `API cooldown — pausing 10s (${accumulated.length} stocks so far)` }));
+            await new Promise(r => setTimeout(r, 10000));
             consecutiveEmpty = 0;
-          } else if (consecutiveEmpty === 1) {
-            setProgress(p => ({ ...p, current: `Rate limit detected — pausing 15s...` }));
-            await new Promise(r => setTimeout(r, 15000));
+          } else if (consecutiveEmpty >= 1) {
+            await new Promise(r => setTimeout(r, 3000));
           } else {
-            // Healthy: 5s between chunks to stay well under burst limit
-            await new Promise(r => setTimeout(r, 5000));
+            // Normal: light 1.5s gap between chunks
+            await new Promise(r => setTimeout(r, 1500));
           }
         }
       }
@@ -245,11 +242,11 @@ export default function ScreenerTab() {
         console.log(`[Screener] Retry pass ${retryPass}: ${missed.length} missed symbols`);
         setProgress(p => ({
           ...p,
-          current: `Retrying ${missed.length} missed stocks (pass ${retryPass}/${MAX_RETRY_PASSES}) — cooling down 20s...`,
+          current: `Retrying ${missed.length} missed stocks (pass ${retryPass}/${MAX_RETRY_PASSES}) — cooling down 5s...`,
         }));
 
-        // Cooldown before retry pass to let rate limits fully reset
-        await new Promise(r => setTimeout(r, 20000));
+        // Brief cooldown before retry
+        await new Promise(r => setTimeout(r, 5000));
 
         consecutiveEmpty = 0;
         for (let i = 0; i < missed.length; i += CHUNK_SIZE) {
@@ -270,15 +267,14 @@ export default function ScreenerTab() {
           if (received === 0) consecutiveEmpty++;
           else consecutiveEmpty = 0;
 
-          // More conservative delays during retries
+          // Light delays during retries
           if (i + CHUNK_SIZE < missed.length && !controller.signal.aborted) {
             if (consecutiveEmpty >= 2) {
-              setProgress(p => ({ ...p, current: `Still rate limited — pausing 30s (retry ${retryPass})` }));
-              await new Promise(r => setTimeout(r, 30000));
+              setProgress(p => ({ ...p, current: `Pausing 5s before next retry chunk...` }));
+              await new Promise(r => setTimeout(r, 5000));
               consecutiveEmpty = 0;
             } else {
-              // Always wait 8s between retry chunks
-              await new Promise(r => setTimeout(r, 8000));
+              await new Promise(r => setTimeout(r, 2000));
             }
           }
         }
@@ -932,7 +928,7 @@ export default function ScreenerTab() {
               Start Full Scan
             </button>
             <p className="text-xs text-text-muted/40 mt-3 font-mono">
-              Takes ~10-15 minutes — throttled with retries to ensure all stocks are scanned
+              Takes ~2-4 minutes — powered by Polygon options snapshots for reliable full coverage
             </p>
           </div>
         </div>

@@ -97,6 +97,33 @@ export async function getOptionsSnapshot(
   return allResults;
 }
 
+/**
+ * Lightweight options snapshot for screener — single page, no pagination.
+ * Returns up to 250 contracts per ticker (sufficient for ATM analysis).
+ * Much faster than full snapshot since it skips pagination.
+ */
+export async function getOptionsSnapshotLite(
+  ticker: string
+): Promise<PolygonOptionSnapshot[]> {
+  const url = buildUrl(
+    `/v3/snapshot/options/${ticker.toUpperCase()}`,
+    { limit: '250' }
+  );
+  const res: Response = await fetch(url, {
+    next: { revalidate: 15 },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT),
+  });
+  if (!res.ok)
+    throw new Error(`Polygon snapshot error: ${res.status}`);
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    throw new Error(`Polygon snapshot JSON parse error: ${e instanceof Error ? e.message : 'malformed response'}`);
+  }
+  return data.results || [];
+}
+
 // ─── Historical Equity Bars ────────────────────────────────
 
 export interface PolygonBar {

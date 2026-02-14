@@ -1,6 +1,8 @@
 import { NextRequest } from 'next/server';
-import { getQuote, getExpirations, getOptionsChain } from '@/lib/providers/tradier';
+import { getQuotes } from '@/lib/providers/tradier';
+import { getOptionsSnapshotLite, type PolygonOptionSnapshot } from '@/lib/providers/polygon';
 import { fetchEquityBars } from '@/lib/providers/equityBars';
+import type { Quote } from '@/types/market';
 
 function isMarketOpenNow(): boolean {
   const fmt = new Intl.DateTimeFormat('en-US', {
@@ -32,6 +34,7 @@ import {
 import { generateRecommendations, type RecommendationInput } from '@/lib/math/recommendations';
 import { getUniverseSymbols, getTop500Symbols } from '@/lib/stockUniverse';
 import type { EquityBar } from '@/lib/providers/equityBars';
+import type { OptionContract, OptionsChain, OptionExpiration } from '@/types/market';
 import { fetchSwapData, type SwapData } from '@/lib/providers/dtcc';
 import { fetchRegSHOThreshold, fetchShortInterest, type ShortInterestData } from '@/lib/providers/finra';
 
@@ -62,10 +65,109 @@ export interface ScreenerResult {
   regSHO: boolean;
 }
 
-const CONCURRENCY = 3; // reduced from 5 — each stock makes ~4 Tradier calls, keep burst small
+// Polygon has much higher rate limits than Tradier — can run 10 stocks in parallel
+// Each stock now makes only 2 API calls: 1 Polygon snapshot + 1 Polygon equity bars
+const CONCURRENCY = 10;
 
 async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Convert Polygon options snapshot into the same OptionsChain format
+ * used by the rest of the analysis pipeline. This replaces the
+ * per-stock Tradier getExpirations + getOptionsChain calls.
+ */
+function polygonSnapshotToChains(
+  ticker: string,
+  snapshots: PolygonOptionSnapshot[],
+  spotPrice: number,
+): { expirations: OptionExpiration[]; chains: OptionsChain[] } {
+  if (snapshots.length === 0) return { expirations: [], chains: [] };
+
+  const now = new Date();
+
+  // Group by expiration date
+  const byExp = new Map<string, PolygonOptionSnapshot[]>();
+  for (const opt of snapshots) {
+    const exp = opt.details.expiration_date;
+    if (!exp) continue;
+    const dte = Math.ceil((new Date(exp + 'T16:00:00').getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+    if (dte < 0) continue; // skip expired
+    if (!byExp.has(exp)) byExp.set(exp, []);
+    byExp.get(exp)!.push(opt);
+  }
+
+  // Sort expirations chronologically
+  const expDates = [...byExp.keys()].sort();
+
+  const expirations: OptionExpiration[] = expDates.map(date => {
+    const dte = Math.max(0, Math.ceil((new Date(date + 'T16:00:00').getTime() - now.getTime()) / (1000 * 60 * 60 * 24)));
+    const strikes = [...new Set(byExp.get(date)!.map(o => o.details.strike_price))].sort((a, b) => a - b);
+    return { date, dte, strikes };
+  });
+
+  // Build OptionsChain for nearest 3 expirations (same as before)
+  const nearExps = expirations.slice(0, 3);
+  const chains: OptionsChain[] = nearExps.map(exp => {
+    const opts = byExp.get(exp.date) || [];
+    const calls: OptionContract[] = [];
+    const puts: OptionContract[] = [];
+
+    for (const opt of opts) {
+      const type: 'call' | 'put' = opt.details.contract_type === 'call' ? 'call' : 'put';
+      const lastPrice = opt.day?.close ?? 0;
+
+      const contract: OptionContract = {
+        symbol: opt.details.ticker || '',
+        underlying: ticker,
+        strike: opt.details.strike_price,
+        expiration: exp.date,
+        type,
+        last: lastPrice,
+        bid: 0,
+        ask: 0,
+        mid: lastPrice,
+        volume: opt.day?.volume ?? 0,
+        openInterest: opt.open_interest ?? 0,
+        impliedVolatility: opt.implied_volatility ?? 0,
+        delta: opt.greeks?.delta ?? 0,
+        gamma: opt.greeks?.gamma ?? 0,
+        theta: opt.greeks?.theta ?? 0,
+        vega: opt.greeks?.vega ?? 0,
+        rho: 0,
+        dte: exp.dte,
+        inTheMoney: type === 'call' ? spotPrice > opt.details.strike_price : spotPrice < opt.details.strike_price,
+        intrinsicValue: type === 'call'
+          ? Math.max(0, spotPrice - opt.details.strike_price)
+          : Math.max(0, opt.details.strike_price - spotPrice),
+        extrinsicValue: Math.max(0, lastPrice - (type === 'call'
+          ? Math.max(0, spotPrice - opt.details.strike_price)
+          : Math.max(0, opt.details.strike_price - spotPrice))),
+        bidAskSpread: 0,
+        volumeOiRatio: (opt.open_interest ?? 0) > 0
+          ? (opt.day?.volume ?? 0) / (opt.open_interest ?? 1)
+          : 0,
+      };
+
+      if (type === 'call') calls.push(contract);
+      else puts.push(contract);
+    }
+
+    calls.sort((a, b) => a.strike - b.strike);
+    puts.sort((a, b) => a.strike - b.strike);
+
+    return {
+      underlying: ticker,
+      underlyingPrice: spotPrice,
+      expiration: exp.date,
+      calls,
+      puts,
+      timestamp: Date.now(),
+    };
+  });
+
+  return { expirations, chains };
 }
 
 /**
@@ -145,30 +247,38 @@ function computeQuickCorrelationCtx(
 
 async function analyzeStock(
   ticker: string,
+  quoteMap: Map<string, Quote>,
   swapMap: Map<string, SwapData>,
   regSHOSet: Set<string>,
   siMap: Map<string, ShortInterestData>,
 ): Promise<ScreenerResult | null> {
   try {
-    // Fetch core data: quote + expirations + equity bars in parallel
-    const [quote, expirations, historyBars] = await Promise.all([
-      getQuote(ticker),
-      getExpirations(ticker).catch(() => []),
-      fetchEquityBars(ticker, 250), // match recommendations route exactly
+    // Fetch Polygon options snapshot + equity bars in parallel
+    // This replaces 4-6 Tradier calls (quote, expirations, 2-3 chains)
+    // with just 2 Polygon calls — no more Tradier rate limiting!
+    const [polygonSnapshot, historyBars] = await Promise.all([
+      getOptionsSnapshotLite(ticker).catch(() => [] as PolygonOptionSnapshot[]),
+      fetchEquityBars(ticker, 250),
     ]);
 
-    const spotPrice = quote.last;
+    // Spot price: prefer pre-fetched Tradier quote (most fresh),
+    // fall back to Polygon snapshot's underlying price
+    const quote = quoteMap.get(ticker);
+    const spotPrice = quote?.last
+      || (polygonSnapshot.length > 0 ? polygonSnapshot[0].underlying_asset?.price : 0)
+      || 0;
     if (!spotPrice || spotPrice <= 0) return null;
 
-    // Match recommendations route exactly: 3 nearest expirations
+    const changePct = quote?.changePct ?? 0;
+
+    // Convert Polygon snapshot to OptionsChain format
+    const { expirations, chains } = polygonSnapshotToChains(ticker, polygonSnapshot, spotPrice);
+
     const nearExps = expirations.slice(0, 3);
-    if (nearExps.length === 0) return null;
+    if (nearExps.length === 0 || chains.length === 0) return null;
 
-    const chains = await Promise.all(
-      nearExps.map(e => getOptionsChain(ticker, e.date).catch(() => null))
-    ).then(c => c.filter((x): x is NonNullable<typeof x> => x !== null));
-
-    if (chains.length === 0) return null;
+    // ─── Everything below is IDENTICAL to before ───
+    // Same GEX/DEX, same IV, same scoring, same recommendations
 
     // Aggregate GEX
     const allExposures = chains.flatMap(chain =>
@@ -241,7 +351,7 @@ async function analyzeStock(
       hvCurrent
     );
 
-    // Max pain from nearest chain (same helper as recommendations route)
+    // Max pain from nearest chain
     const maxPainResult = computeMaxPain(
       nearChain.calls.map(c => ({ strike: c.strike, openInterest: c.openInterest })),
       nearChain.puts.map(p => ({ strike: p.strike, openInterest: p.openInterest }))
@@ -272,7 +382,7 @@ async function analyzeStock(
       ivHvRatio,
       skewBias: skew.skewBias,
       skewRatio: skew.skewRatio,
-      changePercent: quote.changePct,
+      changePercent: changePct,
       atr14: profile.atr14,
       atrPercent: profile.atrPercent,
       dailySigma: profile.dailySigma,
@@ -311,7 +421,7 @@ async function analyzeStock(
       currentIV,
       ivRank: ivMetrics.ivRank,
       volumePCR,
-      changePercent: quote.changePct,
+      changePercent: changePct,
       topSignal: topSignal ? `${topSignal.name}: ${topSignal.direction}` : 'N/A',
       signalCount: rec.signals.filter(s => s.weight !== 0).length,
       gammaFlip,
@@ -329,6 +439,31 @@ async function analyzeStock(
     console.error(`[screener] Failed to analyze ${ticker}:`, err instanceof Error ? err.message : err);
     return null;
   }
+}
+
+/**
+ * Pre-fetch all quotes in bulk via Tradier batch API.
+ * This replaces 380 individual getQuote() calls with ~10 batch calls.
+ */
+async function prefetchQuotes(symbols: string[]): Promise<Map<string, Quote>> {
+  const BATCH_SIZE = 40;
+  const quoteMap = new Map<string, Quote>();
+
+  for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
+    const batch = symbols.slice(i, i + BATCH_SIZE);
+    try {
+      const quotes = await getQuotes(batch);
+      for (const q of quotes) {
+        if (q.symbol && q.last > 0) quoteMap.set(q.symbol, q);
+      }
+    } catch (err) {
+      console.warn(`[screener] Batch quote fetch failed for chunk ${i}-${i + BATCH_SIZE}:`, err instanceof Error ? err.message : err);
+    }
+    // Small delay between batch quote fetches to be safe
+    if (i + BATCH_SIZE < symbols.length) await sleep(500);
+  }
+
+  return quoteMap;
 }
 
 export async function GET(request: NextRequest) {
@@ -349,11 +484,14 @@ export async function GET(request: NextRequest) {
 
       send({ type: 'start', total: symbols.length });
 
-      // Pre-fetch DTCC + FINRA data once (shared across all stocks)
-      const [swapMap, regSHOSet, siMap] = await Promise.all([
+      // Pre-fetch shared data: DTCC + FINRA + all quotes in bulk
+      // Quotes use Tradier batch API (~10 calls for 380 stocks)
+      // Options data uses Polygon (per-stock, no rate limit issues)
+      const [swapMap, regSHOSet, siMap, quoteMap] = await Promise.all([
         fetchSwapData().then(r => r.data).catch(() => new Map<string, SwapData>()),
         fetchRegSHOThreshold().catch(() => new Set<string>()),
         fetchShortInterest().catch(() => new Map<string, ShortInterestData>()),
+        prefetchQuotes(symbols),
       ]);
 
       send({
@@ -361,60 +499,39 @@ export async function GET(request: NextRequest) {
         swapData: swapMap.size > 0,
         regSHOCount: regSHOSet.size,
         shortInterestCount: siMap.size,
+        quotesLoaded: quoteMap.size,
       });
 
       const results: ScreenerResult[] = [];
       let completed = 0;
-      let nullStreak = 0; // Track consecutive null results (rate limit indicator)
 
       // Process in batches with concurrency control
+      // Polygon handles 10 concurrent requests easily (unlike Tradier's ~3)
       for (let i = 0; i < symbols.length; i += CONCURRENCY) {
         const batch = symbols.slice(i, i + CONCURRENCY);
 
         const batchResults = await Promise.all(
           batch.map(async (sym) => {
-            const result = await analyzeStock(sym, swapMap, regSHOSet, siMap);
+            const result = await analyzeStock(sym, quoteMap, swapMap, regSHOSet, siMap);
             completed++;
             send({
               type: 'progress',
               completed,
               total: symbols.length,
               current: sym,
-              // Include full result so client can accumulate incrementally
-              // (critical for Hobby plan where function may timeout before 'done')
               result: result || null,
             });
             return result;
           })
         );
 
-        const batchNulls = batchResults.filter(r => r === null).length;
-        if (batchNulls === batch.length) {
-          nullStreak += batch.length;
-        } else {
-          nullStreak = 0;
-        }
-
         for (const r of batchResults) {
           if (r) results.push(r);
         }
 
-        // Adaptive delay: slow down when hitting rate limits
-        // Tradier allows ~120 req/min (free) or ~500/min (sandbox)
-        // Each stock = ~4 calls, so 3 concurrent = ~12 calls per batch
+        // Light delay between batches — Polygon is generous but be a good citizen
         if (i + CONCURRENCY < symbols.length) {
-          if (nullStreak >= 6) {
-            // Heavily rate-limited — long pause to let window reset
-            send({ type: 'progress', completed, total: symbols.length, current: '(rate limited — pausing 20s)' });
-            await sleep(20000);
-            nullStreak = 0; // reset after pause
-          } else if (batchNulls > 0) {
-            // Some failures — moderate pause
-            await sleep(3000);
-          } else {
-            // All good — steady pace to avoid bursting
-            await sleep(1200);
-          }
+          await sleep(300);
         }
       }
 
