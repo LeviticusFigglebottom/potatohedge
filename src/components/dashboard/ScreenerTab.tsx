@@ -136,8 +136,10 @@ export default function ScreenerTab() {
     globalTotal: number,
     controller: AbortController,
     retryPass?: number,
+    provider?: string,
   ): Promise<number> => {
-    const scanUrl = `/api/market/screener?symbols=${symbols.join(',')}`;
+    const providerParam = provider ? `&provider=${provider}` : '';
+    const scanUrl = `/api/market/screener?symbols=${symbols.join(',')}${providerParam}`;
     const beforeCount = accumulated.length;
     const chunkStart = Date.now();
 
@@ -297,6 +299,66 @@ export default function ScreenerTab() {
         }
 
         setProgress(p => ({ ...p, completed: accumulated.length }));
+      }
+
+      // ═══════════════════════════════════════════════════
+      // REFINEMENT PASS: Re-score top stocks with Tradier
+      // (Polygon IV model differs from Tradier/ORATS used by overview)
+      // ═══════════════════════════════════════════════════
+      const REFINE_COUNT = 40;
+      const REFINE_CHUNK = 10; // 10 stocks × 4 Tradier calls = 40 calls/chunk (~20s)
+
+      if (accumulated.length > 0 && !controller.signal.aborted) {
+        const topSymbols = [...accumulated]
+          .sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore))
+          .slice(0, REFINE_COUNT)
+          .map(r => r.symbol);
+
+        console.log(`[Screener] Refining top ${topSymbols.length} stocks with Tradier data`);
+        setProgress(p => ({
+          ...p,
+          current: `Refining top ${topSymbols.length} scores with Tradier data (matching overview)...`,
+        }));
+
+        // Show intermediate Polygon results while refining
+        const sortedIntermediate = [...accumulated].sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
+        setResults(sortedIntermediate);
+
+        for (let i = 0; i < topSymbols.length; i += REFINE_CHUNK) {
+          if (controller.signal.aborted) break;
+
+          const chunk = topSymbols.slice(i, i + REFINE_CHUNK);
+          chunkCounter++;
+
+          // scanChunk with provider=tradier appends to accumulated.
+          // The Tradier results replace Polygon results for these symbols.
+          const beforeRefine = accumulated.length;
+          const received = await scanChunk(
+            chunk, chunkCounter, accumulated, chunkLog,
+            0, allSymbols.length, controller, undefined, 'tradier'
+          );
+          console.log(`[Screener] Refinement: ${received}/${chunk.length} Tradier results`);
+
+          // Deduplicate: keep only the latest (Tradier) result for each symbol
+          const seen = new Set<string>();
+          for (let j = accumulated.length - 1; j >= 0; j--) {
+            if (seen.has(accumulated[j].symbol)) {
+              accumulated.splice(j, 1);
+            } else {
+              seen.add(accumulated[j].symbol);
+            }
+          }
+
+          // Update live results
+          const sorted = [...accumulated].sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
+          setResults(sorted);
+
+          // Tradier rate limit cooldown between refinement chunks
+          if (i + REFINE_CHUNK < topSymbols.length && !controller.signal.aborted) {
+            setProgress(p => ({ ...p, current: `Tradier cooldown — refining ${Math.min(i + REFINE_CHUNK, topSymbols.length)}/${topSymbols.length}...` }));
+            await new Promise(r => setTimeout(r, 3000));
+          }
+        }
       }
 
       // ═══════════════════════════════════════════════════

@@ -1,8 +1,8 @@
 import { NextRequest } from 'next/server';
-import { getQuotes } from '@/lib/providers/tradier';
+import { getQuotes, getExpirations, getOptionsChain } from '@/lib/providers/tradier';
 import { getOptionsSnapshotLite, polygonSnapshotToChains, getEquityHistory } from '@/lib/providers/polygon';
 import { getMarketIndicators } from '@/lib/providers/fred';
-import type { Quote } from '@/types/market';
+import type { Quote, OptionsChain } from '@/types/market';
 
 function isMarketOpenNow(): boolean {
   const fmt = new Intl.DateTimeFormat('en-US', {
@@ -149,6 +149,7 @@ async function analyzeStock(
   regSHOSet: Set<string>,
   siMap: Map<string, ShortInterestData>,
   vixLevel: number | undefined,
+  useTradier: boolean = false,
 ): Promise<ScreenerResult | null> {
   try {
     // Spot price from pre-fetched Tradier batch quote
@@ -156,18 +157,38 @@ async function analyzeStock(
     const spotPrice = quote?.last || 0;
     if (!spotPrice || spotPrice <= 0) return null;
 
-    // Fetch Polygon snapshot + equity bars SEQUENTIALLY to control burst rate.
-    // Sequential = max 1 Polygon call in flight per stock at any time.
     const from = new Date(Date.now() - 260 * 86400000).toISOString().split('T')[0];
     const to = new Date().toISOString().split('T')[0];
 
-    const snapshots = await getOptionsSnapshotLite(ticker).catch(() => []);
-    const rawBars = await getEquityHistory(ticker, 1, 'day', from, to).catch(() => []);
+    let chains: OptionsChain[];
+    let historyBars: { o: number; h: number; l: number; c: number; v: number; t: number }[];
 
-    const historyBars = rawBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, t: b.t }));
+    if (useTradier) {
+      // Tradier path: identical to overview/recommendations route.
+      // Sequential calls with 400ms delays to respect rate limits.
+      const [expirations, rawBars] = await Promise.all([
+        getExpirations(ticker).catch(() => []),
+        getEquityHistory(ticker, 1, 'day', from, to).catch(() => []),
+      ]);
+      historyBars = rawBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, t: b.t }));
 
-    // Convert Polygon snapshots to OptionsChain format (3 nearest expirations)
-    const chains = polygonSnapshotToChains(snapshots, ticker, spotPrice, 3);
+      const nearExps = expirations.slice(0, 3);
+      chains = [];
+      for (const exp of nearExps) {
+        try {
+          const chain = await getOptionsChain(ticker, exp.date, spotPrice);
+          chains.push(chain);
+        } catch { /* skip failed chain */ }
+        if (chains.length < nearExps.length) await sleep(400);
+      }
+    } else {
+      // Polygon path: fast bulk scanning (1 API call for all options data).
+      const snapshots = await getOptionsSnapshotLite(ticker).catch(() => []);
+      const rawBars = await getEquityHistory(ticker, 1, 'day', from, to).catch(() => []);
+      historyBars = rawBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, t: b.t }));
+      chains = polygonSnapshotToChains(snapshots, ticker, spotPrice, 3);
+    }
+
     if (chains.length === 0) return null;
 
     // ─── Aggregate dealer exposure (GEX + DEX + Vanna + Charm) ───
@@ -406,11 +427,17 @@ async function prefetchQuotes(symbols: string[]): Promise<Map<string, Quote>> {
 export async function GET(request: NextRequest) {
   const symbolsParam = request.nextUrl.searchParams.get('symbols');
   const minScore = parseInt(request.nextUrl.searchParams.get('minScore') || '0');
+  const provider = request.nextUrl.searchParams.get('provider') || 'polygon';
+  const useTradier = provider === 'tradier';
 
   const tierParam = request.nextUrl.searchParams.get('tier');
   const symbols = symbolsParam
     ? symbolsParam.split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
     : tierParam === 'all' ? getUniverseSymbols() : getTop500Symbols();
+
+  // Tradier refinement: sequential (1 at a time) to respect rate limits.
+  // Polygon bulk: CONCURRENCY=4 with stagger for speed.
+  const concurrency = useTradier ? 1 : CONCURRENCY;
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
@@ -453,17 +480,15 @@ export async function GET(request: NextRequest) {
       let completed = 0;
 
       // Process stocks with staggered starts.
-      // Each stock: 2 SEQUENTIAL Polygon calls (snapshot + bars).
-      // CONCURRENCY=4 with 300ms stagger = max ~4 Polygon calls in flight.
-      // Polygon rate limit ~5 calls/sec → comfortably under limit.
-      for (let i = 0; i < symbols.length; i += CONCURRENCY) {
-        const batch = symbols.slice(i, i + CONCURRENCY);
+      // Polygon: CONCURRENCY=4 with 300ms stagger (2 calls/stock, fast).
+      // Tradier: CONCURRENCY=1, sequential (4 calls/stock, rate-limited).
+      for (let i = 0; i < symbols.length; i += concurrency) {
+        const batch = symbols.slice(i, i + concurrency);
 
         const batchResults = await Promise.all(
           batch.map(async (sym, idx) => {
-            // Stagger starts within batch
             if (idx > 0) await sleep(idx * 300);
-            const result = await analyzeStock(sym, quoteMap, swapMap, regSHOSet, siMap, vixLevel);
+            const result = await analyzeStock(sym, quoteMap, swapMap, regSHOSet, siMap, vixLevel, useTradier);
             completed++;
             send({
               type: 'progress',
@@ -480,9 +505,9 @@ export async function GET(request: NextRequest) {
           if (r) results.push(r);
         }
 
-        // Brief pause between batches
-        if (i + CONCURRENCY < symbols.length) {
-          await sleep(200);
+        // Pause between batches — Tradier needs more cooldown
+        if (i + concurrency < symbols.length) {
+          await sleep(useTradier ? 500 : 200);
         }
       }
 
