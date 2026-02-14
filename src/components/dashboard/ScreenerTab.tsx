@@ -121,7 +121,7 @@ export default function ScreenerTab() {
     }
   }, []);
 
-  const CHUNK_SIZE = 30; // 30 stocks per chunk — must complete under Vercel's 60s timeout
+  const CHUNK_SIZE = 20; // 20 stocks per chunk — Tradier rate limits need smaller batches
 
   /**
    * Scan a single chunk of symbols, returning the number of results received.
@@ -223,17 +223,18 @@ export default function ScreenerTab() {
           consecutiveEmpty = 0;
         }
 
-        // Inter-chunk delay — Polygon-powered, much lighter pacing needed
+        // Inter-chunk delay — Tradier needs generous pacing between chunks
         if (i + CHUNK_SIZE < allSymbols.length && !controller.signal.aborted) {
           if (consecutiveEmpty >= 3) {
-            setProgress(p => ({ ...p, current: `API cooldown — pausing 10s (${accumulated.length} stocks so far)` }));
-            await new Promise(r => setTimeout(r, 10000));
+            setProgress(p => ({ ...p, current: `API cooldown — pausing 15s (${accumulated.length} stocks so far)` }));
+            await new Promise(r => setTimeout(r, 15000));
             consecutiveEmpty = 0;
           } else if (consecutiveEmpty >= 1) {
-            await new Promise(r => setTimeout(r, 3000));
+            setProgress(p => ({ ...p, current: `Rate limit recovery — pausing 8s...` }));
+            await new Promise(r => setTimeout(r, 8000));
           } else {
-            // Normal: light 1.5s gap between chunks
-            await new Promise(r => setTimeout(r, 1500));
+            // Normal: 5s gap between chunks for Tradier rate limit headroom
+            await new Promise(r => setTimeout(r, 5000));
           }
         }
       }
@@ -283,14 +284,14 @@ export default function ScreenerTab() {
           if (received === 0) consecutiveEmpty++;
           else consecutiveEmpty = 0;
 
-          // Light delays during retries
+          // Generous delays during retries — Tradier rate limits need recovery time
           if (i + CHUNK_SIZE < missed.length && !controller.signal.aborted) {
             if (consecutiveEmpty >= 2) {
-              setProgress(p => ({ ...p, current: `Pausing 5s before next retry chunk...` }));
-              await new Promise(r => setTimeout(r, 5000));
+              setProgress(p => ({ ...p, current: `Pausing 10s before next retry chunk...` }));
+              await new Promise(r => setTimeout(r, 10000));
               consecutiveEmpty = 0;
             } else {
-              await new Promise(r => setTimeout(r, 2000));
+              await new Promise(r => setTimeout(r, 5000));
             }
           }
         }
@@ -944,7 +945,7 @@ export default function ScreenerTab() {
               Start Full Scan
             </button>
             <p className="text-xs text-text-muted/40 mt-3 font-mono">
-              Takes ~2-4 minutes — powered by Polygon options snapshots for reliable full coverage
+              Takes ~5-8 minutes — uses same Tradier data as Overview for consistent scores
             </p>
           </div>
         </div>

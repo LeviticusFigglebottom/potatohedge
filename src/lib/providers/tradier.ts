@@ -202,7 +202,7 @@ export async function getExpirations(symbol: string): Promise<OptionExpiration[]
 
 // ─── Options Chain ─────────────────────────────────────────────────
 
-export async function getOptionsChain(symbol: string, expiration: string): Promise<OptionsChain> {
+export async function getOptionsChain(symbol: string, expiration: string, spotPrice?: number): Promise<OptionsChain> {
   const token = process.env.TRADIER_API_KEY!;
 
   // Fetch chain with Greeks
@@ -217,13 +217,15 @@ export async function getOptionsChain(symbol: string, expiration: string): Promi
   }
   const data = await res.json();
 
-  // Get underlying price
-  let underlyingPrice = 0;
-  try {
-    const quote = await getQuote(symbol);
-    underlyingPrice = quote.last;
-  } catch {
-    // fallback
+  // Use provided spotPrice to avoid extra getQuote() API call
+  let underlyingPrice = spotPrice || 0;
+  if (!underlyingPrice) {
+    try {
+      const quote = await getQuote(symbol);
+      underlyingPrice = quote.last;
+    } catch {
+      // fallback
+    }
   }
 
   const options = data.options?.option;
