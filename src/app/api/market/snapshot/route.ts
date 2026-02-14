@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getOptionsSnapshot } from '@/lib/providers/polygon';
 import { fetchEquityBars } from '@/lib/providers/equityBars';
 import { getOptionsChain, getExpirations, getQuote } from '@/lib/providers/tradier';
-import { getVIXHistory } from '@/lib/providers/fred';
+import { getVIXHistory, getMarketIndicators } from '@/lib/providers/fred';
 import {
   computeIVRankPercentile,
   computeHistoricalVolatility,
@@ -27,12 +27,13 @@ export async function GET(request: NextRequest) {
     // 3. Polygon options snapshot (for term structure + skew surface)
     // 4. VIX real-time quote (for market vol context)
     // 5. VIX history from FRED (for time-series overlay)
-    const [expirations, historyBars, polygonSnapshot, vixQuote, vixHistory] = await Promise.all([
+    const [expirations, historyBars, polygonSnapshot, vixQuote, vixHistory, fredIndicators] = await Promise.all([
       getExpirations(ticker).catch(() => []),
       fetchEquityBars(ticker, 400),
       getOptionsSnapshot(ticker).catch(() => []),
       getQuote('VIX').catch(() => null),
       getVIXHistory(400).catch(() => []),
+      getMarketIndicators().catch(() => ({ vix: null, skew: null })),
     ]);
 
     // Fetch nearest 3 Tradier chains for ATM IV across expirations
@@ -301,6 +302,7 @@ export async function GET(request: NextRequest) {
       ivTimeSeries: ivTimeSeries.slice(-252),
       vix: vixData,
       vixTimeSeries: vixTimeSeries.slice(-252),
+      skew: fredIndicators.skew,
       snapshotCount: polygonSnapshot.length,
       tradierChainsUsed: tradierChains.length,
       timestamp: Date.now(),

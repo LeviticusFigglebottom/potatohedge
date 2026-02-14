@@ -44,6 +44,7 @@ export interface SnapshotData {
   ivTimeSeries?: { time: number; hv20: number; ivProxy: number; ivRank: number }[];
   vix?: { price: number; change: number; changePct: number } | null;
   vixTimeSeries?: { time: number; vix: number }[];
+  skew?: { current: number; previous: number; change: number; changePercent: number; date: string } | null;
   snapshotCount: number;
 }
 

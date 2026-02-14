@@ -391,6 +391,104 @@ export default function CorrelationPanel() {
         </div>
       </div>
 
+      {/* Regime Performance Heatmap */}
+      <div className="panel">
+        <SectionHeader icon={Activity} title="Regime Performance Heatmap" color="text-accent-cyan" />
+        <div className="px-4 py-3">
+          <div className="text-[10px] text-text-muted font-mono mb-3">Win rates and avg returns across different market conditions</div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs font-mono">
+              <thead>
+                <tr className="border-b border-border/30">
+                  <th className="px-2 py-1.5 text-left text-[10px] text-text-muted font-normal">Condition</th>
+                  <th className="px-2 py-1.5 text-center text-[10px] text-text-muted font-normal">Win Rate (5d)</th>
+                  <th className="px-2 py-1.5 text-center text-[10px] text-text-muted font-normal">Avg Return (20d)</th>
+                  <th className="px-2 py-1.5 text-center text-[10px] text-text-muted font-normal">Sample</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[
+                  {
+                    label: 'Low Volatility',
+                    winRate: c.ivRegime.lowIV.winRate5d,
+                    avgReturn: c.ivRegime.lowIV.avgReturn20d,
+                    sample: c.ivRegime.lowIV.sampleSize,
+                    icon: '🟢',
+                  },
+                  {
+                    label: 'Mid Volatility',
+                    winRate: c.ivRegime.midIV.winRate5d,
+                    avgReturn: c.ivRegime.midIV.avgReturn20d,
+                    sample: c.ivRegime.midIV.sampleSize,
+                    icon: '🟡',
+                  },
+                  {
+                    label: 'High Volatility',
+                    winRate: c.ivRegime.highIV.winRate5d,
+                    avgReturn: c.ivRegime.highIV.avgReturn20d,
+                    sample: c.ivRegime.highIV.sampleSize,
+                    icon: '🔴',
+                  },
+                  {
+                    label: 'Post SPY Drawdown',
+                    winRate: c.meanReversion.afterBigDown.reversalRate,
+                    avgReturn: c.meanReversion.afterBigDown.avgNext5dReturn * 4,
+                    sample: c.meanReversion.afterBigDown.sampleSize,
+                    icon: '📉',
+                  },
+                  {
+                    label: 'Post SPY Rally',
+                    winRate: 1 - c.meanReversion.afterBigUp.reversalRate,
+                    avgReturn: c.meanReversion.afterBigUp.avgNext5dReturn * 4,
+                    sample: c.meanReversion.afterBigUp.sampleSize,
+                    icon: '📈',
+                  },
+                ].map(row => {
+                  const wrPct = row.winRate * 100;
+                  const retPct = row.avgReturn * 100;
+                  const wrColor = wrPct >= 60 ? 'bg-green-500/30 text-green-400' : wrPct >= 55 ? 'bg-green-500/15 text-green-400' : wrPct >= 45 ? 'bg-bg-tertiary text-text-secondary' : wrPct >= 40 ? 'bg-red-500/15 text-red-400' : 'bg-red-500/30 text-red-400';
+                  const retColor = retPct >= 2 ? 'bg-green-500/30 text-green-400' : retPct >= 0.5 ? 'bg-green-500/15 text-green-400' : retPct >= -0.5 ? 'bg-bg-tertiary text-text-secondary' : retPct >= -2 ? 'bg-red-500/15 text-red-400' : 'bg-red-500/30 text-red-400';
+                  return (
+                    <tr key={row.label} className="border-b border-border/10">
+                      <td className="px-2 py-2 text-text-secondary">{row.label}</td>
+                      <td className="px-2 py-2 text-center">
+                        <span className={`inline-block px-2 py-0.5 rounded ${wrColor} font-semibold`}>
+                          {row.sample > 0 ? `${wrPct.toFixed(0)}%` : '—'}
+                        </span>
+                      </td>
+                      <td className="px-2 py-2 text-center">
+                        <span className={`inline-block px-2 py-0.5 rounded ${retColor} font-semibold`}>
+                          {row.sample > 0 ? `${retPct > 0 ? '+' : ''}${retPct.toFixed(1)}%` : '—'}
+                        </span>
+                      </td>
+                      <td className="px-2 py-2 text-center text-text-muted">{row.sample > 0 ? `n=${row.sample}` : '—'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Market Relative Summary Bar */}
+          <div className="mt-4 pt-3 border-t border-border/20">
+            <div className="text-[10px] text-text-muted font-mono uppercase tracking-wider mb-2">Market Sensitivity</div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+              {[
+                { label: 'Beta', value: c.marketRelative.beta.toFixed(2), color: c.marketRelative.beta > 1.3 ? 'bg-red-500/20 border-red-500/30 text-red-400' : c.marketRelative.beta < 0.7 ? 'bg-green-500/20 border-green-500/30 text-green-400' : 'bg-bg-tertiary border-border/30 text-text-primary' },
+                { label: 'SPY Corr', value: c.marketRelative.correlation.toFixed(2), color: c.marketRelative.correlation > 0.7 ? 'bg-amber-500/15 border-amber-500/20 text-amber-400' : 'bg-bg-tertiary border-border/30 text-text-primary' },
+                { label: 'DD Ratio', value: `${c.marketRelative.drawdownBehavior.ratio.toFixed(1)}x`, color: c.marketRelative.drawdownBehavior.ratio > 1.5 ? 'bg-red-500/20 border-red-500/30 text-red-400' : 'bg-bg-tertiary border-border/30 text-text-primary' },
+                { label: 'Rally Ratio', value: `${c.marketRelative.rallyBehavior.ratio.toFixed(1)}x`, color: c.marketRelative.rallyBehavior.ratio > 1.3 ? 'bg-green-500/20 border-green-500/30 text-green-400' : 'bg-bg-tertiary border-border/30 text-text-primary' },
+              ].map(item => (
+                <div key={item.label} className={`flex flex-col items-center px-3 py-2 rounded-lg border ${item.color}`}>
+                  <span className="text-[9px] font-mono opacity-60">{item.label}</span>
+                  <span className="text-sm font-mono font-bold">{item.value}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* Anomalies */}
       {c.anomalies.length > 0 && (
         <div className="panel">

@@ -6,7 +6,7 @@ import {
   Building2, RefreshCw, Loader2, ArrowRightLeft, ShieldAlert, AlertTriangle, Clock,
   Zap, ChevronDown, ChevronUp, Waves, TrendingUp, TrendingDown, Info,
 } from 'lucide-react';
-import { saveFlowSnapshot, saveTickerFlowSnapshot, type DailyFlowRecord } from '@/lib/flowHistory';
+import { saveFlowSnapshot, saveTickerFlowSnapshot, loadFlowHistory, type DailyFlowRecord } from '@/lib/flowHistory';
 import FlowHistoryPanel from './FlowHistoryChart';
 
 // ─── Types ──────────────────────────────────────────────────
@@ -655,13 +655,90 @@ export default function InstitutionalTab() {
       )}
 
       {/* ═══════════════════════════════════════════════════════
+          TODAY VS HISTORY — Quick comparison of today's flow
+          ═══════════════════════════════════════════════════════ */}
+      {data && data.marketFlow && (() => {
+        const history: DailyFlowRecord[] = loadFlowHistory();
+        if (history.length < 3) return null;
+
+        const avg = {
+          netPremium: history.reduce((s, r) => s + r.netPremium, 0) / history.length,
+          putCallRatio: history.reduce((s, r) => s + r.putCallRatio, 0) / history.length,
+          sweepCount: history.reduce((s, r) => s + r.sweepCount, 0) / history.length,
+          blockCount: history.reduce((s, r) => s + r.blockCount, 0) / history.length,
+        };
+
+        const metrics = [
+          {
+            label: 'Net Premium',
+            today: data.marketFlow!.netPremium,
+            avg: avg.netPremium,
+            format: (n: number) => fmt$(n),
+            positive: data.marketFlow!.netPremium > avg.netPremium,
+          },
+          {
+            label: 'P/C Ratio',
+            today: data.marketFlow!.putCallRatio,
+            avg: avg.putCallRatio,
+            format: (n: number) => n.toFixed(2),
+            positive: data.marketFlow!.putCallRatio < avg.putCallRatio,
+          },
+          {
+            label: 'Sweeps',
+            today: (data.flowAlerts || []).filter((a: FlowAlert) => a.tradeType === 'sweep').length,
+            avg: avg.sweepCount,
+            format: (n: number) => n.toFixed(0),
+            positive: true,
+          },
+          {
+            label: 'Blocks',
+            today: (data.flowAlerts || []).filter((a: FlowAlert) => a.tradeType === 'block').length,
+            avg: avg.blockCount,
+            format: (n: number) => n.toFixed(0),
+            positive: true,
+          },
+        ];
+
+        return (
+          <div className="panel">
+            <div className="panel-header">
+              <div className="flex items-center gap-2">
+                <TrendingUp className="w-3.5 h-3.5 text-cyan-400" />
+                <span className="panel-title">Today vs {history.length}-Day Average</span>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-px bg-border/20 border-t border-border/20">
+              {metrics.map(m => {
+                const diff = m.today - m.avg;
+                const diffPct = m.avg !== 0 ? (diff / Math.abs(m.avg)) * 100 : 0;
+                return (
+                  <div key={m.label} className="bg-bg-secondary px-4 py-3">
+                    <div className="text-[10px] text-text-muted font-mono mb-0.5">{m.label}</div>
+                    <div className="text-lg font-bold font-mono text-text-primary">{m.format(m.today)}</div>
+                    <div className="flex items-center gap-1 mt-0.5">
+                      <span className="text-[10px] font-mono text-text-muted">avg: {m.format(m.avg)}</span>
+                      {Math.abs(diffPct) > 10 && (
+                        <span className={`text-[10px] font-mono font-semibold ${diffPct > 0 === m.positive ? 'text-green-400' : 'text-red-400'}`}>
+                          {diffPct > 0 ? '+' : ''}{diffPct.toFixed(0)}%
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ═══════════════════════════════════════════════════════
           FLOW HISTORY — Historical time series of premium flow
           ═══════════════════════════════════════════════════════ */}
       <Section
         title="Flow History"
         icon={<TrendingUp className="w-3.5 h-3.5 text-cyan-400" />}
         badge={<span className="text-[10px] text-text-muted/50 font-mono">auto-recorded daily</span>}
-        defaultOpen={false}
+        defaultOpen={true}
       >
         <FlowHistoryPanel />
       </Section>

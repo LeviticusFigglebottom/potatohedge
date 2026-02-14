@@ -583,9 +583,86 @@ export default function ScreenerTab() {
         )}
       </div>
 
-      {/* Results Table */}
+      {/* Results — Mobile Card Layout */}
       {results.length > 0 && (
-        <div className="panel overflow-hidden">
+        <div className="md:hidden space-y-2">
+          {filteredResults.slice(0, 50).map(r => (
+            <div
+              key={r.symbol}
+              className="panel p-3 cursor-pointer hover:border-accent-cyan/30 transition-colors"
+              onClick={() => navigateToStock(r.symbol)}
+            >
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2">
+                  <span className="font-mono font-bold text-text-primary text-sm">{r.symbol}</span>
+                  <span className={`flex items-center gap-0.5 ${biasColor(r.overallBias, r.biasScore)}`}>
+                    {biasIcon(r.overallBias)}
+                    <span className="text-[10px] font-mono capitalize">{r.overallBias}</span>
+                  </span>
+                  {r.warnings.length > 0 && <AlertTriangle className="w-3 h-3 text-yellow-500" />}
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className={`inline-block px-2 py-0.5 rounded text-xs font-mono font-semibold border ${scoreBg(r.biasScore)}`}>
+                    {r.biasScore > 0 ? '+' : ''}{r.biasScore}
+                  </span>
+                  {trackedSymbols.has(r.symbol) ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-accent-cyan" />
+                  ) : (
+                    <button onClick={(e) => handleTrackSignal(r, e)} className="p-0.5 text-text-muted hover:text-accent-cyan">
+                      <Crosshair className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="grid grid-cols-4 gap-2 text-xs font-mono">
+                <div>
+                  <div className="text-[9px] text-text-muted">Price</div>
+                  <div className="text-text-secondary">${r.spotPrice.toFixed(2)}</div>
+                </div>
+                <div>
+                  <div className="text-[9px] text-text-muted">Change</div>
+                  <div className={r.changePercent >= 0 ? 'text-green-400' : 'text-red-400'}>
+                    {r.changePercent >= 0 ? '+' : ''}{r.changePercent.toFixed(2)}%
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[9px] text-text-muted">IV Rank</div>
+                  <div className="flex items-center gap-1">
+                    <div className="w-8 h-1 bg-bg-tertiary rounded-full overflow-hidden">
+                      <div className={`h-full rounded-full ${r.ivRank > 70 ? 'bg-orange-500' : r.ivRank < 30 ? 'bg-blue-400' : 'bg-accent-cyan/60'}`} style={{ width: `${Math.min(100, r.ivRank)}%` }} />
+                    </div>
+                    <span className="text-text-muted">{r.ivRank}</span>
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[9px] text-text-muted">PCR</div>
+                  <div className={r.volumePCR > 1.3 ? 'text-red-400' : r.volumePCR < 0.7 ? 'text-green-400' : 'text-text-muted'}>{r.volumePCR.toFixed(2)}</div>
+                </div>
+              </div>
+              <div className="flex items-center justify-between mt-1.5">
+                <div className="flex items-center gap-2">
+                  <span className={`text-[10px] font-mono px-1 py-0.5 rounded ${
+                    r.volRegime === 'high' ? 'bg-orange-500/15 text-orange-400' : r.volRegime === 'low' ? 'bg-blue-500/15 text-blue-400' : 'bg-bg-tertiary text-text-muted'
+                  }`}>{r.volRegime} vol</span>
+                  <span className={`text-[10px] font-mono px-1 py-0.5 rounded ${
+                    r.gammaRegime === 'long' ? 'bg-green-500/15 text-green-400' : r.gammaRegime === 'short' ? 'bg-red-500/15 text-red-400' : 'bg-bg-tertiary text-text-muted'
+                  }`}>{r.gammaRegime}γ</span>
+                </div>
+                <span className="text-[10px] font-mono text-text-muted truncate max-w-[120px]">{r.topSignal}</span>
+              </div>
+            </div>
+          ))}
+          {filteredResults.length > 50 && (
+            <div className="text-center text-xs font-mono text-text-muted py-2">
+              Showing 50 of {filteredResults.length} — use desktop for full table
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Results Table — Desktop */}
+      {results.length > 0 && (
+        <div className="panel overflow-hidden hidden md:block">
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
