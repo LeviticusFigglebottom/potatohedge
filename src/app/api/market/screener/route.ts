@@ -1,7 +1,6 @@
 import { NextRequest } from 'next/server';
 import { getQuotes } from '@/lib/providers/tradier';
-import { getOptionsSnapshotLite, type PolygonOptionSnapshot } from '@/lib/providers/polygon';
-import { fetchEquityBars } from '@/lib/providers/equityBars';
+import { getOptionsSnapshotLite, getEquityHistory, type PolygonOptionSnapshot } from '@/lib/providers/polygon';
 import type { Quote } from '@/types/market';
 
 function isMarketOpenNow(): boolean {
@@ -33,7 +32,6 @@ import {
 } from '@/lib/math/analytics';
 import { generateRecommendations, type RecommendationInput } from '@/lib/math/recommendations';
 import { getUniverseSymbols, getTop500Symbols } from '@/lib/stockUniverse';
-import type { EquityBar } from '@/lib/providers/equityBars';
 import type { OptionContract, OptionsChain, OptionExpiration } from '@/types/market';
 import { fetchSwapData, type SwapData } from '@/lib/providers/dtcc';
 import { fetchRegSHOThreshold, fetchShortInterest, type ShortInterestData } from '@/lib/providers/finra';
@@ -65,9 +63,10 @@ export interface ScreenerResult {
   regSHO: boolean;
 }
 
-// Polygon has much higher rate limits than Tradier — can run 10 stocks in parallel
-// Each stock now makes only 2 API calls: 1 Polygon snapshot + 1 Polygon equity bars
-const CONCURRENCY = 10;
+// Polygon has much higher rate limits than Tradier — can run 8 stocks in parallel
+// Each stock makes 2 Polygon calls: 1 snapshot + 1 equity history (max 8s each)
+// Keep under Vercel 60s timeout: 4 waves × 8s = 32s + overhead ≈ 38s
+const CONCURRENCY = 8;
 
 async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -175,7 +174,7 @@ function polygonSnapshotToChains(
  * Computes mean reversion stats and vol regime performance from daily bars.
  */
 function computeQuickCorrelationCtx(
-  bars: EquityBar[],
+  bars: { o: number; h: number; l: number; c: number; v: number; t: number }[],
   hvCurrent: number,
 ): RecommendationInput['correlationCtx'] {
   if (bars.length < 60) return undefined;
@@ -254,12 +253,15 @@ async function analyzeStock(
 ): Promise<ScreenerResult | null> {
   try {
     // Fetch Polygon options snapshot + equity bars in parallel
-    // This replaces 4-6 Tradier calls (quote, expirations, 2-3 chains)
-    // with just 2 Polygon calls — no more Tradier rate limiting!
-    const [polygonSnapshot, historyBars] = await Promise.all([
+    // Uses Polygon directly (NOT fetchEquityBars which falls back to Tradier,
+    // adding up to 8s extra per stock and risking Vercel 60s timeout)
+    const from = new Date(Date.now() - 260 * 86400000).toISOString().split('T')[0];
+    const to = new Date().toISOString().split('T')[0];
+    const [polygonSnapshot, rawBars] = await Promise.all([
       getOptionsSnapshotLite(ticker).catch(() => [] as PolygonOptionSnapshot[]),
-      fetchEquityBars(ticker, 250),
+      getEquityHistory(ticker, 1, 'day', from, to).catch(() => []),
     ]);
+    const historyBars = rawBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, t: b.t }));
 
     // Spot price: prefer pre-fetched Tradier quote (most fresh),
     // fall back to Polygon snapshot's underlying price
@@ -484,14 +486,20 @@ export async function GET(request: NextRequest) {
 
       send({ type: 'start', total: symbols.length });
 
-      // Pre-fetch shared data: DTCC + FINRA + all quotes in bulk
-      // Quotes use Tradier batch API (~10 calls for 380 stocks)
-      // Options data uses Polygon (per-stock, no rate limit issues)
+      send({ type: 'progress', completed: 0, total: symbols.length, current: 'Loading market data...' });
+
+      // Pre-fetch shared data: DTCC + FINRA + quotes (with 8s cap on quotes)
+      // Quotes use Tradier batch API — if slow, fall back to Polygon prices
+      const quotesWithTimeout = Promise.race([
+        prefetchQuotes(symbols),
+        sleep(8000).then(() => new Map<string, Quote>()),
+      ]);
+
       const [swapMap, regSHOSet, siMap, quoteMap] = await Promise.all([
         fetchSwapData().then(r => r.data).catch(() => new Map<string, SwapData>()),
         fetchRegSHOThreshold().catch(() => new Set<string>()),
         fetchShortInterest().catch(() => new Map<string, ShortInterestData>()),
-        prefetchQuotes(symbols),
+        quotesWithTimeout,
       ]);
 
       send({

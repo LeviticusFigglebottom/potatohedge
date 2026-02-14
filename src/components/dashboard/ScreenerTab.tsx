@@ -121,7 +121,7 @@ export default function ScreenerTab() {
     }
   }, []);
 
-  const CHUNK_SIZE = 50; // 50 stocks per chunk — Polygon-powered, no Tradier rate limit bottleneck
+  const CHUNK_SIZE = 30; // 30 stocks per chunk — must complete under Vercel's 60s timeout
 
   /**
    * Scan a single chunk of symbols, returning the number of results received.
@@ -141,25 +141,41 @@ export default function ScreenerTab() {
     const beforeCount = accumulated.length;
     const chunkStart = Date.now();
 
+    // Per-chunk abort: auto-timeout at 55s (Vercel kills at 60s) + user abort
+    const chunkAbort = new AbortController();
+    const timeout = setTimeout(() => chunkAbort.abort(), 55000);
+    const onMainAbort = () => chunkAbort.abort();
+    controller.signal.addEventListener('abort', onMainAbort);
+
     try {
-      const res = await fetch(scanUrl, { signal: controller.signal });
+      const res = await fetch(scanUrl, { signal: chunkAbort.signal });
       if (!res.ok || !res.body) {
         chunkLog.push({ chunk: chunkIdx, sent: symbols.length, received: 0, ms: Date.now() - chunkStart, error: `HTTP ${res.status}`, retry: retryPass });
         setScanLog([...chunkLog]);
         return 0;
       }
 
-      await processStream(res, accumulated, globalOffset, globalTotal, controller.signal);
+      await processStream(res, accumulated, globalOffset, globalTotal, chunkAbort.signal);
       const received = accumulated.length - beforeCount;
       chunkLog.push({ chunk: chunkIdx, sent: symbols.length, received, ms: Date.now() - chunkStart, retry: retryPass });
       setScanLog([...chunkLog]);
       return received;
     } catch (err) {
-      if ((err as Error).name === 'AbortError') throw err;
+      // Propagate user abort but handle chunk timeout gracefully
+      if ((err as Error).name === 'AbortError' && controller.signal.aborted) throw err;
       const received = accumulated.length - beforeCount;
-      chunkLog.push({ chunk: chunkIdx, sent: symbols.length, received, ms: Date.now() - chunkStart, error: (err as Error).message, retry: retryPass });
+      const isTimeout = (err as Error).name === 'AbortError' && !controller.signal.aborted;
+      chunkLog.push({
+        chunk: chunkIdx, sent: symbols.length, received,
+        ms: Date.now() - chunkStart,
+        error: isTimeout ? 'timeout (55s)' : (err as Error).message,
+        retry: retryPass,
+      });
       setScanLog([...chunkLog]);
       return received;
+    } finally {
+      clearTimeout(timeout);
+      controller.signal.removeEventListener('abort', onMainAbort);
     }
   }, [processStream]);
 
