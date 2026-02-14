@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
-import { getQuotes, getExpirations, getOptionsChain } from '@/lib/providers/tradier';
-import { getEquityHistory } from '@/lib/providers/polygon';
+import { getQuotes } from '@/lib/providers/tradier';
+import { getOptionsSnapshotLite, polygonSnapshotToChains, getEquityHistory } from '@/lib/providers/polygon';
 import { getMarketIndicators } from '@/lib/providers/fred';
 import type { Quote } from '@/types/market';
 
@@ -33,7 +33,6 @@ import {
 } from '@/lib/math/analytics';
 import { generateRecommendations, type RecommendationInput } from '@/lib/math/recommendations';
 import { getUniverseSymbols, getTop500Symbols } from '@/lib/stockUniverse';
-import type { OptionContract, OptionsChain, OptionExpiration } from '@/types/market';
 import { fetchSwapData, type SwapData } from '@/lib/providers/dtcc';
 import { fetchRegSHOThreshold, fetchShortInterest, type ShortInterestData } from '@/lib/providers/finra';
 
@@ -64,11 +63,10 @@ export interface ScreenerResult {
   regSHO: boolean;
 }
 
-// Uses Tradier for options (same data as overview) with staggered rate limiting.
-// Each stock: getExpirations(1) + getOptionsChain×3(3) = 4 Tradier calls.
-// (getOptionsChain now accepts spotPrice, skipping internal getQuote — was 7 calls before!)
-// Stagger 3 stocks at 300ms offsets to keep burst under ~6 calls/sec.
-const CONCURRENCY = 3;
+// Polygon snapshot = 1 API call per stock (vs 4 Tradier calls).
+// Equity history = 1 Polygon call. Total: 2 Polygon calls/stock.
+// Polygon allows ~5 calls/sec. CONCURRENCY=4 with stagger keeps us under that.
+const CONCURRENCY = 4;
 
 async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -158,34 +156,22 @@ async function analyzeStock(
     const spotPrice = quote?.last || 0;
     if (!spotPrice || spotPrice <= 0) return null;
 
-    // Fetch expirations + equity bars in parallel (1 Tradier + 1 Polygon call)
+    // Fetch Polygon snapshot + equity bars SEQUENTIALLY to control burst rate.
+    // Sequential = max 1 Polygon call in flight per stock at any time.
     const from = new Date(Date.now() - 260 * 86400000).toISOString().split('T')[0];
     const to = new Date().toISOString().split('T')[0];
-    const [expirations, rawBars] = await Promise.all([
-      getExpirations(ticker).catch(() => []),
-      getEquityHistory(ticker, 1, 'day', from, to).catch(() => []),
-    ]);
+
+    const snapshots = await getOptionsSnapshotLite(ticker).catch(() => []);
+    const rawBars = await getEquityHistory(ticker, 1, 'day', from, to).catch(() => []);
+
     const historyBars = rawBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, t: b.t }));
 
-    // 3 nearest expirations — matches overview/recommendations route exactly
-    const nearExps = expirations.slice(0, 3);
-    if (nearExps.length === 0) return null;
-
-    // Fetch chains SEQUENTIALLY with 150ms delay between each to avoid bursting.
-    // Pass spotPrice to skip the hidden getQuote() call inside getOptionsChain.
-    const chains: NonNullable<Awaited<ReturnType<typeof getOptionsChain>>>[] = [];
-    for (const exp of nearExps) {
-      try {
-        const chain = await getOptionsChain(ticker, exp.date, spotPrice);
-        chains.push(chain);
-      } catch { /* skip failed chain */ }
-      if (chains.length < nearExps.length) await sleep(150);
-    }
-
+    // Convert Polygon snapshots to OptionsChain format (3 nearest expirations)
+    const chains = polygonSnapshotToChains(snapshots, ticker, spotPrice, 3);
     if (chains.length === 0) return null;
 
     // ─── Aggregate dealer exposure (GEX + DEX + Vanna + Charm) ───
-    // Matches recommendations route: includes vanna and charm aggregation
+    // computeDealerExposureFromChain computes vanna/charm via Black-Scholes internally
     const allExposures = chains.flatMap(chain =>
       computeDealerExposureFromChain(
         chain.calls.map(c => ({ strike: c.strike, openInterest: c.openInterest, impliedVolatility: c.impliedVolatility, gamma: c.gamma, delta: c.delta, dte: c.dte })),
@@ -229,7 +215,7 @@ async function analyzeStock(
     const volumePCR = totalCallVol > 0 ? totalPutVol / totalCallVol : 1;
     const oiPCR = totalCallOI > 0 ? totalPutOI / totalCallOI : 1;
 
-    // ATM IV — matches recommendations route exactly
+    // ATM IV
     const nearChain = chains[0];
     const atmTolerance = spotPrice < 20 ? 0.10 : spotPrice < 50 ? 0.05 : 0.02;
     const atmOpts = [...nearChain.calls, ...nearChain.puts]
@@ -300,6 +286,13 @@ async function analyzeStock(
       ? ((top3CallOI / Math.max(1, totalCallOIForConc)) * 100 + (top3PutOI / Math.max(1, totalPutOIForConc)) * 100) / 2
       : undefined;
 
+    // Expiration DTE for nearest chains
+    const chainExps = chains.map(c => {
+      const expDate = new Date(c.expiration + 'T16:00:00-05:00');
+      const dte = Math.max(0, Math.ceil((expDate.getTime() - Date.now()) / 86400000));
+      return { date: c.expiration, dte };
+    });
+
     const input: RecommendationInput = {
       symbol: ticker,
       spotPrice,
@@ -327,10 +320,10 @@ async function analyzeStock(
       atrPercent: profile.atrPercent,
       dailySigma: profile.dailySigma,
       avgDailyRangePct: profile.avgDailyRangePct,
-      nearestExp: nearExps[0]?.date || '',
-      nearestDTE: nearExps[0]?.dte || 0,
-      weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
-      monthlyExp: nearExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
+      nearestExp: chainExps[0]?.date || '',
+      nearestDTE: chainExps[0]?.dte || 0,
+      weeklyExp: chainExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
+      monthlyExp: chainExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
       correlationCtx,
       // DTCC swap data
       swapMaturitiesToday: swapMap.get(ticker)?.maturitiesToday,
@@ -341,7 +334,7 @@ async function analyzeStock(
       shortInterest: siMap.get(ticker)?.shortInterest,
       daysToCover: siMap.get(ticker)?.daysToCover,
       regSHOThreshold: regSHOSet.has(ticker),
-      // Signals that match recommendations route (were missing before)
+      // Signals matching recommendations route
       totalVanna: totalVanna || undefined,
       totalCharm: totalCharm || undefined,
       nearTermIV,
@@ -459,14 +452,16 @@ export async function GET(request: NextRequest) {
       const results: ScreenerResult[] = [];
       let completed = 0;
 
-      // Process stocks with staggered starts to avoid Tradier burst rate limits.
-      // CONCURRENCY=3 with 300ms offsets = max ~6 Tradier calls/sec.
+      // Process stocks with staggered starts.
+      // Each stock: 2 SEQUENTIAL Polygon calls (snapshot + bars).
+      // CONCURRENCY=4 with 300ms stagger = max ~4 Polygon calls in flight.
+      // Polygon rate limit ~5 calls/sec → comfortably under limit.
       for (let i = 0; i < symbols.length; i += CONCURRENCY) {
         const batch = symbols.slice(i, i + CONCURRENCY);
 
         const batchResults = await Promise.all(
           batch.map(async (sym, idx) => {
-            // Stagger starts within batch to avoid all-at-once burst
+            // Stagger starts within batch
             if (idx > 0) await sleep(idx * 300);
             const result = await analyzeStock(sym, quoteMap, swapMap, regSHOSet, siMap, vixLevel);
             completed++;
@@ -485,9 +480,9 @@ export async function GET(request: NextRequest) {
           if (r) results.push(r);
         }
 
-        // Brief pause between batches for rate limit recovery
+        // Brief pause between batches
         if (i + CONCURRENCY < symbols.length) {
-          await sleep(500);
+          await sleep(200);
         }
       }
 
