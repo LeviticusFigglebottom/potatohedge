@@ -377,3 +377,13 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     get().saveAndLoadMetricHistory();
   },
 }));
+
+// ─── Client-side rehydration ─────────────────────────────────
+// The store `create()` runs during SSR where window is undefined,
+// so localStorage-based initializers return null. Rehydrate on the client.
+if (typeof window !== 'undefined') {
+  const cached = loadBriefingCache();
+  if (cached && !useDashboardStore.getState().briefingCache) {
+    useDashboardStore.setState({ briefingCache: cached });
+  }
+}
