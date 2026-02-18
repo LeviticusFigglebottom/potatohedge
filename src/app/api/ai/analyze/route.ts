@@ -4,6 +4,21 @@ import { logErr, logWarn } from '@/lib/errorLogger';
 
 export const maxDuration = 120; // Web search fundamental analysis can take longer
 
+function isMarketOpenNow(): boolean {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric', minute: 'numeric', weekday: 'short', hour12: false,
+  });
+  const parts = fmt.formatToParts(new Date());
+  const get = (type: string) => parts.find(p => p.type === type)?.value || '';
+  const hours = parseInt(get('hour'), 10) || 0;
+  const minutes = parseInt(get('minute'), 10) || 0;
+  const dayName = get('weekday');
+  if (dayName === 'Sat' || dayName === 'Sun') return false;
+  const time = hours * 60 + minutes;
+  return time >= 570 && time <= 960; // 9:30 AM - 4:00 PM ET
+}
+
 interface AnalysisRequest {
   symbol: string;
   mode?: 'trade' | 'fundamental';
@@ -593,11 +608,20 @@ function buildPrompt(d: AnalysisRequest, flow?: FlowResult, vix?: VIXContext | n
 
   const moveSigma = d.dailySigma > 0 ? Math.abs(d.changePct) / d.dailySigma : 0;
   const moveATR = d.atrPercent > 0 ? Math.abs(d.changePct) / d.atrPercent : 0;
+  const marketOpen = isMarketOpenNow();
 
-  return `You are an expert options strategist and quantitative analyst. Analyze the following LIVE market data for ${d.symbol} and provide specific, actionable options trade recommendations.
-
+  return `You are an expert options strategist and quantitative analyst. Analyze the following ${marketOpen ? 'LIVE' : 'END-OF-DAY'} market data for ${d.symbol} and provide specific, actionable options trade recommendations.
+${!marketOpen ? `
+** MARKET IS CURRENTLY CLOSED **
+Volume, flow, and intraday momentum data below is from the LAST trading session — it is STALE.
+DO NOT interpret zero or low volume as bearish or lacking conviction.
+DO NOT weight volume P/C ratio, options flow, or sweep/block data as live signals.
+FOCUS YOUR ANALYSIS ON: OI-based dealer positioning (GEX walls, DEX, gamma flip, max pain),
+IV regime/term structure, skew, historical correlations, and structural levels.
+Momentum data reflects the prior session's close and may include after-hours moves.
+` : ''}
 ═══════════════════════════════════════════
-MARKET DATA SNAPSHOT — ${d.symbol}
+MARKET DATA SNAPSHOT — ${d.symbol}${!marketOpen ? ' (last session close)' : ''}
 ═══════════════════════════════════════════
 
 PRICE ACTION

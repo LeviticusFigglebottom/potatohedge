@@ -1,6 +1,23 @@
 import { NextRequest } from 'next/server';
-import { getQuote, getExpirations, getOptionsChain } from '@/lib/providers/tradier';
-import { fetchEquityBars } from '@/lib/providers/equityBars';
+import { getQuotes, getExpirations, getOptionsChain } from '@/lib/providers/tradier';
+import { getOptionsSnapshotLite, polygonSnapshotToChains, getEquityHistory } from '@/lib/providers/polygon';
+import { getMarketIndicators } from '@/lib/providers/fred';
+import type { Quote, OptionsChain } from '@/types/market';
+
+function isMarketOpenNow(): boolean {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric', minute: 'numeric', weekday: 'short', hour12: false,
+  });
+  const parts = fmt.formatToParts(new Date());
+  const get = (type: string) => parts.find(p => p.type === type)?.value || '';
+  const hours = parseInt(get('hour'), 10) || 0;
+  const minutes = parseInt(get('minute'), 10) || 0;
+  const dayName = get('weekday');
+  if (dayName === 'Sat' || dayName === 'Sun') return false;
+  const time = hours * 60 + minutes;
+  return time >= 570 && time <= 960;
+}
 import {
   computeDealerExposureFromChain,
   findGammaFlip,
@@ -15,8 +32,7 @@ import {
   computeStockProfile,
 } from '@/lib/math/analytics';
 import { generateRecommendations, type RecommendationInput } from '@/lib/math/recommendations';
-import { getUniverseSymbols } from '@/lib/stockUniverse';
-import type { EquityBar } from '@/lib/providers/equityBars';
+import { getUniverseSymbols, getTop500Symbols } from '@/lib/stockUniverse';
 import { fetchSwapData, type SwapData } from '@/lib/providers/dtcc';
 import { fetchRegSHOThreshold, fetchShortInterest, type ShortInterestData } from '@/lib/providers/finra';
 
@@ -47,7 +63,10 @@ export interface ScreenerResult {
   regSHO: boolean;
 }
 
-const CONCURRENCY = 8; // maximize stocks scanned within 60s Hobby timeout
+// Polygon snapshot = 1 API call per stock (vs 4 Tradier calls).
+// Equity history = 1 Polygon call. Total: 2 Polygon calls/stock.
+// Polygon allows ~5 calls/sec. CONCURRENCY=4 with stagger keeps us under that.
+const CONCURRENCY = 4;
 
 async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -55,22 +74,19 @@ async function sleep(ms: number) {
 
 /**
  * Lightweight correlation context from equity bars — no extra API calls needed.
- * Computes mean reversion stats and vol regime performance from daily bars.
  */
 function computeQuickCorrelationCtx(
-  bars: EquityBar[],
+  bars: { o: number; h: number; l: number; c: number; v: number; t: number }[],
   hvCurrent: number,
 ): RecommendationInput['correlationCtx'] {
   if (bars.length < 60) return undefined;
 
-  // Daily returns
   const returns: number[] = [];
   for (let i = 1; i < bars.length; i++) {
     if (bars[i - 1].c > 0) returns.push((bars[i].c - bars[i - 1].c) / bars[i - 1].c);
   }
   if (returns.length < 40) return undefined;
 
-  // Rolling 20-day HV for vol regime classification
   const hvValues: number[] = [];
   for (let i = 20; i < returns.length; i++) {
     const window = returns.slice(i - 20, i);
@@ -83,12 +99,11 @@ function computeQuickCorrelationCtx(
   const p33 = sortedHV[Math.floor(sortedHV.length * 0.33)] || 0;
   const p66 = sortedHV[Math.floor(sortedHV.length * 0.66)] || 999;
 
-  // Vol regime forward returns
   const lowVolRets: number[] = [];
   const highVolRets: number[] = [];
   const lowVolWins5d: boolean[] = [];
   for (let i = 0; i < hvValues.length - 20; i++) {
-    const idx = i + 20; // index into returns
+    const idx = i + 20;
     const fwd5 = returns.slice(idx, idx + 5).reduce((s, r) => s + r, 0);
     const fwd20 = returns.slice(idx, idx + 20).reduce((s, r) => s + r, 0);
     if (hvValues[i] <= p33) {
@@ -99,7 +114,6 @@ function computeQuickCorrelationCtx(
     }
   }
 
-  // Mean reversion: after 2σ+ moves
   const dailySigma = hvCurrent > 0 ? hvCurrent / Math.sqrt(252) : 0.015;
   const bigUps: { next1d: number }[] = [];
   const bigDowns: { next1d: number; next5d: number }[] = [];
@@ -122,40 +136,63 @@ function computeQuickCorrelationCtx(
     lowVolWinRate: lowVolWins5d.length > 5 ? lowVolWins5d.filter(Boolean).length / lowVolWins5d.length : 0.5,
     highVolAvg20d: avg(highVolRets),
     lowVolAvg20d: avg(lowVolRets),
-    volOverpricingRate: 0.5, // not computed in lightweight version
-    drawdownRatio: 1, // needs SPY data, skip in screener
-    alpha30d: 0, // needs SPY data, skip in screener
+    volOverpricingRate: 0.5,
+    drawdownRatio: 1,
+    alpha30d: 0,
   };
 }
 
 async function analyzeStock(
   ticker: string,
+  quoteMap: Map<string, Quote>,
   swapMap: Map<string, SwapData>,
   regSHOSet: Set<string>,
   siMap: Map<string, ShortInterestData>,
+  vixLevel: number | undefined,
+  useTradier: boolean = false,
 ): Promise<ScreenerResult | null> {
   try {
-    // Fetch core data: quote + expirations + equity bars in parallel
-    const [quote, expirations, historyBars] = await Promise.all([
-      getQuote(ticker),
-      getExpirations(ticker).catch(() => []),
-      fetchEquityBars(ticker, 250), // match recommendations route exactly
-    ]);
-
-    const spotPrice = quote.last;
+    // Spot price from pre-fetched Tradier batch quote
+    const quote = quoteMap.get(ticker);
+    const spotPrice = quote?.last || 0;
     if (!spotPrice || spotPrice <= 0) return null;
 
-    // Match recommendations route exactly: 3 nearest expirations
-    const nearExps = expirations.slice(0, 3);
-    if (nearExps.length === 0) return null;
+    const from = new Date(Date.now() - 260 * 86400000).toISOString().split('T')[0];
+    const to = new Date().toISOString().split('T')[0];
 
-    const chains = await Promise.all(
-      nearExps.map(e => getOptionsChain(ticker, e.date).catch(() => null))
-    ).then(c => c.filter((x): x is NonNullable<typeof x> => x !== null));
+    let chains: OptionsChain[];
+    let historyBars: { o: number; h: number; l: number; c: number; v: number; t: number }[];
+
+    if (useTradier) {
+      // Tradier path: identical to overview/recommendations route.
+      // Sequential calls with 400ms delays to respect rate limits.
+      const [expirations, rawBars] = await Promise.all([
+        getExpirations(ticker).catch(() => []),
+        getEquityHistory(ticker, 1, 'day', from, to).catch(() => []),
+      ]);
+      historyBars = rawBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, t: b.t }));
+
+      const nearExps = expirations.slice(0, 3);
+      chains = [];
+      for (const exp of nearExps) {
+        try {
+          const chain = await getOptionsChain(ticker, exp.date, spotPrice);
+          chains.push(chain);
+        } catch { /* skip failed chain */ }
+        if (chains.length < nearExps.length) await sleep(400);
+      }
+    } else {
+      // Polygon path: fast bulk scanning (1 API call for all options data).
+      const snapshots = await getOptionsSnapshotLite(ticker).catch(() => []);
+      const rawBars = await getEquityHistory(ticker, 1, 'day', from, to).catch(() => []);
+      historyBars = rawBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, t: b.t }));
+      chains = polygonSnapshotToChains(snapshots, ticker, spotPrice, 3);
+    }
 
     if (chains.length === 0) return null;
 
-    // Aggregate GEX
+    // ─── Aggregate dealer exposure (GEX + DEX + Vanna + Charm) ───
+    // computeDealerExposureFromChain computes vanna/charm via Black-Scholes internally
     const allExposures = chains.flatMap(chain =>
       computeDealerExposureFromChain(
         chain.calls.map(c => ({ strike: c.strike, openInterest: c.openInterest, impliedVolatility: c.impliedVolatility, gamma: c.gamma, delta: c.delta, dte: c.dte })),
@@ -172,6 +209,12 @@ async function analyzeStock(
         existing.netDEX += e.netDEX;
         existing.callGEX += e.callGEX;
         existing.putGEX += e.putGEX;
+        existing.netVanna += e.netVanna;
+        existing.callVanna += e.callVanna;
+        existing.putVanna += e.putVanna;
+        existing.netCharm += e.netCharm;
+        existing.callCharm += e.callCharm;
+        existing.putCharm += e.putCharm;
       } else {
         byStrike.set(e.strike, { ...e });
       }
@@ -180,6 +223,8 @@ async function analyzeStock(
 
     const totalGEX = aggExposures.reduce((s, e) => s + e.netGEX, 0);
     const totalDEX = aggExposures.reduce((s, e) => s + e.netDEX, 0);
+    const totalVanna = aggExposures.reduce((s, e) => s + e.netVanna, 0);
+    const totalCharm = aggExposures.reduce((s, e) => s + e.netCharm, 0);
     const gammaFlip = findGammaFlip(aggExposures, spotPrice);
     const callWall = findCallWall(aggExposures);
     const putWall = findPutWall(aggExposures);
@@ -191,7 +236,7 @@ async function analyzeStock(
     const volumePCR = totalCallVol > 0 ? totalPutVol / totalCallVol : 1;
     const oiPCR = totalCallOI > 0 ? totalPutOI / totalCallOI : 1;
 
-    // ATM IV — adaptive tolerance for low-priced stocks
+    // ATM IV
     const nearChain = chains[0];
     const atmTolerance = spotPrice < 20 ? 0.10 : spotPrice < 50 ? 0.05 : 0.02;
     const atmOpts = [...nearChain.calls, ...nearChain.puts]
@@ -205,7 +250,6 @@ async function analyzeStock(
     const closes = historyBars.map(b => b.c).reverse();
     const hvCurrent = computeHistoricalVolatility(closes, 20);
 
-    // If ATM IV came back as 0 (missing data), fall back to HV * 1.15 as proxy
     if (currentIV === 0 && hvCurrent > 0) {
       currentIV = hvCurrent * 1.15;
     }
@@ -226,14 +270,49 @@ async function analyzeStock(
       hvCurrent
     );
 
-    // Max pain from nearest chain (same helper as recommendations route)
+    // Max pain
     const maxPainResult = computeMaxPain(
       nearChain.calls.map(c => ({ strike: c.strike, openInterest: c.openInterest })),
       nearChain.puts.map(p => ({ strike: p.strike, openInterest: p.openInterest }))
     );
 
-    // Lightweight correlation context from existing bars
     const correlationCtx = computeQuickCorrelationCtx(historyBars, hvCurrent);
+
+    // ─── Signals that match recommendations route ───
+
+    // IV term structure (near vs next expiration)
+    let nearTermIV: number | undefined;
+    let nextTermIV: number | undefined;
+    if (chains.length >= 2) {
+      const getATMIV = (chain: typeof chains[0]) => {
+        const atm = [...chain.calls, ...chain.puts]
+          .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < atmTolerance && o.impliedVolatility > 0.01)
+          .sort((a, b) => Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice));
+        return atm.length > 0 ? atm.slice(0, 4).reduce((s, o) => s + o.impliedVolatility, 0) / Math.min(4, atm.length) : 0;
+      };
+      nearTermIV = getATMIV(chains[0]);
+      nextTermIV = getATMIV(chains[1]);
+      if (nearTermIV === 0) nearTermIV = undefined;
+      if (nextTermIV === 0) nextTermIV = undefined;
+    }
+
+    // OI Concentration (top 3 call + put strikes as % of total)
+    const callsByOI = [...nearChain.calls].sort((a, b) => b.openInterest - a.openInterest);
+    const putsByOI = [...nearChain.puts].sort((a, b) => b.openInterest - a.openInterest);
+    const top3CallOI = callsByOI.slice(0, 3).reduce((s, c) => s + c.openInterest, 0);
+    const top3PutOI = putsByOI.slice(0, 3).reduce((s, p) => s + p.openInterest, 0);
+    const totalCallOIForConc = nearChain.calls.reduce((s, c) => s + c.openInterest, 0);
+    const totalPutOIForConc = nearChain.puts.reduce((s, p) => s + p.openInterest, 0);
+    const oiConcentration = (totalCallOIForConc + totalPutOIForConc) > 0
+      ? ((top3CallOI / Math.max(1, totalCallOIForConc)) * 100 + (top3PutOI / Math.max(1, totalPutOIForConc)) * 100) / 2
+      : undefined;
+
+    // Expiration DTE for nearest chains
+    const chainExps = chains.map(c => {
+      const expDate = new Date(c.expiration + 'T16:00:00-05:00');
+      const dte = Math.max(0, Math.ceil((expDate.getTime() - Date.now()) / 86400000));
+      return { date: c.expiration, dte };
+    });
 
     const input: RecommendationInput = {
       symbol: ticker,
@@ -257,15 +336,15 @@ async function analyzeStock(
       ivHvRatio,
       skewBias: skew.skewBias,
       skewRatio: skew.skewRatio,
-      changePercent: quote.changePct,
+      changePercent: quote?.changePct ?? 0,
       atr14: profile.atr14,
       atrPercent: profile.atrPercent,
       dailySigma: profile.dailySigma,
       avgDailyRangePct: profile.avgDailyRangePct,
-      nearestExp: nearExps[0]?.date || '',
-      nearestDTE: nearExps[0]?.dte || 0,
-      weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
-      monthlyExp: nearExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
+      nearestExp: chainExps[0]?.date || '',
+      nearestDTE: chainExps[0]?.dte || 0,
+      weeklyExp: chainExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
+      monthlyExp: chainExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
       correlationCtx,
       // DTCC swap data
       swapMaturitiesToday: swapMap.get(ticker)?.maturitiesToday,
@@ -276,11 +355,18 @@ async function analyzeStock(
       shortInterest: siMap.get(ticker)?.shortInterest,
       daysToCover: siMap.get(ticker)?.daysToCover,
       regSHOThreshold: regSHOSet.has(ticker),
+      // Signals matching recommendations route
+      totalVanna: totalVanna || undefined,
+      totalCharm: totalCharm || undefined,
+      nearTermIV,
+      nextTermIV,
+      oiConcentration,
+      vixLevel,
+      isMarketOpen: isMarketOpenNow(),
     };
 
     const rec = generateRecommendations(input);
 
-    // Find top signal by absolute weight
     const topSignal = rec.signals.length > 0
       ? rec.signals.reduce((top, s) => Math.abs(s.weight) > Math.abs(top.weight) ? s : top, rec.signals[0])
       : null;
@@ -295,7 +381,7 @@ async function analyzeStock(
       currentIV,
       ivRank: ivMetrics.ivRank,
       volumePCR,
-      changePercent: quote.changePct,
+      changePercent: quote?.changePct ?? 0,
       topSignal: topSignal ? `${topSignal.name}: ${topSignal.direction}` : 'N/A',
       signalCount: rec.signals.filter(s => s.weight !== 0).length,
       gammaFlip,
@@ -303,7 +389,6 @@ async function analyzeStock(
       putWall,
       warnings: rec.warnings,
       timestamp: Date.now(),
-      // DTCC + FINRA data
       swapMaturitiesToday: swapMap.get(ticker)?.maturitiesToday || 0,
       swapNotionalToday: swapMap.get(ticker)?.notionalToday || 0,
       daysToCover: siMap.get(ticker)?.daysToCover || 0,
@@ -315,13 +400,44 @@ async function analyzeStock(
   }
 }
 
+/**
+ * Pre-fetch all quotes in bulk via Tradier batch API.
+ * 380 stocks → ~10 batch calls (40 per batch). Much lighter than per-stock quotes.
+ */
+async function prefetchQuotes(symbols: string[]): Promise<Map<string, Quote>> {
+  const BATCH_SIZE = 40;
+  const quoteMap = new Map<string, Quote>();
+
+  for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
+    const batch = symbols.slice(i, i + BATCH_SIZE);
+    try {
+      const quotes = await getQuotes(batch);
+      for (const q of quotes) {
+        if (q.symbol && q.last > 0) quoteMap.set(q.symbol, q);
+      }
+    } catch (err) {
+      console.warn(`[screener] Batch quote fetch failed for chunk ${i}-${i + BATCH_SIZE}:`, err instanceof Error ? err.message : err);
+    }
+    if (i + BATCH_SIZE < symbols.length) await sleep(500);
+  }
+
+  return quoteMap;
+}
+
 export async function GET(request: NextRequest) {
   const symbolsParam = request.nextUrl.searchParams.get('symbols');
   const minScore = parseInt(request.nextUrl.searchParams.get('minScore') || '0');
+  const provider = request.nextUrl.searchParams.get('provider') || 'polygon';
+  const useTradier = provider === 'tradier';
 
+  const tierParam = request.nextUrl.searchParams.get('tier');
   const symbols = symbolsParam
     ? symbolsParam.split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
-    : getUniverseSymbols();
+    : tierParam === 'all' ? getUniverseSymbols() : getTop500Symbols();
+
+  // Tradier refinement: sequential (1 at a time) to respect rate limits.
+  // Polygon bulk: CONCURRENCY=4 with stagger for speed.
+  const concurrency = useTradier ? 1 : CONCURRENCY;
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
@@ -331,39 +447,54 @@ export async function GET(request: NextRequest) {
       };
 
       send({ type: 'start', total: symbols.length });
+      send({ type: 'progress', completed: 0, total: symbols.length, current: 'Loading market data...' });
 
-      // Pre-fetch DTCC + FINRA data once (shared across all stocks)
-      const [swapMap, regSHOSet, siMap] = await Promise.all([
+      // Pre-fetch shared data in parallel:
+      // - Tradier batch quotes (~10 calls for all 380 stocks) with 8s cap
+      // - DTCC swaps, FINRA short data
+      // - VIX level from FRED (1 call, cached)
+      const quotesWithTimeout = Promise.race([
+        prefetchQuotes(symbols),
+        sleep(8000).then(() => new Map<string, Quote>()),
+      ]);
+
+      const [swapMap, regSHOSet, siMap, quoteMap, indicators] = await Promise.all([
         fetchSwapData().then(r => r.data).catch(() => new Map<string, SwapData>()),
         fetchRegSHOThreshold().catch(() => new Set<string>()),
         fetchShortInterest().catch(() => new Map<string, ShortInterestData>()),
+        quotesWithTimeout,
+        getMarketIndicators().catch(() => ({ vix: null, skew: null })),
       ]);
+
+      const vixLevel = indicators.vix?.current ?? undefined;
 
       send({
         type: 'meta',
         swapData: swapMap.size > 0,
         regSHOCount: regSHOSet.size,
         shortInterestCount: siMap.size,
+        quotesLoaded: quoteMap.size,
       });
 
       const results: ScreenerResult[] = [];
       let completed = 0;
 
-      // Process in batches with concurrency control
-      for (let i = 0; i < symbols.length; i += CONCURRENCY) {
-        const batch = symbols.slice(i, i + CONCURRENCY);
+      // Process stocks with staggered starts.
+      // Polygon: CONCURRENCY=4 with 300ms stagger (2 calls/stock, fast).
+      // Tradier: CONCURRENCY=1, sequential (4 calls/stock, rate-limited).
+      for (let i = 0; i < symbols.length; i += concurrency) {
+        const batch = symbols.slice(i, i + concurrency);
 
         const batchResults = await Promise.all(
-          batch.map(async (sym) => {
-            const result = await analyzeStock(sym, swapMap, regSHOSet, siMap);
+          batch.map(async (sym, idx) => {
+            if (idx > 0) await sleep(idx * 300);
+            const result = await analyzeStock(sym, quoteMap, swapMap, regSHOSet, siMap, vixLevel, useTradier);
             completed++;
             send({
               type: 'progress',
               completed,
               total: symbols.length,
               current: sym,
-              // Include full result so client can accumulate incrementally
-              // (critical for Hobby plan where function may timeout before 'done')
               result: result || null,
             });
             return result;
@@ -374,16 +505,14 @@ export async function GET(request: NextRequest) {
           if (r) results.push(r);
         }
 
-        // Small delay between batches to avoid rate limit spikes
-        if (i + CONCURRENCY < symbols.length) {
-          await sleep(100);
+        // Pause between batches — Tradier needs more cooldown
+        if (i + concurrency < symbols.length) {
+          await sleep(useTradier ? 500 : 200);
         }
       }
 
-      // Sort by absolute bias score descending
       results.sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
 
-      // Filter by minimum score if specified
       const filtered = minScore > 0
         ? results.filter(r => Math.abs(r.biasScore) >= minScore)
         : results;

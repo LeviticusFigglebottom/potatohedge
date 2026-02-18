@@ -2,13 +2,43 @@
 
 import { useState, useCallback, useRef } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
-import { STOCK_UNIVERSE } from '@/lib/stockUniverse';
-import { Radar, Download, ArrowUpDown, Filter, Loader2, AlertTriangle, TrendingUp, TrendingDown, Minus } from 'lucide-react';
+import { STOCK_UNIVERSE, getTop500Symbols, getUniverseSymbols } from '@/lib/stockUniverse';
+import { Radar, Download, ArrowUpDown, Filter, Loader2, AlertTriangle, TrendingUp, TrendingDown, Minus, Crosshair, CheckCircle2, ListChecks } from 'lucide-react';
 import type { ScreenerResult } from '@/app/api/market/screener/route';
+import { addSignal, loadSignals } from '@/lib/signalTracker';
 
 type SortKey = 'symbol' | 'biasScore' | 'spotPrice' | 'changePercent' | 'ivRank' | 'currentIV' | 'volumePCR';
 type SortDir = 'asc' | 'desc';
 type BiasFilter = 'all' | 'bullish' | 'bearish' | 'extreme';
+
+const SCREENER_CACHE_KEY = 'optix-screener-cache';
+
+function loadScreenerCache(): { results: ScreenerResult[]; timestamp: number } | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(SCREENER_CACHE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function saveScreenerCache(results: ScreenerResult[]): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(SCREENER_CACHE_KEY, JSON.stringify({ results, timestamp: Date.now() }));
+  } catch { /* storage full or unavailable */ }
+}
+
+function formatAge(timestamp: number): string {
+  const ms = Date.now() - timestamp;
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h ago`;
+}
 
 export default function ScreenerTab() {
   const { loadSymbol, setActiveTab } = useDashboardStore();
@@ -20,12 +50,139 @@ export default function ScreenerTab() {
   const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [biasFilter, setBiasFilter] = useState<BiasFilter>('all');
   const [minScore, setMinScore] = useState(0);
-  const [lastScanTime, setLastScanTime] = useState<string | null>(null);
+  const [scanTimestamp, setScanTimestamp] = useState<number | null>(null);
+  const [trackedSymbols, setTrackedSymbols] = useState<Set<string>>(new Set());
+  const [includeRetail, setIncludeRetail] = useState(false);
+  const [scanLog, setScanLog] = useState<{ chunk: number; sent: number; received: number; ms: number; error?: string; retry?: number }[]>([]);
   const abortRef = useRef<AbortController | null>(null);
+
+  // Load cached screener results + tracked symbols on mount
+  useState(() => {
+    const existing = loadSignals();
+    setTrackedSymbols(new Set(existing.map(s => s.symbol)));
+    const cached = loadScreenerCache();
+    if (cached && cached.results.length > 0) {
+      setResults(cached.results);
+      setScanTimestamp(cached.timestamp);
+    }
+  });
+
+  // Process one SSE stream chunk, accumulating results
+  const processStream = useCallback(async (
+    res: Response,
+    accumulated: ScreenerResult[],
+    globalOffset: number,
+    globalTotal: number,
+    signal: AbortSignal,
+  ) => {
+    if (!res.body) return;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      if (signal.aborted) { reader.cancel(); break; }
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const data = JSON.parse(line.slice(6));
+
+          if (data.type === 'progress') {
+            setProgress({
+              completed: globalOffset + data.completed,
+              total: globalTotal,
+              current: data.current,
+            });
+            if (data.result && data.result.symbol) {
+              accumulated.push(data.result as ScreenerResult);
+              // Live-update displayed results every 10 stocks
+              if (accumulated.length % 10 === 0) {
+                const sorted = [...accumulated].sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
+                setResults(sorted);
+              }
+            }
+          } else if (data.type === 'done' && data.results) {
+            // Server sent final sorted results for this chunk — merge any we missed
+            for (const r of data.results as ScreenerResult[]) {
+              if (!accumulated.some(a => a.symbol === r.symbol)) {
+                accumulated.push(r);
+              }
+            }
+          }
+        } catch { /* skip malformed events */ }
+      }
+    }
+  }, []);
+
+  const CHUNK_SIZE = 30; // 30 stocks per chunk — Polygon snapshots (2 calls/stock) are fast
+
+  /**
+   * Scan a single chunk of symbols, returning the number of results received.
+   * Appends results to `accumulated`, logs to `chunkLog`, and updates state.
+   */
+  const scanChunk = useCallback(async (
+    symbols: string[],
+    chunkIdx: number,
+    accumulated: ScreenerResult[],
+    chunkLog: { chunk: number; sent: number; received: number; ms: number; error?: string; retry?: number }[],
+    globalOffset: number,
+    globalTotal: number,
+    controller: AbortController,
+    retryPass?: number,
+    provider?: string,
+  ): Promise<number> => {
+    const providerParam = provider ? `&provider=${provider}` : '';
+    const scanUrl = `/api/market/screener?symbols=${symbols.join(',')}${providerParam}`;
+    const beforeCount = accumulated.length;
+    const chunkStart = Date.now();
+
+    // Per-chunk abort: auto-timeout at 55s (Vercel kills at 60s) + user abort
+    const chunkAbort = new AbortController();
+    const timeout = setTimeout(() => chunkAbort.abort(), 55000);
+    const onMainAbort = () => chunkAbort.abort();
+    controller.signal.addEventListener('abort', onMainAbort);
+
+    try {
+      const res = await fetch(scanUrl, { signal: chunkAbort.signal });
+      if (!res.ok || !res.body) {
+        chunkLog.push({ chunk: chunkIdx, sent: symbols.length, received: 0, ms: Date.now() - chunkStart, error: `HTTP ${res.status}`, retry: retryPass });
+        setScanLog([...chunkLog]);
+        return 0;
+      }
+
+      await processStream(res, accumulated, globalOffset, globalTotal, chunkAbort.signal);
+      const received = accumulated.length - beforeCount;
+      chunkLog.push({ chunk: chunkIdx, sent: symbols.length, received, ms: Date.now() - chunkStart, retry: retryPass });
+      setScanLog([...chunkLog]);
+      return received;
+    } catch (err) {
+      // Propagate user abort but handle chunk timeout gracefully
+      if ((err as Error).name === 'AbortError' && controller.signal.aborted) throw err;
+      const received = accumulated.length - beforeCount;
+      const isTimeout = (err as Error).name === 'AbortError' && !controller.signal.aborted;
+      chunkLog.push({
+        chunk: chunkIdx, sent: symbols.length, received,
+        ms: Date.now() - chunkStart,
+        error: isTimeout ? 'timeout (55s)' : (err as Error).message,
+        retry: retryPass,
+      });
+      setScanLog([...chunkLog]);
+      return received;
+    } finally {
+      clearTimeout(timeout);
+      controller.signal.removeEventListener('abort', onMainAbort);
+    }
+  }, [processStream]);
 
   const startScan = useCallback(async () => {
     if (scanning) {
-      // Abort current scan
       abortRef.current?.abort();
       setScanning(false);
       return;
@@ -33,76 +190,239 @@ export default function ScreenerTab() {
 
     setScanning(true);
     setResults([]);
-    setProgress({ completed: 0, total: 0, current: '' });
+    setScanLog([]);
 
     const controller = new AbortController();
     abortRef.current = controller;
 
+    const allSymbols = includeRetail ? getUniverseSymbols() : getTop500Symbols();
+    setProgress({ completed: 0, total: allSymbols.length, current: '' });
+
+    const accumulated: ScreenerResult[] = [];
+    const chunkLog: { chunk: number; sent: number; received: number; ms: number; error?: string; retry?: number }[] = [];
+    let chunkCounter = 0;
+
     try {
-      const res = await fetch('/api/market/screener', { signal: controller.signal });
-      if (!res.ok || !res.body) throw new Error('Screener API error');
+      // ═══════════════════════════════════════════════════
+      // PASS 1: Initial scan of all symbols
+      // ═══════════════════════════════════════════════════
+      let consecutiveEmpty = 0;
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      // Accumulate results from progress events so partial scans still
-      // show data even if the serverless function times out before 'done'
-      const accumulated: ScreenerResult[] = [];
-      let gotDone = false;
+      for (let i = 0; i < allSymbols.length; i += CHUNK_SIZE) {
+        if (controller.signal.aborted) break;
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
+        const chunk = allSymbols.slice(i, i + CHUNK_SIZE);
+        chunkCounter++;
+        const totalChunks = Math.ceil(allSymbols.length / CHUNK_SIZE);
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n\n');
-        buffer = lines.pop() || '';
+        const received = await scanChunk(chunk, chunkCounter, accumulated, chunkLog, i, allSymbols.length, controller);
+        console.log(`[Screener] Chunk ${chunkCounter}/${totalChunks}: ${received}/${chunk.length} in pass 1`);
 
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          try {
-            const data = JSON.parse(line.slice(6));
+        // Track empty responses for adaptive pacing
+        if (received === 0) {
+          consecutiveEmpty++;
+        } else {
+          consecutiveEmpty = 0;
+        }
 
-            if (data.type === 'start') {
-              setProgress(p => ({ ...p, total: data.total }));
-            } else if (data.type === 'progress') {
-              setProgress({ completed: data.completed, total: data.total, current: data.current });
-              // Accumulate full results as they stream in
-              if (data.result && data.result.symbol) {
-                accumulated.push(data.result as ScreenerResult);
-                // Update displayed results every 10 stocks so user sees live progress
-                if (accumulated.length % 10 === 0) {
-                  const sorted = [...accumulated].sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
-                  setResults(sorted);
-                }
-              }
-            } else if (data.type === 'done') {
-              // Final sorted results from server (if we get here)
-              gotDone = true;
-              setResults(data.results);
-              setLastScanTime(new Date().toLocaleString());
-            }
-          } catch { /* skip malformed events */ }
+        // Inter-chunk delay — Polygon-powered, light pacing needed
+        if (i + CHUNK_SIZE < allSymbols.length && !controller.signal.aborted) {
+          if (consecutiveEmpty >= 3) {
+            setProgress(p => ({ ...p, current: `API cooldown — pausing 10s (${accumulated.length} stocks so far)` }));
+            await new Promise(r => setTimeout(r, 10000));
+            consecutiveEmpty = 0;
+          } else if (consecutiveEmpty >= 1) {
+            setProgress(p => ({ ...p, current: `Rate limit recovery — pausing 5s...` }));
+            await new Promise(r => setTimeout(r, 5000));
+          } else {
+            // Normal: 2s gap between chunks
+            await new Promise(r => setTimeout(r, 2000));
+          }
         }
       }
 
-      // If stream ended without 'done' (serverless timeout), finalize accumulated results
-      if (!gotDone && accumulated.length > 0) {
+      // ═══════════════════════════════════════════════════
+      // PASS 2+3: Retry any missed symbols
+      // ═══════════════════════════════════════════════════
+      const MAX_RETRY_PASSES = 2;
+
+      for (let retryPass = 1; retryPass <= MAX_RETRY_PASSES; retryPass++) {
+        if (controller.signal.aborted) break;
+
+        // Find symbols that weren't in any accumulated result
+        const scannedSymbols = new Set(accumulated.map(r => r.symbol));
+        const missed = allSymbols.filter(s => !scannedSymbols.has(s));
+
+        if (missed.length === 0) {
+          console.log(`[Screener] All ${allSymbols.length} symbols scanned — no retry needed`);
+          break;
+        }
+
+        console.log(`[Screener] Retry pass ${retryPass}: ${missed.length} missed symbols`);
+        setProgress(p => ({
+          ...p,
+          current: `Retrying ${missed.length} missed stocks (pass ${retryPass}/${MAX_RETRY_PASSES}) — cooling down 5s...`,
+        }));
+
+        // Brief cooldown before retry
+        await new Promise(r => setTimeout(r, 5000));
+
+        consecutiveEmpty = 0;
+        for (let i = 0; i < missed.length; i += CHUNK_SIZE) {
+          if (controller.signal.aborted) break;
+
+          const chunk = missed.slice(i, i + CHUNK_SIZE);
+          chunkCounter++;
+
+          const received = await scanChunk(chunk, chunkCounter, accumulated, chunkLog, 0, allSymbols.length, controller, retryPass);
+          console.log(`[Screener] Retry ${retryPass} chunk: ${received}/${chunk.length}`);
+
+          // Update live results
+          if (accumulated.length > 0 && accumulated.length % 5 === 0) {
+            const sorted = [...accumulated].sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
+            setResults(sorted);
+          }
+
+          if (received === 0) consecutiveEmpty++;
+          else consecutiveEmpty = 0;
+
+          // Retry delays
+          if (i + CHUNK_SIZE < missed.length && !controller.signal.aborted) {
+            if (consecutiveEmpty >= 2) {
+              setProgress(p => ({ ...p, current: `Pausing 8s before next retry chunk...` }));
+              await new Promise(r => setTimeout(r, 8000));
+              consecutiveEmpty = 0;
+            } else {
+              await new Promise(r => setTimeout(r, 3000));
+            }
+          }
+        }
+
+        setProgress(p => ({ ...p, completed: accumulated.length }));
+      }
+
+      // ═══════════════════════════════════════════════════
+      // REFINEMENT PASS: Re-score top stocks with Tradier
+      // (Polygon IV model differs from Tradier/ORATS used by overview)
+      // ═══════════════════════════════════════════════════
+      const REFINE_COUNT = 40;
+      const REFINE_CHUNK = 10; // 10 stocks × 4 Tradier calls = 40 calls/chunk (~20s)
+
+      if (accumulated.length > 0 && !controller.signal.aborted) {
+        const topSymbols = [...accumulated]
+          .sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore))
+          .slice(0, REFINE_COUNT)
+          .map(r => r.symbol);
+
+        console.log(`[Screener] Refining top ${topSymbols.length} stocks with Tradier data`);
+        setProgress(p => ({
+          ...p,
+          current: `Refining top ${topSymbols.length} scores with Tradier data (matching overview)...`,
+        }));
+
+        // Show intermediate Polygon results while refining
+        const sortedIntermediate = [...accumulated].sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
+        setResults(sortedIntermediate);
+
+        for (let i = 0; i < topSymbols.length; i += REFINE_CHUNK) {
+          if (controller.signal.aborted) break;
+
+          const chunk = topSymbols.slice(i, i + REFINE_CHUNK);
+          chunkCounter++;
+
+          // scanChunk with provider=tradier appends to accumulated.
+          // The Tradier results replace Polygon results for these symbols.
+          const beforeRefine = accumulated.length;
+          const received = await scanChunk(
+            chunk, chunkCounter, accumulated, chunkLog,
+            0, allSymbols.length, controller, undefined, 'tradier'
+          );
+          console.log(`[Screener] Refinement: ${received}/${chunk.length} Tradier results`);
+
+          // Deduplicate: keep only the latest (Tradier) result for each symbol
+          const seen = new Set<string>();
+          for (let j = accumulated.length - 1; j >= 0; j--) {
+            if (seen.has(accumulated[j].symbol)) {
+              accumulated.splice(j, 1);
+            } else {
+              seen.add(accumulated[j].symbol);
+            }
+          }
+
+          // Update live results
+          const sorted = [...accumulated].sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
+          setResults(sorted);
+
+          // Tradier rate limit cooldown between refinement chunks
+          if (i + REFINE_CHUNK < topSymbols.length && !controller.signal.aborted) {
+            setProgress(p => ({ ...p, current: `Tradier cooldown — refining ${Math.min(i + REFINE_CHUNK, topSymbols.length)}/${topSymbols.length}...` }));
+            await new Promise(r => setTimeout(r, 3000));
+          }
+        }
+      }
+
+      // ═══════════════════════════════════════════════════
+      // Finalize and persist
+      // ═══════════════════════════════════════════════════
+      const scannedFinal = new Set(accumulated.map(r => r.symbol));
+      const stillMissed = allSymbols.filter(s => !scannedFinal.has(s));
+      if (stillMissed.length > 0) {
+        console.warn(`[Screener] ${stillMissed.length} symbols still missed after retries: ${stillMissed.slice(0, 10).join(', ')}...`);
+      }
+
+      if (accumulated.length > 0) {
         const sorted = accumulated.sort((a, b) => Math.abs(b.biasScore) - Math.abs(a.biasScore));
         setResults(sorted);
-        setLastScanTime(`${new Date().toLocaleString()} (partial: ${accumulated.length} stocks)`);
+        saveScreenerCache(sorted);
       }
+      setScanTimestamp(Date.now());
     } catch (err) {
       if ((err as Error).name === 'AbortError') { /* expected */ }
     } finally {
       setScanning(false);
     }
-  }, [scanning]);
+  }, [scanning, includeRetail, scanChunk]);
 
   const navigateToStock = useCallback((symbol: string) => {
     loadSymbol(symbol);
     setActiveTab('overview');
   }, [loadSymbol, setActiveTab]);
+
+  const handleTrackSignal = useCallback(async (r: ScreenerResult, e: React.MouseEvent) => {
+    e.stopPropagation();
+    // Fetch fresh quote — entry price MUST be current
+    let entryPrice = 0;
+    try {
+      const res = await fetch(`/api/market/quote?symbol=${r.symbol}`, { signal: AbortSignal.timeout(8000) });
+      if (res.ok) {
+        const q = await res.json();
+        if (q.last > 0) entryPrice = q.last;
+      }
+    } catch { /* will check below */ }
+
+    if (entryPrice <= 0) {
+      console.warn(`Signal Tracker: could not get fresh price for ${r.symbol}, skipping`);
+      return;
+    }
+
+    addSignal({
+      symbol: r.symbol,
+      entryPrice,
+      bias: r.overallBias,
+      biasScore: r.biasScore,
+      gammaRegime: r.gammaRegime,
+      volRegime: r.volRegime,
+      ivRank: r.ivRank,
+      topSignal: r.topSignal,
+      gammaFlip: r.gammaFlip,
+      callWall: r.callWall,
+      putWall: r.putWall,
+      source: 'screener',
+    });
+    setTrackedSymbols(prev => new Set(prev).add(r.symbol));
+  }, []);
+
+  const [trackingAll, setTrackingAll] = useState(false);
 
   // Sort + filter
   const filteredResults = results
@@ -135,6 +455,69 @@ export default function ScreenerTab() {
       setSortDir('desc');
     }
   };
+
+  const handleTrackAll = useCallback(async () => {
+    // Only track high-conviction signals: |score| >= 50
+    const untracked = filteredResults.filter(r => !trackedSymbols.has(r.symbol) && Math.abs(r.biasScore) >= 50);
+    if (untracked.length === 0) return;
+
+    setTrackingAll(true);
+    try {
+      // Batch-fetch fresh quotes — 40 symbols per request to stay within API limits
+      const symbols = untracked.map(r => r.symbol);
+      const freshPrices: Record<string, number> = {};
+      const BATCH_SIZE = 40;
+
+      for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
+        const batch = symbols.slice(i, i + BATCH_SIZE);
+        try {
+          const res = await fetch(`/api/market/quotes?symbols=${batch.join(',')}`, {
+            signal: AbortSignal.timeout(15000),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (Array.isArray(data)) {
+              for (const q of data) {
+                if (q.symbol && q.last > 0) freshPrices[q.symbol] = q.last;
+              }
+            }
+          }
+        } catch { /* continue with next batch */ }
+      }
+
+      const newTracked = new Set(trackedSymbols);
+      let skippedNoPrice = 0;
+      for (const r of untracked) {
+        const price = freshPrices[r.symbol];
+        // Only track if we got a fresh price — never use stale scan data
+        if (!price || price <= 0) {
+          skippedNoPrice++;
+          continue;
+        }
+        addSignal({
+          symbol: r.symbol,
+          entryPrice: price,
+          bias: r.overallBias,
+          biasScore: r.biasScore,
+          gammaRegime: r.gammaRegime,
+          volRegime: r.volRegime,
+          ivRank: r.ivRank,
+          topSignal: r.topSignal,
+          gammaFlip: r.gammaFlip,
+          callWall: r.callWall,
+          putWall: r.putWall,
+          source: 'screener',
+        });
+        newTracked.add(r.symbol);
+      }
+      if (skippedNoPrice > 0) {
+        console.warn(`Signal Tracker: skipped ${skippedNoPrice} stocks (no fresh price available)`);
+      }
+      setTrackedSymbols(newTracked);
+    } finally {
+      setTrackingAll(false);
+    }
+  }, [filteredResults, trackedSymbols]);
 
   const exportCSV = useCallback(() => {
     if (filteredResults.length === 0) return;
@@ -214,13 +597,24 @@ export default function ScreenerTab() {
             <Radar className="w-4 h-4 text-accent-cyan" />
             <span className="panel-title">Market Screener</span>
             <span className="text-xs text-text-muted font-mono">
-              {STOCK_UNIVERSE.length} stocks
+              {includeRetail ? STOCK_UNIVERSE.length : getTop500Symbols().length} stocks
             </span>
           </div>
           <div className="flex items-center gap-3">
-            {lastScanTime && (
-              <span className="text-xs text-text-muted font-mono">
-                Last scan: {lastScanTime}
+            <label className="flex items-center gap-1.5 text-xs font-mono text-text-muted cursor-pointer select-none" title="Include smaller-cap retail favorites (adds ~50 stocks)">
+              <input
+                type="checkbox"
+                checked={includeRetail}
+                onChange={(e) => setIncludeRetail(e.target.checked)}
+                disabled={scanning}
+                className="accent-accent-cyan"
+              />
+              +Retail
+            </label>
+            {scanTimestamp && (
+              <span className={`text-xs font-mono ${Date.now() - scanTimestamp > 3600000 ? 'text-yellow-400' : 'text-text-muted'}`}
+                title={new Date(scanTimestamp).toLocaleString()}>
+                Scanned: {formatAge(scanTimestamp)}
               </span>
             )}
             <button
@@ -263,6 +657,30 @@ export default function ScreenerTab() {
             <span className="text-xs font-mono text-accent-cyan">
               Analyzing {progress.current}...
             </span>
+          </div>
+        )}
+
+        {/* Chunk Log (scan debugging) */}
+        {scanLog.length > 0 && (
+          <div className="px-4 pb-3 border-t border-border/20 pt-2">
+            <details className="text-xs font-mono">
+              <summary className="text-text-muted cursor-pointer hover:text-text-secondary">
+                Scan Log: {scanLog.reduce((s, c) => s + c.received, 0)} stocks from {scanLog.length} chunks
+                {scanLog.some(c => c.retry) && <span className="text-accent-cyan ml-2">(+{scanLog.filter(c => c.retry).length} retries)</span>}
+                {scanLog.some(c => c.error) && <span className="text-yellow-400 ml-2">({scanLog.filter(c => c.error).length} errors)</span>}
+              </summary>
+              <div className="mt-1.5 space-y-0.5">
+                {scanLog.map((c, i) => (
+                  <div key={i} className={`flex items-center gap-2 ${c.error ? 'text-yellow-400' : c.received === c.sent ? 'text-text-muted' : 'text-amber-400/70'}`}>
+                    <span>{c.retry ? `Retry${c.retry}` : 'Chunk'} {c.chunk}:</span>
+                    <span>{c.received}/{c.sent}</span>
+                    <span className="text-text-muted/50">{(c.ms / 1000).toFixed(1)}s</span>
+                    {c.error && <span className="text-red-400 truncate">{c.error}</span>}
+                    {!c.error && c.received < c.sent && <span className="text-amber-400/50">(rate limited)</span>}
+                  </div>
+                ))}
+              </div>
+            </details>
           </div>
         )}
 
@@ -310,6 +728,15 @@ export default function ScreenerTab() {
             </span>
 
             <button
+              onClick={handleTrackAll}
+              disabled={trackingAll || filteredResults.filter(r => !trackedSymbols.has(r.symbol) && Math.abs(r.biasScore) >= 50).length === 0}
+              className="px-3 py-1.5 rounded-md text-xs font-mono bg-accent-cyan/10 border border-accent-cyan/20 text-accent-cyan hover:bg-accent-cyan/20 transition-all flex items-center gap-1.5 disabled:opacity-40"
+              title="Track all stocks with |Score| >= 50"
+            >
+              <ListChecks className="w-3.5 h-3.5" />
+              {trackingAll ? 'Tracking...' : `Track |50|+ (${filteredResults.filter(r => !trackedSymbols.has(r.symbol) && Math.abs(r.biasScore) >= 50).length})`}
+            </button>
+            <button
               onClick={exportCSV}
               className="px-3 py-1.5 rounded-md text-xs font-mono bg-bg-tertiary border border-border/30 text-text-secondary hover:border-accent-cyan/30 hover:text-accent-cyan transition-all flex items-center gap-1.5"
             >
@@ -320,9 +747,86 @@ export default function ScreenerTab() {
         )}
       </div>
 
-      {/* Results Table */}
+      {/* Results — Mobile Card Layout */}
       {results.length > 0 && (
-        <div className="panel overflow-hidden">
+        <div className="md:hidden space-y-2">
+          {filteredResults.slice(0, 50).map(r => (
+            <div
+              key={r.symbol}
+              className="panel p-3 cursor-pointer hover:border-accent-cyan/30 transition-colors"
+              onClick={() => navigateToStock(r.symbol)}
+            >
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2">
+                  <span className="font-mono font-bold text-text-primary text-sm">{r.symbol}</span>
+                  <span className={`flex items-center gap-0.5 ${biasColor(r.overallBias, r.biasScore)}`}>
+                    {biasIcon(r.overallBias)}
+                    <span className="text-[10px] font-mono capitalize">{r.overallBias}</span>
+                  </span>
+                  {r.warnings.length > 0 && <AlertTriangle className="w-3 h-3 text-yellow-500" />}
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className={`inline-block px-2 py-0.5 rounded text-xs font-mono font-semibold border ${scoreBg(r.biasScore)}`}>
+                    {r.biasScore > 0 ? '+' : ''}{r.biasScore}
+                  </span>
+                  {trackedSymbols.has(r.symbol) ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-accent-cyan" />
+                  ) : (
+                    <button onClick={(e) => handleTrackSignal(r, e)} className="p-0.5 text-text-muted hover:text-accent-cyan">
+                      <Crosshair className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="grid grid-cols-4 gap-2 text-xs font-mono">
+                <div>
+                  <div className="text-[9px] text-text-muted">Price</div>
+                  <div className="text-text-secondary">${r.spotPrice.toFixed(2)}</div>
+                </div>
+                <div>
+                  <div className="text-[9px] text-text-muted">Change</div>
+                  <div className={r.changePercent >= 0 ? 'text-green-400' : 'text-red-400'}>
+                    {r.changePercent >= 0 ? '+' : ''}{r.changePercent.toFixed(2)}%
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[9px] text-text-muted">IV Rank</div>
+                  <div className="flex items-center gap-1">
+                    <div className="w-8 h-1 bg-bg-tertiary rounded-full overflow-hidden">
+                      <div className={`h-full rounded-full ${r.ivRank > 70 ? 'bg-orange-500' : r.ivRank < 30 ? 'bg-blue-400' : 'bg-accent-cyan/60'}`} style={{ width: `${Math.min(100, r.ivRank)}%` }} />
+                    </div>
+                    <span className="text-text-muted">{r.ivRank}</span>
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[9px] text-text-muted">PCR</div>
+                  <div className={r.volumePCR > 1.3 ? 'text-red-400' : r.volumePCR < 0.7 ? 'text-green-400' : 'text-text-muted'}>{r.volumePCR.toFixed(2)}</div>
+                </div>
+              </div>
+              <div className="flex items-center justify-between mt-1.5">
+                <div className="flex items-center gap-2">
+                  <span className={`text-[10px] font-mono px-1 py-0.5 rounded ${
+                    r.volRegime === 'high' ? 'bg-orange-500/15 text-orange-400' : r.volRegime === 'low' ? 'bg-blue-500/15 text-blue-400' : 'bg-bg-tertiary text-text-muted'
+                  }`}>{r.volRegime} vol</span>
+                  <span className={`text-[10px] font-mono px-1 py-0.5 rounded ${
+                    r.gammaRegime === 'long' ? 'bg-green-500/15 text-green-400' : r.gammaRegime === 'short' ? 'bg-red-500/15 text-red-400' : 'bg-bg-tertiary text-text-muted'
+                  }`}>{r.gammaRegime}γ</span>
+                </div>
+                <span className="text-[10px] font-mono text-text-muted truncate max-w-[120px]">{r.topSignal}</span>
+              </div>
+            </div>
+          ))}
+          {filteredResults.length > 50 && (
+            <div className="text-center text-xs font-mono text-text-muted py-2">
+              Showing 50 of {filteredResults.length} — use desktop for full table
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Results Table — Desktop */}
+      {results.length > 0 && (
+        <div className="panel overflow-hidden hidden md:block">
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
@@ -341,6 +845,7 @@ export default function ScreenerTab() {
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Key Levels</th>
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">Swaps</th>
                   <th className="px-3 py-2 text-left text-xs font-mono text-text-muted">SI/DTC</th>
+                  <th className="px-3 py-2 text-center text-xs font-mono text-text-muted w-16">Track</th>
                 </tr>
               </thead>
               <tbody>
@@ -458,6 +963,19 @@ export default function ScreenerTab() {
                         )}
                       </div>
                     </td>
+                    <td className="px-3 py-2 text-center">
+                      {trackedSymbols.has(r.symbol) ? (
+                        <span className="text-accent-cyan"><CheckCircle2 className="w-3.5 h-3.5 inline" /></span>
+                      ) : (
+                        <button
+                          onClick={(e) => handleTrackSignal(r, e)}
+                          title={`Track ${r.symbol} signal`}
+                          className="p-1 rounded hover:bg-accent-cyan/15 text-text-muted hover:text-accent-cyan transition-colors"
+                        >
+                          <Crosshair className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -473,7 +991,7 @@ export default function ScreenerTab() {
             <Radar className="w-12 h-12 text-text-muted/30 mb-4" />
             <h3 className="text-lg font-semibold text-text-secondary mb-2">Market Screener</h3>
             <p className="text-sm text-text-muted max-w-md mb-1">
-              Scan {STOCK_UNIVERSE.length} stocks across all sectors for extreme directional signals.
+              Scan {getTop500Symbols().length} top market-cap stocks across all sectors for extreme directional signals.
               Identifies the strongest bullish and bearish setups based on GEX positioning,
               options flow, IV regime, and dealer exposure.
             </p>
@@ -489,7 +1007,7 @@ export default function ScreenerTab() {
               Start Full Scan
             </button>
             <p className="text-xs text-text-muted/40 mt-3 font-mono">
-              Takes ~2-4 minutes depending on API response times
+              Takes ~3-5 minutes — Polygon snapshots + all scoring signals
             </p>
           </div>
         </div>

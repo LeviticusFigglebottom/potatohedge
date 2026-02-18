@@ -44,10 +44,11 @@ export interface SnapshotData {
   ivTimeSeries?: { time: number; hv20: number; ivProxy: number; ivRank: number }[];
   vix?: { price: number; change: number; changePct: number } | null;
   vixTimeSeries?: { time: number; vix: number }[];
+  skew?: { current: number; previous: number; change: number; changePercent: number; date: string } | null;
   snapshotCount: number;
 }
 
-export type TabId = 'overview' | 'chain' | 'dealer' | 'volatility' | 'analytics' | 'screener' | 'institutional' | 'briefing' | 'paper' | 'tracker' | 'diagnostics';
+export type TabId = 'overview' | 'chain' | 'dealer' | 'volatility' | 'analytics' | 'screener' | 'institutional' | 'briefing' | 'paper' | 'tracker' | 'signals' | 'diagnostics';
 
 // ─── AI-generated content cache (survives tab switches) ───
 
@@ -133,6 +134,29 @@ interface DashboardStore {
   runDiagnostics: () => Promise<void>;
 }
 
+// ─── Briefing persistence helpers ─────────────────────────
+const BRIEFING_CACHE_KEY = 'optix-briefing-cache';
+
+function loadBriefingCache(): BriefingCache | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(BRIEFING_CACHE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function saveBriefingCache(data: BriefingCache | null): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (data) {
+      localStorage.setItem(BRIEFING_CACHE_KEY, JSON.stringify(data));
+    } else {
+      localStorage.removeItem(BRIEFING_CACHE_KEY);
+    }
+  } catch { /* storage full or unavailable */ }
+}
+
 const api = async (path: string) => {
   const res = await fetch(path);
   if (!res.ok) {
@@ -159,9 +183,9 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
   metricHistory: [],
   loading: {}, error: null, errors: [], diagnostics: null, lastUpdate: 0,
 
-  // AI-generated content cache — persists across tab switches
-  briefingCache: null,
-  setBriefingCache: (data) => set({ briefingCache: data }),
+  // AI-generated content cache — persists to localStorage across page reloads
+  briefingCache: loadBriefingCache(),
+  setBriefingCache: (data) => { saveBriefingCache(data); set({ briefingCache: data }); },
   aiAnalysisCache: null,
   setAiAnalysisCache: (data) => set({ aiAnalysisCache: data }),
 
@@ -354,3 +378,13 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
     get().saveAndLoadMetricHistory();
   },
 }));
+
+// ─── Client-side rehydration ─────────────────────────────────
+// The store `create()` runs during SSR where window is undefined,
+// so localStorage-based initializers return null. Rehydrate on the client.
+if (typeof window !== 'undefined') {
+  const cached = loadBriefingCache();
+  if (cached && !useDashboardStore.getState().briefingCache) {
+    useDashboardStore.setState({ briefingCache: cached });
+  }
+}

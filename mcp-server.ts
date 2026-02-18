@@ -24,12 +24,21 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+// Note: zod v4 basic schemas (z.string, z.enum, z.record, etc.) are runtime-compatible
+// with MCP SDK's schema validation. If type errors occur, use `import { z } from 'zod/v3'`.
 import { z } from 'zod';
 
 const DASHBOARD_URL = process.env.DASHBOARD_URL || 'http://localhost:3000';
+const DIAGNOSTICS_SECRET = process.env.DIAGNOSTICS_SECRET || '';
 const FETCH_TIMEOUT = 15000;
 
 // ─── Helper: call diagnostics API ──────────────────────────
+
+function authHeaders(): Record<string, string> {
+  const h: Record<string, string> = {};
+  if (DIAGNOSTICS_SECRET) h['Authorization'] = `Bearer ${DIAGNOSTICS_SECRET}`;
+  return h;
+}
 
 async function diagGet(check: string, params?: Record<string, string>): Promise<unknown> {
   const url = new URL(`${DASHBOARD_URL}/api/diagnostics`);
@@ -39,7 +48,10 @@ async function diagGet(check: string, params?: Record<string, string>): Promise<
       if (v) url.searchParams.set(k, v);
     }
   }
-  const res = await fetch(url.toString(), { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
+  const res = await fetch(url.toString(), {
+    headers: authHeaders(),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT),
+  });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new Error(`Diagnostics API error (${check}): ${res.status} ${body.slice(0, 300)}`);
@@ -50,7 +62,7 @@ async function diagGet(check: string, params?: Record<string, string>): Promise<
 async function diagPost(body: Record<string, unknown>): Promise<unknown> {
   const res = await fetch(`${DASHBOARD_URL}/api/diagnostics`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(FETCH_TIMEOUT),
   });
@@ -241,6 +253,89 @@ server.tool(
   async ({ severity, source, message, context }) => {
     try {
       const data = await diagPost({ action: 'log-error', severity, source, message, context });
+      return { content: [{ type: 'text', text: formatResult(data) }] };
+    } catch (e) {
+      return { content: [{ type: 'text', text: `Error: ${e instanceof Error ? e.message : 'Unknown'}` }], isError: true };
+    }
+  }
+);
+
+// ── Tool: Clean Trade Data ────────────────────────────────
+
+server.tool(
+  'clean_trades',
+  'Run data integrity cleanup on tracked trades — removes invalid entries, fixes zero-price legs, deduplicates, and auto-expires stale trades',
+  {},
+  async () => {
+    try {
+      const data = await diagPost({ action: 'clean-trades' });
+      return { content: [{ type: 'text', text: formatResult(data) }] };
+    } catch (e) {
+      return { content: [{ type: 'text', text: `Error: ${e instanceof Error ? e.message : 'Unknown'}` }], isError: true };
+    }
+  }
+);
+
+// ── Tool: Force Evaluate All Trades ──────────────────────
+
+server.tool(
+  'force_evaluate',
+  'Force-evaluate all open trades with live pricing — works outside market hours. Enters pending trades, checks profit targets and stop losses, expires stale trades.',
+  {},
+  async () => {
+    try {
+      const data = await diagPost({ action: 'force-evaluate' });
+      return { content: [{ type: 'text', text: formatResult(data) }] };
+    } catch (e) {
+      return { content: [{ type: 'text', text: `Error: ${e instanceof Error ? e.message : 'Unknown'}` }], isError: true };
+    }
+  }
+);
+
+// ── Tool: Force Close a Trade ────────────────────────────
+
+server.tool(
+  'force_close',
+  'Force-close a specific open trade with live pricing. Also closes any associated Tradier paper positions.',
+  {
+    trade_id: z.string().describe('The trade ID to force-close'),
+    reason: z.enum(['manual-close', 'expiration']).optional().describe('Close reason (default: manual-close)'),
+  },
+  async ({ trade_id, reason }) => {
+    try {
+      const data = await diagPost({ action: 'force-close', id: trade_id, reason: reason || 'manual-close' });
+      return { content: [{ type: 'text', text: formatResult(data) }] };
+    } catch (e) {
+      return { content: [{ type: 'text', text: `Error: ${e instanceof Error ? e.message : 'Unknown'}` }], isError: true };
+    }
+  }
+);
+
+// ── Tool: Purge Closed Trades ────────────────────────────
+
+server.tool(
+  'purge_closed',
+  'Remove all closed/expired trades from the server, keeping only open (pending/entered) trades',
+  {},
+  async () => {
+    try {
+      const data = await diagPost({ action: 'purge-closed' });
+      return { content: [{ type: 'text', text: formatResult(data) }] };
+    } catch (e) {
+      return { content: [{ type: 'text', text: `Error: ${e instanceof Error ? e.message : 'Unknown'}` }], isError: true };
+    }
+  }
+);
+
+// ── Tool: Nuclear Reset ──────────────────────────────────
+
+server.tool(
+  'nuke_everything',
+  'DESTRUCTIVE: Purge ALL tracked trades, clear error log, cancel paper orders, and close paper positions. Use with extreme caution.',
+  {},
+  async () => {
+    try {
+      const data = await diagPost({ action: 'nuke-everything' });
       return { content: [{ type: 'text', text: formatResult(data) }] };
     } catch (e) {
       return { content: [{ type: 'text', text: `Error: ${e instanceof Error ? e.message : 'Unknown'}` }], isError: true };

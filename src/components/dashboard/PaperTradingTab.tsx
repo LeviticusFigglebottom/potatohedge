@@ -7,6 +7,17 @@ import {
   Activity, Trash2, ChevronDown, ChevronUp, Eraser,
 } from 'lucide-react';
 
+/** Safely extract an error message from a fetch Response that may not be JSON. */
+async function safeErrorMsg(res: Response, fallback: string): Promise<string> {
+  try {
+    const data = await res.json();
+    return data?.error || fallback;
+  } catch {
+    const text = await res.text().catch(() => '');
+    return text.slice(0, 200) || `${fallback} (HTTP ${res.status})`;
+  }
+}
+
 interface ParsedOCC {
   underlying: string;
   expDate: string;
@@ -26,6 +37,7 @@ interface Position {
   currentValue: number;
   unrealizedPL: number;
   unrealizedPLPct: number;
+  priceUnavailable?: boolean;
   bid: number;
   ask: number;
 }
@@ -402,6 +414,7 @@ interface SpreadGroup {
   netPLPct: number;
   rule: TradeRule | undefined;
   spreadLabel: string;
+  partialPricing?: boolean; // true if any leg has no current quote
 }
 
 /** Group positions into spreads using trade rules. Ungrouped positions stay as single-leg groups. */
@@ -420,14 +433,17 @@ function groupPositionsIntoSpreads(positions: Position[]): SpreadGroup[] {
 
     for (const p of matched) assigned.add(p.id);
 
+    const partialPricing = matched.some(p => p.priceUnavailable);
     const netCost = matched.reduce((s, p) => s + p.cost_basis, 0);
     const netCurrentValue = matched.reduce((s, p) => {
       const sign = p.quantity > 0 ? 1 : -1;
       return s + p.currentPrice * Math.abs(p.quantity) * 100 * sign;
     }, 0);
+    // Only sum unrealizedPL for legs that have a real current price.
+    // Legs with priceUnavailable already have unrealizedPL=0 from the API.
     const netPL = matched.reduce((s, p) => s + p.unrealizedPL, 0);
     const absNetCost = Math.abs(netCost);
-    const netPLPct = absNetCost > 0 ? (netPL / absNetCost) * 100 : 0;
+    const netPLPct = (absNetCost > 0 && !partialPricing) ? (netPL / absNetCost) * 100 : 0;
 
     // Build spread label like "AAPL Bull Call $260/$265 ×10"
     const underlying = rule.underlying || matched[0]?.parsed?.underlying || '';
@@ -449,6 +465,7 @@ function groupPositionsIntoSpreads(positions: Position[]): SpreadGroup[] {
       netCostBasis: netCost,
       netCurrentValue,
       netPL,
+      partialPricing,
       netPLPct,
       rule,
       spreadLabel,
@@ -516,8 +533,8 @@ export default function PaperTradingTab() {
         return;
       }
 
-      if (!accRes.ok) throw new Error((await accRes.json()).error || 'Account fetch failed');
-      if (!ordRes.ok) throw new Error((await ordRes.json()).error || 'Orders fetch failed');
+      if (!accRes.ok) throw new Error(await safeErrorMsg(accRes, 'Account fetch failed'));
+      if (!ordRes.ok) throw new Error(await safeErrorMsg(ordRes, 'Orders fetch failed'));
 
       const accData = await accRes.json();
       setAccount(accData);
@@ -546,7 +563,8 @@ export default function PaperTradingTab() {
         body: JSON.stringify(trade),
       });
 
-      const data = await res.json();
+      let data;
+      try { data = await res.json(); } catch { throw new Error(await safeErrorMsg(res, 'Trade failed')); }
       if (!res.ok) throw new Error(data.error || 'Trade failed');
 
       // Save exit rules if target/stop were specified
@@ -575,7 +593,7 @@ export default function PaperTradingTab() {
   const handleCancel = async (orderId: number) => {
     try {
       const res = await fetch(`/api/paper/orders?id=${orderId}`, { method: 'DELETE' });
-      if (!res.ok) throw new Error((await res.json()).error || 'Cancel failed');
+      if (!res.ok) throw new Error(await safeErrorMsg(res, 'Cancel failed'));
       setTimeout(refresh, 500);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Cancel failed');
@@ -589,7 +607,8 @@ export default function PaperTradingTab() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol: position.symbol, quantity: position.quantity }),
       });
-      const data = await res.json();
+      let data;
+      try { data = await res.json(); } catch { throw new Error(await safeErrorMsg(res, 'Close failed')); }
       if (!res.ok) throw new Error(data.error || 'Close failed');
       setTradeStatus(`Closing order placed: #${data.orderId}`);
       setTimeout(refresh, 1000);
@@ -809,7 +828,9 @@ export default function PaperTradingTab() {
                           {/* Net P/L */}
                           <div className="text-right min-w-[120px]">
                             <div className="text-[10px] text-text-muted font-mono">Net P&L</div>
-                            <PLBadge value={group.netPL} pct={group.netPLPct} />
+                            {group.partialPricing
+                              ? <span className="text-[11px] font-mono text-yellow-400">Awaiting quotes</span>
+                              : <PLBadge value={group.netPL} pct={group.netPLPct} />}
                           </div>
 
                           {/* Exit progress */}

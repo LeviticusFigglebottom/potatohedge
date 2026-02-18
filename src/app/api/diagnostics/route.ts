@@ -12,10 +12,13 @@ export const maxDuration = 15;
  * GET /api/diagnostics?check=trade&id=... — Deep inspect a single trade
  *
  * POST /api/diagnostics  { action: 'log-error', ... }       — Log client-side error
- * POST /api/diagnostics  { action: 'trigger-eval', ... }    — Trigger evaluation cycle
+ * POST /api/diagnostics  { action: 'clean-trades' }         — Run data cleanup (was in health check)
  * POST /api/diagnostics  { action: 'fix-trade', id, fixes } — Fix a specific trade
  * POST /api/diagnostics  { action: 'clear-expired' }        — Remove expired/stale trades
  * POST /api/diagnostics  { action: 'clear-errors' }         — Clear error log
+ *
+ * Authentication: Set DIAGNOSTICS_SECRET env var. If set, requests must include
+ *   Authorization: Bearer <secret> header. If not set, endpoint is open (dev mode).
  */
 
 import { NextRequest, NextResponse } from 'next/server';
@@ -29,9 +32,64 @@ import {
   type ErrorSource,
 } from '@/lib/errorLogger';
 
+// ─── Auth ─────────────────────────────────────────────────
+
+function checkAuth(request: NextRequest): NextResponse | null {
+  const secret = process.env.DIAGNOSTICS_SECRET;
+  if (!secret) return null; // No secret configured = open access (dev mode)
+  const auth = request.headers.get('authorization');
+  if (auth === `Bearer ${secret}`) return null; // Authorized
+  return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+}
+
+// ─── Mutex for trade operations ───────────────────────────
+
+let tradeMutexPromise = Promise.resolve();
+
+async function withTradeLock<T>(fn: () => Promise<T>): Promise<T> {
+  let release: () => void;
+  const prev = tradeMutexPromise;
+  tradeMutexPromise = new Promise<void>(resolve => { release = resolve; });
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release!();
+  }
+}
+
+// ─── Timezone helper ──────────────────────────────────────
+
+function getETComponents(): { day: number; hours: number; minutes: number; timeStr: string; dayName: string } {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric', minute: 'numeric', second: 'numeric',
+    weekday: 'short', hour12: false,
+  });
+  const parts = fmt.formatToParts(new Date());
+  const get = (type: string) => parts.find(p => p.type === type)?.value || '';
+  const hours = parseInt(get('hour'), 10) || 0;
+  const minutes = parseInt(get('minute'), 10) || 0;
+  const dayName = get('weekday');
+  const dayMap: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  const day = dayMap[dayName] ?? new Date().getDay();
+  const timeStr = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')} ET ${dayName}`;
+  return { day, hours, minutes, timeStr, dayName };
+}
+
+function isMarketOpenET(): boolean {
+  const { day, hours, minutes } = getETComponents();
+  if (day === 0 || day === 6) return false;
+  const time = hours * 60 + minutes;
+  return time >= 570 && time <= 975; // 9:30 AM - 4:15 PM ET
+}
+
 // ─── GET Handler ──────────────────────────────────────────
 
 export async function GET(request: NextRequest) {
+  const authErr = checkAuth(request);
+  if (authErr) return authErr;
+
   const check = request.nextUrl.searchParams.get('check') || 'health';
 
   try {
@@ -82,6 +140,9 @@ export async function GET(request: NextRequest) {
 // ─── POST Handler ─────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
+  const authErr = checkAuth(request);
+  if (authErr) return authErr;
+
   try {
     const body = await request.json();
     const { action } = body as { action: string };
@@ -102,18 +163,21 @@ export async function POST(request: NextRequest) {
         clearErrors();
         return NextResponse.json({ ok: true, message: 'Error log cleared' });
 
+      case 'clean-trades':
+        return NextResponse.json(await withTradeLock(() => cleanTradeData()));
+
       case 'clear-expired':
-        return NextResponse.json(await clearExpiredTrades());
+        return NextResponse.json(await withTradeLock(() => clearExpiredTrades()));
 
       case 'purge-closed':
-        return NextResponse.json(await purgeClosedFromServer());
+        return NextResponse.json(await withTradeLock(() => purgeClosedFromServer()));
 
       case 'purge-all':
-        return NextResponse.json(await purgeAllFromServer());
+        return NextResponse.json(await withTradeLock(() => purgeAllFromServer()));
 
       case 'nuke-everything': {
         // Nuclear option: clear ALL tracked trades + error log + paper positions
-        const tradeResult = await purgeAllFromServer();
+        const tradeResult = await withTradeLock(() => purgeAllFromServer());
         clearErrors();
         let paperResult = { ordersCancelled: 0, positionsClosed: 0 };
         if (process.env.TRADIER_SANDBOX_KEY) {
@@ -147,16 +211,16 @@ export async function POST(request: NextRequest) {
       case 'fix-trade': {
         const { id, fixes } = body;
         if (!id) return NextResponse.json({ error: 'id required' }, { status: 400 });
-        return NextResponse.json(await fixTrade(id, fixes));
+        return NextResponse.json(await withTradeLock(() => fixTrade(id, fixes)));
       }
 
       case 'force-evaluate':
-        return NextResponse.json(await forceEvaluateTrades());
+        return NextResponse.json(await withTradeLock(() => forceEvaluateTrades()));
 
       case 'force-close': {
         const { id: closeId, reason } = body;
         if (!closeId) return NextResponse.json({ error: 'id required' }, { status: 400 });
-        return NextResponse.json(await forceCloseTrade(closeId, reason || 'manual-close'));
+        return NextResponse.json(await withTradeLock(() => forceCloseTrade(closeId, reason || 'manual-close')));
       }
 
       default:
@@ -175,13 +239,72 @@ async function getHealth() {
   const connected = await testConnection();
   const errorSummary = getErrorSummary();
 
-  // Load tracked trades from server
+  // Load tracked trades from server — READ ONLY, no mutations
+  const trades = await loadTrackedTradesFromServer();
+
+  const openTrades = trades.filter(t => t.status === 'pending' || t.status === 'entered');
+  // entryDebit=0 is valid for credit spreads; only null means truly unpriced
+  const unpricedTrades = openTrades.filter(t => t.entryDebit === null || t.entryDebit === undefined);
+  const expiredNotClosed = trades.filter(t => {
+    if (t.status === 'exited' || t.status === 'expired') return false;
+    const expDate = new Date(t.expirationDate + 'T16:00:00-05:00').getTime();
+    return Date.now() > expDate;
+  });
+
+  // Count data quality issues (read-only — no fixes applied)
+  const invalidTrades = trades.filter(t =>
+    !t || !t.id || !t.symbol || !t.strategy ||
+    !t.legs || !Array.isArray(t.legs) || t.legs.length === 0 ||
+    !t.legs.some(l => l.optionSymbol) || !t.expirationDate
+  );
+  const zeroPriceEntered = trades.filter(t =>
+    t.status === 'entered' && t.entryDebit === null && !t.legs.some(l => l.entryMid > 0)
+  );
+
+  // Data quality checks
+  const issues: string[] = [];
+  if (!connected) issues.push('No persistence backend connected (Redis/Blob)');
+  if (unpricedTrades.length > 0) issues.push(`${unpricedTrades.length} trades awaiting entry pricing`);
+  if (expiredNotClosed.length > 0) issues.push(`${expiredNotClosed.length} trades past expiration but not closed`);
+  if (errorSummary.recentCritical.length > 0) issues.push(`${errorSummary.recentCritical.length} critical errors in last hour`);
+  if (invalidTrades.length > 0) issues.push(`${invalidTrades.length} trades with missing/invalid data — run clean-trades to fix`);
+  if (zeroPriceEntered.length > 0) issues.push(`${zeroPriceEntered.length} entered trades with zero pricing — run clean-trades to fix`);
+
+  const badLegs = trades.filter(t => t.legs.length === 0 || t.legs.some(l => !l.optionSymbol));
+  if (badLegs.length > 0) issues.push(`${badLegs.length} trades with missing/invalid leg data`);
+
+  const status = issues.length === 0 ? 'healthy' : issues.some(i => i.includes('critical')) ? 'critical' : 'degraded';
+
+  return {
+    status,
+    timestamp: Date.now(),
+    persistence: { ...persistence, connected },
+    trades: {
+      total: trades.length,
+      open: openTrades.length,
+      pending: trades.filter(t => t.status === 'pending').length,
+      entered: trades.filter(t => t.status === 'entered').length,
+      exited: trades.filter(t => t.status === 'exited').length,
+      expired: trades.filter(t => t.status === 'expired').length,
+      unpriced: unpricedTrades.length,
+      expiredNotClosed: expiredNotClosed.length,
+    },
+    errors: errorSummary,
+    issues,
+    apis: {
+      tradier: !!process.env.TRADIER_API_KEY,
+      polygon: !!process.env.POLYGON_API_KEY,
+      claude: !!process.env.ANTHROPIC_API_KEY,
+    },
+  };
+}
+
+// ─── Clean Trade Data (mutations moved out of health check) ──
+
+async function cleanTradeData() {
+  const now = Date.now();
   let trades = await loadTrackedTradesFromServer();
   const originalCount = trades.length;
-
-  // ─── Comprehensive data integrity cleanup ──────────────
-
-  const now = Date.now();
   let autoExpired = 0;
   let cleaned = 0;
 
@@ -210,13 +333,12 @@ async function getHealth() {
   // 3. Deduplicate: same symbol + strategy + expiration → keep newest open trade
   const seenKeys = new Set<string>();
   const deduped: ServerTrade[] = [];
-  // Process newest first (sorted by trackedAt desc)
   trades.sort((a, b) => b.trackedAt - a.trackedAt);
   for (const t of trades) {
     const key = `${t.symbol}|${t.strategy}|${t.expirationDate}`;
     const isOpen = t.status === 'pending' || t.status === 'entered';
     if (isOpen && seenKeys.has(key)) {
-      cleaned++; // drop duplicate open trade
+      cleaned++;
       continue;
     }
     if (isOpen) seenKeys.add(key);
@@ -228,7 +350,7 @@ async function getHealth() {
   for (const t of trades) {
     if (t.status === 'exited' || t.status === 'expired') continue;
     const expDate = new Date(t.expirationDate + 'T16:00:00-05:00').getTime();
-    if (now > expDate + 3600000) { // 1 hour past expiration
+    if (now > expDate + 3600000) {
       t.status = 'expired' as ServerTrade['status'];
       t.exitedAt = now;
       t.exitReason = 'expiration';
@@ -237,57 +359,19 @@ async function getHealth() {
     }
   }
 
-  // Save if anything changed
   if (cleaned > 0 || autoExpired > 0) {
     await saveTrackedTradesToServer(trades);
   }
 
-  const openTrades = trades.filter(t => t.status === 'pending' || t.status === 'entered');
-  // entryDebit=0 is valid for credit spreads; only null means truly unpriced
-  const unpricedTrades = openTrades.filter(t => t.entryDebit === null || t.entryDebit === undefined);
-  const expiredNotClosed = trades.filter(t => {
-    if (t.status === 'exited' || t.status === 'expired') return false;
-    const expDate = new Date(t.expirationDate + 'T16:00:00-05:00').getTime();
-    return Date.now() > expDate;
-  });
-
-  // Data quality checks
-  const issues: string[] = [];
-  if (!connected) issues.push('No persistence backend connected (Redis/Blob)');
-  if (unpricedTrades.length > 0) issues.push(`${unpricedTrades.length} trades awaiting entry pricing`);
-  if (expiredNotClosed.length > 0) issues.push(`${expiredNotClosed.length} trades past expiration but not closed`);
-  if (errorSummary.recentCritical.length > 0) issues.push(`${errorSummary.recentCritical.length} critical errors in last hour`);
-
-  // Check for trades with suspicious data
-  const badLegs = trades.filter(t => t.legs.length === 0 || t.legs.some(l => !l.optionSymbol));
-  if (badLegs.length > 0) issues.push(`${badLegs.length} trades with missing/invalid leg data`);
-
-  const status = issues.length === 0 ? 'healthy' : issues.some(i => i.includes('critical')) ? 'critical' : 'degraded';
-
   return {
-    status,
-    timestamp: Date.now(),
-    persistence: { ...persistence, connected },
-    trades: {
-      total: trades.length,
-      open: openTrades.length,
-      pending: trades.filter(t => t.status === 'pending').length,
-      entered: trades.filter(t => t.status === 'entered').length,
-      exited: trades.filter(t => t.status === 'exited').length,
-      expired: trades.filter(t => t.status === 'expired').length,
-      unpriced: unpricedTrades.length,
-      expiredNotClosed: expiredNotClosed.length,
-      autoExpiredThisCheck: autoExpired,
-      autoCleaned: cleaned,
-      originalCount,
-    },
-    errors: errorSummary,
-    issues,
-    apis: {
-      tradier: !!process.env.TRADIER_API_KEY,
-      polygon: !!process.env.POLYGON_API_KEY,
-      claude: !!process.env.ANTHROPIC_API_KEY,
-    },
+    ok: true,
+    originalCount,
+    currentCount: trades.length,
+    cleaned,
+    autoExpired,
+    message: cleaned + autoExpired > 0
+      ? `Cleaned ${cleaned} invalid trades, auto-expired ${autoExpired}`
+      : 'No issues found — trade data is clean',
   };
 }
 
@@ -548,14 +632,11 @@ async function testApis() {
   };
 
   // Market hours status
-  const now = new Date();
-  const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  const day = et.getDay();
-  const time = et.getHours() * 60 + et.getMinutes();
-  const marketOpen = day >= 1 && day <= 5 && time >= 570 && time <= 975;
+  const etInfo = getETComponents();
+  const marketOpen = isMarketOpenET();
   results._marketHours = {
     available: marketOpen,
-    error: marketOpen ? undefined : `Market closed (ET: ${et.toLocaleTimeString('en-US', { timeZone: 'America/New_York' })} ${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][day]}). TrackerMonitor is dormant.`,
+    error: marketOpen ? undefined : `Market closed (${etInfo.timeStr}). TrackerMonitor is dormant.`,
   };
 
   return results;

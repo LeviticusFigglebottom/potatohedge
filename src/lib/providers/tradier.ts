@@ -23,7 +23,7 @@ export async function getQuote(symbol: string): Promise<Quote> {
   const token = process.env.TRADIER_API_KEY!;
   const res = await fetch(
     `${getBaseUrl()}/markets/quotes?symbols=${encodeURIComponent(symbol)}&greeks=false`,
-    { headers: getHeaders(token), next: { revalidate: 5 }, signal: AbortSignal.timeout(FETCH_TIMEOUT) }
+    { headers: getHeaders(token), cache: 'no-store', signal: AbortSignal.timeout(FETCH_TIMEOUT) }
   );
 
   if (!res.ok) {
@@ -56,6 +56,48 @@ export async function getQuote(symbol: string): Promise<Quote> {
     askSize: quote.asksize ?? 0,
     timestamp: Date.now(),
   };
+}
+
+// ─── Multi-Quote (batch) ──────────────────────────────────────────
+
+export async function getQuotes(symbols: string[]): Promise<Quote[]> {
+  if (symbols.length === 0) return [];
+  if (symbols.length === 1) return [await getQuote(symbols[0])];
+
+  const token = process.env.TRADIER_API_KEY!;
+  const res = await fetch(
+    `${getBaseUrl()}/markets/quotes?symbols=${encodeURIComponent(symbols.join(','))}&greeks=false`,
+    { headers: getHeaders(token), cache: 'no-store', signal: AbortSignal.timeout(FETCH_TIMEOUT) }
+  );
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Tradier quotes error: ${res.status} ${body.slice(0, 200)}`);
+  }
+  const data = await res.json();
+
+  const q = data.quotes?.quote;
+  if (!q) return [];
+
+  const quotes = Array.isArray(q) ? q : [q];
+  return quotes.map((quote: Record<string, unknown>) => ({
+    symbol: quote.symbol as string,
+    last: (quote.last as number) ?? (quote.close as number) ?? 0,
+    change: (quote.change as number) ?? 0,
+    changePct: (quote.change_percentage as number) ?? 0,
+    open: (quote.open as number) ?? 0,
+    high: (quote.high as number) ?? 0,
+    low: (quote.low as number) ?? 0,
+    close: (quote.close as number) ?? 0,
+    prevClose: (quote.prevclose as number) ?? 0,
+    volume: (quote.volume as number) ?? 0,
+    avgVolume: (quote.average_volume as number) ?? 0,
+    bid: (quote.bid as number) ?? 0,
+    ask: (quote.ask as number) ?? 0,
+    bidSize: (quote.bidsize as number) ?? 0,
+    askSize: (quote.asksize as number) ?? 0,
+    timestamp: Date.now(),
+  }));
 }
 
 // ─── History ───────────────────────────────────────────────────────
@@ -160,7 +202,7 @@ export async function getExpirations(symbol: string): Promise<OptionExpiration[]
 
 // ─── Options Chain ─────────────────────────────────────────────────
 
-export async function getOptionsChain(symbol: string, expiration: string): Promise<OptionsChain> {
+export async function getOptionsChain(symbol: string, expiration: string, spotPrice?: number): Promise<OptionsChain> {
   const token = process.env.TRADIER_API_KEY!;
 
   // Fetch chain with Greeks
@@ -175,13 +217,15 @@ export async function getOptionsChain(symbol: string, expiration: string): Promi
   }
   const data = await res.json();
 
-  // Get underlying price
-  let underlyingPrice = 0;
-  try {
-    const quote = await getQuote(symbol);
-    underlyingPrice = quote.last;
-  } catch {
-    // fallback
+  // Use provided spotPrice to avoid extra getQuote() API call
+  let underlyingPrice = spotPrice || 0;
+  if (!underlyingPrice) {
+    try {
+      const quote = await getQuote(symbol);
+      underlyingPrice = quote.last;
+    } catch {
+      // fallback
+    }
   }
 
   const options = data.options?.option;

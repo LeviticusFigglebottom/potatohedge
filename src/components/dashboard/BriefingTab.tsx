@@ -4,9 +4,10 @@ import { useState, useCallback } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import {
   Newspaper, Loader2, AlertTriangle, TrendingUp, TrendingDown, Minus,
-  Wallet, ChevronDown, ChevronUp, CheckCircle2, Sparkles, Eye,
+  Wallet, ChevronDown, ChevronUp, CheckCircle2, Sparkles, Eye, Crosshair,
 } from 'lucide-react';
 import { buildTrackedTradeFromAlgo, addTrackedTrade, sizePosition, fetchEntryPrices, fillEntryPrices, calculatePositionValue, validateAndClampStrikes, type TrackedLeg } from '@/lib/tradeTracker';
+import { addSignal, loadSignals } from '@/lib/signalTracker';
 
 // ─── Trade rule storage (shared with PaperTradingTab + PaperMonitor) ───
 interface TradeRule {
@@ -21,6 +22,7 @@ interface TradeRule {
   createdAt: string;
   exitTriggered?: 'target' | 'stop' | null;
   exitOrderId?: number;
+  isAITracked?: boolean; // true = managed by TrackerMonitor, PaperMonitor will skip
   // Legacy single-position fields (kept for backward compat)
   occSymbol?: string;
   targetPrice?: number | null;
@@ -71,6 +73,40 @@ function calcQty(spot: number, strategy: string, legs: { strike: number; type: '
   return sizePosition(trackerLegs, strategy, spot);
 }
 
+/** Resolve the best expiration date for a trade.
+ *  Algorithm trades: use targetExp from recommendation engine (already resolved).
+ *  AI trades: parse DTE from expiration text, pick best available exp.
+ */
+function resolveExpiration(opts: {
+  targetExp?: string;
+  expirationText?: string;
+  nearestExp: string;
+  weeklyExp?: string;
+  monthlyExp?: string;
+}): string {
+  // If we have an explicit targetExp from the algorithm, use it
+  if (opts.targetExp) return opts.targetExp;
+
+  // For AI trades, try to parse DTE from the expiration text
+  if (opts.expirationText) {
+    const dteMatch = opts.expirationText.match(/(\d+)\s*(?:DTE|dte|days?)/i);
+    const dte = dteMatch ? parseInt(dteMatch[1]) : 0;
+    // Also check for "30-45 DTE" range format
+    const rangeMatch = opts.expirationText.match(/(\d+)\s*[-–]\s*(\d+)\s*DTE/i);
+    const maxDTE = rangeMatch ? parseInt(rangeMatch[2]) : dte;
+
+    if (maxDTE >= 25 && opts.monthlyExp) return opts.monthlyExp;
+    if (maxDTE >= 25 && opts.weeklyExp) return opts.weeklyExp; // fallback
+    if (maxDTE >= 10 && opts.weeklyExp) return opts.weeklyExp;
+
+    // Also try to parse a date directly (e.g., "2025-02-21")
+    const dateMatch = opts.expirationText.match(/(\d{4}-\d{2}-\d{2})/);
+    if (dateMatch) return dateMatch[1];
+  }
+
+  return opts.nearestExp;
+}
+
 function buildOCC(symbol: string, expiration: string, type: 'C' | 'P', strike: number): string {
   const d = new Date(expiration + 'T12:00:00');
   const yy = String(d.getFullYear()).slice(-2);
@@ -92,6 +128,7 @@ interface TradeIdea {
   score: number;
   strikes: string;
   expiration: string;
+  targetExp: string;
   entry: string;
   risk: string;
   reasoning: string[];
@@ -100,6 +137,8 @@ interface TradeIdea {
   stopLossPct: number;
   nearestExp: string;
   nearestDTE: number;
+  weeklyExp?: string;
+  monthlyExp?: string;
   ivRank: number;
   currentIV: number;
   gammaFlip: number | null;
@@ -123,6 +162,8 @@ interface AITradeIdea {
   spot: number;
   nearestExp: string;
   nearestDTE: number;
+  weeklyExp?: string;
+  monthlyExp?: string;
   gammaFlip: number | null;
   callWall: number | null;
   putWall: number | null;
@@ -148,6 +189,17 @@ interface BriefingResponse {
   vix: number;
   tradeIdeas?: TradeIdea[];
   aiTradeIdeas?: AITradeIdea[];
+}
+
+function formatAge(timestamp: number): string {
+  const ms = Date.now() - timestamp;
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h ago`;
 }
 
 function ChangeChip({ pct }: { pct: number }) {
@@ -207,7 +259,14 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
   const [paperStatus, setPaperStatus] = useState<Record<number, string>>({});
   const [trackedIdeas, setTrackedIdeas] = useState<Set<number>>(new Set());
 
-  const handleTrack = async (idea: TradeIdea, idx: number) => {
+  const handleTrack = async (idea: TradeIdea, idx: number, paperQuotes?: Record<string, { bid: number; ask: number; mid: number; last: number }>) => {
+    // Use the algorithm's resolved targetExp (matches the recommended DTE)
+    const exp = resolveExpiration({
+      targetExp: idea.targetExp,
+      nearestExp: idea.nearestExp,
+      weeklyExp: idea.weeklyExp,
+      monthlyExp: idea.monthlyExp,
+    });
     // Build the trade first (with pending legs)
     const tracked = buildTrackedTradeFromAlgo({
       symbol: idea.ticker,
@@ -240,26 +299,23 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
         gammaRegime: 'neutral',
       },
       source: 'ai-briefing',
-      nearestExp: idea.nearestExp,
+      nearestExp: exp,
     });
-    // Fetch live prices and fill entry immediately so trade starts as 'entered'
+    // Fill entry prices: prefer paper fill prices (consistency with paper tab),
+    // then fall back to production API prices
     if (tracked.status === 'pending') {
       const occSymbols = tracked.legs.map(l => l.optionSymbol).filter(Boolean);
-      const { quotes } = await fetchEntryPrices(occSymbols, idea.ticker);
+      const quotes = (paperQuotes && Object.keys(paperQuotes).length > 0)
+        ? paperQuotes
+        : (await fetchEntryPrices(occSymbols, idea.ticker)).quotes;
       if (Object.keys(quotes).length > 0) {
         tracked.legs = fillEntryPrices(tracked.legs, quotes);
         const hasRealPrices = tracked.legs.length > 0 && tracked.legs.every(l => l.entryMid > 0);
         if (hasRealPrices) {
-          // Reject penny options: if avg mid < $0.10, don't mark as entered
-          const pricedLegs = tracked.legs.filter(l => l.entryMid > 0);
-          const avgMid = pricedLegs.reduce((s, l) => s + l.entryMid, 0) / pricedLegs.length;
-          if (avgMid >= 0.10) {
-            tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
-            tracked.status = 'entered';
-            tracked.enteredAt = Date.now();
-            tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
-          }
-          // If avgMid < $0.10, leave as pending — likely penny options that shouldn't be traded
+          tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
+          tracked.status = 'entered';
+          tracked.enteredAt = Date.now();
+          tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
         }
       }
     }
@@ -288,7 +344,13 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
       const sellStrikes = [...idea.strikes.matchAll(/sell\s+\$(\d+(?:\.\d+)?)/gi)].map(m => parseFloat(m[1]));
       const buyStrikes = [...idea.strikes.matchAll(/buy\s+\$(\d+(?:\.\d+)?)/gi)].map(m => parseFloat(m[1]));
 
-      const exp = idea.nearestExp;
+      // Use the algorithm's resolved targetExp (matches the recommended DTE)
+      const exp = resolveExpiration({
+        targetExp: idea.targetExp,
+        nearestExp: idea.nearestExp,
+        weeklyExp: idea.weeklyExp,
+        monthlyExp: idea.monthlyExp,
+      });
       const thesis = `${idea.strategy} — ${idea.reasoning[0] || ''}`;
       let qty = parseQuantity(idea.strikes);
 
@@ -347,7 +409,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
           ],
           underlying: idea.ticker, strategy: idea.strategy, thesis,
           profitTargetPct: idea.profitTargetPct, stopLossPct: idea.stopLossPct,
-          autoExit: true, createdAt: new Date().toISOString(),
+          autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed IC #${data.orderId} (TP: +${idea.profitTargetPct}% / SL: -${idea.stopLossPct}%)` }));
 
@@ -424,7 +486,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
           occSymbols: [buildOCC(idea.ticker, exp, optType, leg1Strike), buildOCC(idea.ticker, exp, optType, leg2Strike)],
           underlying: idea.ticker, strategy: idea.strategy, thesis,
           profitTargetPct: idea.profitTargetPct, stopLossPct: idea.stopLossPct,
-          autoExit: true, createdAt: new Date().toISOString(),
+          autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed spread #${data.orderId} (TP: +${idea.profitTargetPct}% / SL: -${idea.stopLossPct}%)` }));
 
@@ -458,7 +520,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
           occSymbols: [buildOCC(idea.ticker, exp, 'C', strike), buildOCC(idea.ticker, exp, 'P', strike)],
           underlying: idea.ticker, strategy: idea.strategy, thesis,
           profitTargetPct: idea.profitTargetPct, stopLossPct: idea.stopLossPct,
-          autoExit: true, createdAt: new Date().toISOString(),
+          autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed straddle #${data.orderId} (TP: +${idea.profitTargetPct}% / SL: -${idea.stopLossPct}%)` }));
 
@@ -493,7 +555,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
           occSymbols: [buildOCC(idea.ticker, exp, 'P', putStrike), buildOCC(idea.ticker, exp, 'C', callStrike)],
           underlying: idea.ticker, strategy: idea.strategy, thesis,
           profitTargetPct: idea.profitTargetPct, stopLossPct: idea.stopLossPct,
-          autoExit: true, createdAt: new Date().toISOString(),
+          autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed strangle #${data.orderId} (TP: +${idea.profitTargetPct}% / SL: -${idea.stopLossPct}%)` }));
 
@@ -528,12 +590,25 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
           occSymbols: [buildOCC(idea.ticker, exp, optionType, strike)],
           underlying: idea.ticker, strategy: idea.strategy, thesis,
           profitTargetPct: idea.profitTargetPct || 75, stopLossPct: idea.stopLossPct || 50,
-          autoExit: true, createdAt: new Date().toISOString(),
+          autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId} (TP: +${idea.profitTargetPct || 75}% / SL: -${idea.stopLossPct || 50}%)` }));
       }
+      // Fetch paper account fills so tracker uses the same entry prices
+      let paperQuotes: Record<string, { bid: number; ask: number; mid: number; last: number }> = {};
+      try {
+        await new Promise(r => setTimeout(r, 1500)); // wait for sandbox market fill
+        const accRes = await fetch('/api/paper/account', { signal: AbortSignal.timeout(5000) });
+        if (accRes.ok) {
+          const accData = await accRes.json();
+          for (const p of (accData.positions || []) as { symbol: string; costPerContract: number; bid: number; ask: number }[]) {
+            const price = Math.abs(p.costPerContract);
+            if (price > 0) paperQuotes[p.symbol] = { bid: p.bid || price, ask: p.ask || price, mid: price, last: price };
+          }
+        }
+      } catch { /* fall back to production API prices */ }
       // Auto-track the paper trade so TrackerMonitor monitors it
-      if (!trackedIdeas.has(idx)) handleTrack(idea, idx);
+      if (!trackedIdeas.has(idx)) handleTrack(idea, idx, paperQuotes);
     } catch (err) {
       setPaperStatus(s => ({ ...s, [idx]: `Error: ${err instanceof Error ? err.message : 'Failed'}` }));
     }
@@ -584,7 +659,7 @@ function TradeIdeasPanel({ ideas }: { ideas: TradeIdea[] }) {
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
                     <div><span className="text-text-muted">Strategy:</span> <span className="text-text-primary">{idea.strategy}</span></div>
                     <div><span className="text-text-muted">Strikes:</span> <span className="text-text-primary">{idea.strikes}</span></div>
-                    <div><span className="text-text-muted">Exp:</span> <span className="text-text-primary">{idea.expiration} ({idea.nearestDTE}d)</span></div>
+                    <div><span className="text-text-muted">Exp:</span> <span className="text-text-primary">{idea.targetExp || idea.nearestExp} ({idea.expiration})</span></div>
                     <div><span className="text-text-muted">Spot:</span> <span className="text-text-primary">${idea.spot.toFixed(2)}</span></div>
                   </div>
                   <div className="text-xs font-mono text-text-muted">
@@ -655,11 +730,18 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
   const [paperStatus, setPaperStatus] = useState<Record<number, string>>({});
   const [trackedIdeas, setTrackedIdeas] = useState<Set<number>>(new Set());
 
-  const handleTrack = async (idea: AITradeIdea, idx: number) => {
+  const handleTrack = async (idea: AITradeIdea, idx: number, paperQuotes?: Record<string, { bid: number; ask: number; mid: number; last: number }>) => {
     const dirLow = idea.direction.toLowerCase();
     const direction = dirLow.includes('bull') ? 'bullish' : dirLow.includes('bear') ? 'bearish' : 'neutral';
     const targetMatch = idea.target?.match(/(\d+)\s*%/);
     const stopMatch = idea.stopMaxLoss?.match(/(\d+)\s*%/);
+    // Resolve expiration: use AI's stated DTE or fall back to available expirations
+    const exp = resolveExpiration({
+      expirationText: idea.expiration,
+      nearestExp: idea.nearestExp,
+      weeklyExp: idea.weeklyExp,
+      monthlyExp: idea.monthlyExp,
+    });
     const tracked = buildTrackedTradeFromAlgo({
       symbol: idea.ticker,
       spotPrice: idea.spot,
@@ -691,25 +773,23 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
         gammaRegime: 'neutral',
       },
       source: 'ai-analysis',
-      nearestExp: idea.nearestExp,
+      nearestExp: exp,
     });
-    // Fetch live prices and fill entry immediately
+    // Fill entry prices: prefer paper fill prices (consistency with paper tab),
+    // then fall back to production API prices
     if (tracked.status === 'pending') {
       const occSymbols = tracked.legs.map(l => l.optionSymbol).filter(Boolean);
-      const { quotes } = await fetchEntryPrices(occSymbols, idea.ticker);
+      const quotes = (paperQuotes && Object.keys(paperQuotes).length > 0)
+        ? paperQuotes
+        : (await fetchEntryPrices(occSymbols, idea.ticker)).quotes;
       if (Object.keys(quotes).length > 0) {
         tracked.legs = fillEntryPrices(tracked.legs, quotes);
         const hasRealPrices = tracked.legs.length > 0 && tracked.legs.every(l => l.entryMid > 0);
         if (hasRealPrices) {
-          // Reject penny options: if avg mid < $0.10, don't mark as entered
-          const pricedLegs = tracked.legs.filter(l => l.entryMid > 0);
-          const avgMid = pricedLegs.reduce((s, l) => s + l.entryMid, 0) / pricedLegs.length;
-          if (avgMid >= 0.10) {
-            tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
-            tracked.status = 'entered';
-            tracked.enteredAt = Date.now();
-            tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
-          }
+          tracked.entryDebit = calculatePositionValue(tracked.legs, 'entry');
+          tracked.status = 'entered';
+          tracked.enteredAt = Date.now();
+          tracked.priceHistory = [{ timestamp: Date.now(), spotPrice: idea.spot, positionValue: tracked.entryDebit }];
         }
       }
     }
@@ -743,7 +823,13 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
       for (const s of stratSell) if (!sellStrikes.includes(s)) sellStrikes.push(s);
       for (const b of stratBuy) if (!buyStrikes.includes(b)) buyStrikes.push(b);
 
-      const exp = idea.nearestExp;
+      // Resolve expiration: use AI's stated DTE or fall back to available expirations
+      const exp = resolveExpiration({
+        expirationText: idea.expiration,
+        nearestExp: idea.nearestExp,
+        weeklyExp: idea.weeklyExp,
+        monthlyExp: idea.monthlyExp,
+      });
       const thesis = `[AI] ${idea.title} — ${idea.thesis || idea.strategy}`;
       let qty = parseQuantity(idea.strikes);
 
@@ -788,7 +874,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           id: `ai-ic-${idea.ticker}-${exp}-${Date.now()}`,
           occSymbols: [buildOCC(idea.ticker, exp, 'C', sellCall), buildOCC(idea.ticker, exp, 'C', sellCall + wingWidth), buildOCC(idea.ticker, exp, 'P', sellPut), buildOCC(idea.ticker, exp, 'P', sellPut - wingWidth)],
           underlying: idea.ticker, strategy: `[AI] ${idea.strategy}`, thesis,
-          profitTargetPct: 50, stopLossPct: 100, autoExit: true, createdAt: new Date().toISOString(),
+          profitTargetPct: 50, stopLossPct: 100, autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed IC ${qty}x #${data.orderId}` }));
 
@@ -848,7 +934,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           id: `ai-spread-${idea.ticker}-${exp}-${Date.now()}`,
           occSymbols: [buildOCC(idea.ticker, exp, optType, leg1Strike), buildOCC(idea.ticker, exp, optType, leg2Strike)],
           underlying: idea.ticker, strategy: `[AI] ${idea.strategy}`, thesis,
-          profitTargetPct: 50, stopLossPct: 50, autoExit: true, createdAt: new Date().toISOString(),
+          profitTargetPct: 50, stopLossPct: 50, autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed spread #${data.orderId}` }));
 
@@ -882,7 +968,7 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           id: `ai-vol-${idea.ticker}-${exp}-${Date.now()}`,
           occSymbols: [buildOCC(idea.ticker, exp, 'C', callStrike), buildOCC(idea.ticker, exp, 'P', putStrike)],
           underlying: idea.ticker, strategy: `[AI] ${idea.strategy}`, thesis,
-          profitTargetPct: 50, stopLossPct: 40, autoExit: true, createdAt: new Date().toISOString(),
+          profitTargetPct: 50, stopLossPct: 40, autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed ${isStraddle ? 'straddle' : 'strangle'} ${qty}x #${data.orderId}` }));
 
@@ -910,12 +996,25 @@ function AITradeIdeasPanel({ ideas }: { ideas: AITradeIdea[] }) {
           id: `ai-single-${idea.ticker}-${exp}-${Date.now()}`,
           occSymbols: [buildOCC(idea.ticker, exp, optionType, strike)],
           underlying: idea.ticker, strategy: `[AI] ${idea.strategy}`, thesis,
-          profitTargetPct: 75, stopLossPct: 50, autoExit: true, createdAt: new Date().toISOString(),
+          profitTargetPct: 75, stopLossPct: 50, autoExit: true, isAITracked: true, createdAt: new Date().toISOString(),
         });
         setPaperStatus(s => ({ ...s, [idx]: `Placed #${data.orderId}` }));
       }
+      // Fetch paper account fills so tracker uses the same entry prices
+      let paperQuotes: Record<string, { bid: number; ask: number; mid: number; last: number }> = {};
+      try {
+        await new Promise(r => setTimeout(r, 1500)); // wait for sandbox market fill
+        const accRes = await fetch('/api/paper/account', { signal: AbortSignal.timeout(5000) });
+        if (accRes.ok) {
+          const accData = await accRes.json();
+          for (const p of (accData.positions || []) as { symbol: string; costPerContract: number; bid: number; ask: number }[]) {
+            const price = Math.abs(p.costPerContract);
+            if (price > 0) paperQuotes[p.symbol] = { bid: p.bid || price, ask: p.ask || price, mid: price, last: price };
+          }
+        }
+      } catch { /* fall back to production API prices */ }
       // Auto-track the paper trade so TrackerMonitor monitors it
-      if (!trackedIdeas.has(idx)) handleTrack(idea, idx);
+      if (!trackedIdeas.has(idx)) handleTrack(idea, idx, paperQuotes);
     } catch (err) {
       setPaperStatus(s => ({ ...s, [idx]: `Error: ${err instanceof Error ? err.message : 'Failed'}` }));
     }
@@ -1031,6 +1130,43 @@ export default function BriefingTab() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [phase, setPhase] = useState('');
+  const [trackedSignals, setTrackedSignals] = useState<Set<string>>(() => {
+    const existing = loadSignals();
+    return new Set(existing.map(s => s.symbol));
+  });
+
+  const handleTrackSignal = useCallback(async (idx: { symbol: string; price: number; bias: string; biasScore: number; gammaRegime: string; volRegime: string; ivRank: number }) => {
+    // Entry price MUST be current — never use stale briefing cache
+    let entryPrice = 0;
+    try {
+      const res = await fetch(`/api/market/quote?symbol=${idx.symbol}`, { signal: AbortSignal.timeout(8000) });
+      if (res.ok) {
+        const q = await res.json();
+        if (q.last > 0) entryPrice = q.last;
+      }
+    } catch { /* will check below */ }
+
+    if (entryPrice <= 0) {
+      console.warn(`Signal Tracker: could not get fresh price for ${idx.symbol}, skipping`);
+      return;
+    }
+
+    addSignal({
+      symbol: idx.symbol,
+      entryPrice,
+      bias: idx.bias as 'bullish' | 'bearish' | 'neutral',
+      biasScore: idx.biasScore,
+      gammaRegime: idx.gammaRegime,
+      volRegime: idx.volRegime,
+      ivRank: idx.ivRank,
+      topSignal: '',
+      gammaFlip: null,
+      callWall: null,
+      putWall: null,
+      source: 'briefing',
+    });
+    setTrackedSignals(prev => new Set(prev).add(idx.symbol));
+  }, []);
 
   const data = briefingCache as BriefingResponse | null;
 
@@ -1109,8 +1245,9 @@ export default function BriefingTab() {
             <Newspaper className="w-4 h-4 text-accent-cyan" />
             <span className="panel-title">AI Daily Briefing</span>
             {data && (
-              <span className="text-xs text-text-muted font-mono">
-                {data.stocksScanned} stocks &bull; {new Date(data.timestamp).toLocaleTimeString()}
+              <span className={`text-xs font-mono ${Date.now() - data.timestamp > 3600000 ? 'text-yellow-400' : 'text-text-muted'}`}
+                title={new Date(data.timestamp).toLocaleString()}>
+                {data.stocksScanned} stocks &bull; {formatAge(data.timestamp)}
               </span>
             )}
           </div>
@@ -1155,13 +1292,26 @@ export default function BriefingTab() {
                   <div key={idx.symbol} className="bg-bg-secondary px-4 py-3">
                     <div className="flex items-center justify-between mb-1">
                       <span className="text-xs font-mono text-text-muted">{idx.symbol}</span>
-                      <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
-                        idx.bias === 'bullish' ? 'bg-green-500/15 text-green-400' :
-                        idx.bias === 'bearish' ? 'bg-red-500/15 text-red-400' :
-                        'bg-bg-tertiary text-text-muted'
-                      }`}>
-                        {idx.biasScore > 0 ? '+' : ''}{idx.biasScore}
-                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
+                          idx.bias === 'bullish' ? 'bg-green-500/15 text-green-400' :
+                          idx.bias === 'bearish' ? 'bg-red-500/15 text-red-400' :
+                          'bg-bg-tertiary text-text-muted'
+                        }`}>
+                          {idx.biasScore > 0 ? '+' : ''}{idx.biasScore}
+                        </span>
+                        {trackedSignals.has(idx.symbol) ? (
+                          <Crosshair className="w-3 h-3 text-accent-cyan" />
+                        ) : (
+                          <button
+                            onClick={() => handleTrackSignal(idx)}
+                            title={`Track ${idx.symbol} signal`}
+                            className="p-0.5 rounded hover:bg-accent-cyan/15 text-text-muted/40 hover:text-accent-cyan transition-colors"
+                          >
+                            <Crosshair className="w-3 h-3" />
+                          </button>
+                        )}
+                      </div>
                     </div>
                     <div className="text-sm font-mono font-semibold text-text-primary">${idx.price.toFixed(2)}</div>
                     <div className="flex items-center justify-between mt-0.5">

@@ -1,6 +1,21 @@
 import { NextResponse } from 'next/server';
 import { getQuote, getExpirations, getOptionsChain } from '@/lib/providers/tradier';
 import { fetchEquityBars } from '@/lib/providers/equityBars';
+
+function isMarketOpenNow(): boolean {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric', minute: 'numeric', weekday: 'short', hour12: false,
+  });
+  const parts = fmt.formatToParts(new Date());
+  const get = (type: string) => parts.find(p => p.type === type)?.value || '';
+  const hours = parseInt(get('hour'), 10) || 0;
+  const minutes = parseInt(get('minute'), 10) || 0;
+  const dayName = get('weekday');
+  if (dayName === 'Sat' || dayName === 'Sun') return false;
+  const time = hours * 60 + minutes;
+  return time >= 570 && time <= 960;
+}
 import {
   computeDealerExposureFromChain,
   findGammaFlip,
@@ -17,6 +32,7 @@ import {
 import { generateRecommendations } from '@/lib/math/recommendations';
 import { getMarketSwapSummary } from '@/lib/providers/dtcc';
 import { fetchRegSHOWithDate, fetchShortInterestWithDate, fetchShortSaleVolumeWithDate, type ShortVolumeData } from '@/lib/providers/finra';
+import { getMarketIndicators } from '@/lib/providers/fred';
 
 export const maxDuration = 30;
 
@@ -288,7 +304,7 @@ function generateNarrative(
 export async function GET() {
   try {
     /** Run full GEX/IV/flow analysis for a single ticker */
-    async function analyzeIndex(ticker: string): Promise<IndexAnalysis | null> {
+    async function analyzeIndex(ticker: string, vixPrice?: number): Promise<IndexAnalysis | null> {
       try {
         const [quote, expirations, historyBars] = await Promise.all([
           getQuote(ticker),
@@ -392,6 +408,31 @@ export async function GET() {
         );
         const correlationCtx = computeQuickCorrelationCtx(historyBars, hvCurrent);
 
+        // IV term structure: nearest vs next expiration ATM IV
+        let nearTermIV: number | undefined;
+        let nextTermIV: number | undefined;
+        if (chains.length >= 2) {
+          const getATMIV = (chain: typeof chains[0]) => {
+            const atmLocal = [...chain.calls, ...chain.puts]
+              .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < atmTolerance && o.impliedVolatility > 0.01)
+              .sort((a, b) => Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice));
+            return atmLocal.length > 0 ? atmLocal.slice(0, 4).reduce((s, o) => s + o.impliedVolatility, 0) / Math.min(4, atmLocal.length) : 0;
+          };
+          nearTermIV = getATMIV(chains[0]) || undefined;
+          nextTermIV = getATMIV(chains[1]) || undefined;
+        }
+
+        // OI concentration
+        const callsByOI = [...nearChain.calls].sort((a, b) => b.openInterest - a.openInterest);
+        const putsByOI = [...nearChain.puts].sort((a, b) => b.openInterest - a.openInterest);
+        const top3CallOI = callsByOI.slice(0, 3).reduce((s, c) => s + c.openInterest, 0);
+        const top3PutOI = putsByOI.slice(0, 3).reduce((s, p) => s + p.openInterest, 0);
+        const totalCallOIConc = nearChain.calls.reduce((s, c) => s + c.openInterest, 0);
+        const totalPutOIConc = nearChain.puts.reduce((s, p) => s + p.openInterest, 0);
+        const oiConcentration = (totalCallOIConc + totalPutOIConc) > 0
+          ? ((top3CallOI / Math.max(1, totalCallOIConc)) * 100 + (top3PutOI / Math.max(1, totalPutOIConc)) * 100) / 2
+          : undefined;
+
         const input = {
           symbol: ticker, spotPrice, totalGEX, totalDEX, gammaFlip, callWall, putWall,
           maxPain: maxPainResult.strike, volumePCR, oiPCR,
@@ -406,6 +447,13 @@ export async function GET() {
           weeklyExp: nearExps.find(e => e.dte >= 5 && e.dte <= 8)?.date,
           monthlyExp: nearExps.find(e => e.dte >= 25 && e.dte <= 45)?.date,
           correlationCtx,
+          totalVanna: totalVanna || undefined,
+          totalCharm: totalCharm || undefined,
+          nearTermIV,
+          nextTermIV,
+          oiConcentration,
+          vixLevel: vixPrice ?? undefined,
+          isMarketOpen: isMarketOpenNow(),
         };
 
         const rec = generateRecommendations(input);
@@ -444,6 +492,13 @@ export async function GET() {
       }
     }
 
+    // Phase 0: Quick FRED indicators fetch (usually cached, <10ms)
+    const emptyIndicators = { vix: null, skew: null };
+    const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
+      Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
+    const fredIndicators = await raceTimeout(getMarketIndicators().catch(() => emptyIndicators), 2000, emptyIndicators);
+    const fredVixLevel = fredIndicators.vix?.current ?? undefined;
+
     // Phase 1: Fetch VIX, DIA quotes + index analysis + DTCC/FINRA data (with hard timeout)
     const emptySwap = {
       totalMaturitiesToday: 0, totalNotionalToday: 0,
@@ -454,10 +509,6 @@ export async function GET() {
     const emptyRegSHO = { tickers: new Set<string>(), asOf: '' };
     const emptySI = { data: new Map<string, { daysToCover: number; shortInterest: number; previousShortInterest: number; changePercent: number; avgDailyVolume: number }>(), asOf: '' };
     const emptySV = { data: new Map<string, ShortVolumeData>(), asOf: '' };
-
-    // Independent per-provider timeouts — so DTCC being slow doesn't block RegSHO/SI
-    const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
-      Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 
     const institutionalRace = Promise.all([
       raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 4000, emptySwap),
@@ -470,7 +521,7 @@ export async function GET() {
       getQuote('VIX').catch(() => null),
       getQuote('DIA').catch(() => null),
       institutionalRace,
-      ...KEY_INDICES.map(t => analyzeIndex(t)),
+      ...KEY_INDICES.map(t => analyzeIndex(t, fredVixLevel)),
     ]);
 
     const [swapSummary, regSHOResult, siResult, svResult] = institutionalData;

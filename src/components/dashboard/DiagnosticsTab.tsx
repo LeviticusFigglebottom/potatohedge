@@ -5,8 +5,9 @@ import {
   HeartPulse, AlertTriangle, CheckCircle2, Wifi, WifiOff,
   Clock, RefreshCw, Trash2, ChevronDown, ChevronUp, Activity,
   Server, Database, Zap, Bug, Shield, TrendingUp, Play,
-  XCircle, Sun, Moon, Square,
+  XCircle, Sun, Moon, Square, Terminal,
 } from 'lucide-react';
+import { useDashboardStore } from '@/hooks/useDashboardStore';
 
 // ─── Types ──────────────────────────────────────────────────
 
@@ -357,6 +358,162 @@ function EvalResults({ results, errors }: {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+// ─── Client Diagnostics Panel ────────────────────────────────
+
+function ClientDiagnosticsPanel() {
+  const { diagnostics, runDiagnostics } = useDashboardStore();
+  const [running, setRunning] = useState(false);
+
+  const handleRun = async () => {
+    setRunning(true);
+    await runDiagnostics();
+    setRunning(false);
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const diag = diagnostics as Record<string, any> | null;
+
+  // Render a single check as a status badge
+  const CheckBadge = ({ label, ok, ms }: { label: string; ok?: boolean; ms?: number }) => (
+    <div className={`flex items-center justify-between px-3 py-2 rounded ${ok ? 'bg-green-500/5 border border-green-500/15' : ok === false ? 'bg-red-500/5 border border-red-500/15' : 'bg-bg-tertiary/30 border border-border/20'}`}>
+      <div className="flex items-center gap-1.5">
+        {ok ? <CheckCircle2 className="w-3 h-3 text-accent-green" /> : ok === false ? <XCircle className="w-3 h-3 text-red-400" /> : <Clock className="w-3 h-3 text-text-muted" />}
+        <span className="text-xs font-mono text-text-secondary">{label}</span>
+      </div>
+      {ms !== undefined && <span className="text-[10px] font-mono text-text-muted">{ms}ms</span>}
+    </div>
+  );
+
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <div className="flex items-center gap-2">
+          <Terminal className="w-3.5 h-3.5 text-accent-cyan" />
+          <span className="panel-title text-xs">Client Diagnostics</span>
+          {diag?.ranAt && (
+            <span className="text-[10px] font-mono text-text-muted">
+              {new Date(diag.ranAt).toLocaleTimeString()}
+            </span>
+          )}
+        </div>
+        <button
+          onClick={handleRun}
+          disabled={running}
+          className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-mono text-text-muted hover:text-accent-cyan transition-colors disabled:opacity-50"
+        >
+          <RefreshCw className={`w-3 h-3 ${running ? 'animate-spin' : ''}`} />
+          {running ? 'Running...' : 'Run Checks'}
+        </button>
+      </div>
+
+      {!diag ? (
+        <div className="px-4 py-6 text-center text-xs font-mono text-text-muted/50">
+          Client diagnostics run automatically on symbol load. Click &quot;Run Checks&quot; to run manually.
+        </div>
+      ) : (
+        <div className="p-3 space-y-3">
+          {/* Environment */}
+          {diag.debug && (
+            <div>
+              <div className="text-[9px] font-mono text-text-muted/50 uppercase tracking-wider mb-1.5">Environment</div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <CheckBadge label="Runtime" ok={diag.debug.ok} />
+                <CheckBadge label={`Node ${diag.debug.nodeVersion || '?'}`} ok={diag.debug.ok} />
+                {diag.debug.env && Object.entries(diag.debug.env as Record<string, string>).map(([key, val]) => (
+                  <div key={key} className={`flex items-center justify-between px-3 py-2 rounded border ${val === 'set' ? 'bg-green-500/5 border-green-500/15' : 'bg-red-500/5 border-red-500/15'}`}>
+                    <span className="text-[10px] font-mono text-text-secondary truncate">{key.replace('_API_KEY', '').replace('TRADIER_', 'TRAD_')}</span>
+                    <span className={`text-[10px] font-mono ${val === 'set' ? 'text-accent-green' : 'text-red-400'}`}>{val}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Health Checks */}
+          {diag.health?.checks && (
+            <div>
+              <div className="text-[9px] font-mono text-text-muted/50 uppercase tracking-wider mb-1.5">Health Checks</div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {Object.entries(diag.health.checks as Record<string, { ok: boolean }>).map(([name, check]) => (
+                  <CheckBadge key={name} label={name} ok={check.ok} />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Recommendations (recsFull step timing) */}
+          {diag.recsFull?.steps && (
+            <div>
+              <div className="text-[9px] font-mono text-text-muted/50 uppercase tracking-wider mb-1.5">
+                Route Timing — /api/market/recs ({diag.recsFull.ticker})
+                <span className="ml-2 text-accent-cyan">{diag.recsFull.totalMs}ms total</span>
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {Object.entries(diag.recsFull.steps as Record<string, { ok: boolean; ms: number; data?: unknown }>).map(([step, info]) => (
+                  <CheckBadge key={step} label={step} ok={info.ok} ms={info.ms} />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Recommendations Summary */}
+          {diag.recsStripped && (
+            <div>
+              <div className="text-[9px] font-mono text-text-muted/50 uppercase tracking-wider mb-1.5">
+                Recommendations — {diag.recsStripped.symbol} ${diag.recsStripped.spotPrice}
+              </div>
+              <div className="grid grid-cols-3 sm:grid-cols-5 gap-2 text-xs font-mono">
+                <div className="px-3 py-2 bg-bg-tertiary/30 rounded">
+                  <div className="text-text-muted/50 text-[9px]">Bias</div>
+                  <div className={`font-semibold ${diag.recsStripped.overallBias === 'bullish' ? 'text-green-400' : diag.recsStripped.overallBias === 'bearish' ? 'text-red-400' : 'text-text-muted'}`}>
+                    {diag.recsStripped.overallBias} ({diag.recsStripped.biasScore > 0 ? '+' : ''}{diag.recsStripped.biasScore})
+                  </div>
+                </div>
+                <div className="px-3 py-2 bg-bg-tertiary/30 rounded">
+                  <div className="text-text-muted/50 text-[9px]">Vol</div>
+                  <div className="text-text-secondary">{diag.recsStripped.volRegime}</div>
+                </div>
+                <div className="px-3 py-2 bg-bg-tertiary/30 rounded">
+                  <div className="text-text-muted/50 text-[9px]">Gamma</div>
+                  <div className="text-text-secondary">{diag.recsStripped.gammaRegime}</div>
+                </div>
+                <div className="px-3 py-2 bg-bg-tertiary/30 rounded">
+                  <div className="text-text-muted/50 text-[9px]">Signals</div>
+                  <div className="text-text-secondary">{diag.recsStripped.signals?.length || 0}</div>
+                </div>
+                <div className="px-3 py-2 bg-bg-tertiary/30 rounded">
+                  <div className="text-text-muted/50 text-[9px]">Trades</div>
+                  <div className="text-text-secondary">{diag.recsStripped.trades?.length || 0}</div>
+                </div>
+              </div>
+              {diag.recsStripped.warnings?.length > 0 && (
+                <div className="mt-2 space-y-1">
+                  {(diag.recsStripped.warnings as string[]).map((w: string, i: number) => (
+                    <div key={i} className="flex items-start gap-1.5 text-[10px] font-mono text-amber-400/70">
+                      <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+                      <span>{w}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Raw JSON (collapsible) */}
+          <details className="mt-2">
+            <summary className="text-[10px] font-mono text-text-muted/50 cursor-pointer hover:text-text-muted">
+              Raw JSON
+            </summary>
+            <pre className="text-[10px] font-mono text-text-muted/70 bg-bg-tertiary/30 rounded p-3 mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-all">
+              {JSON.stringify(diag, null, 2)}
+            </pre>
+          </details>
+        </div>
+      )}
     </div>
   );
 }
@@ -874,6 +1031,9 @@ export default function DiagnosticsTab() {
           </div>
         </div>
       )}
+
+      {/* Client-side Diagnostics (from loadSymbol auto-run) */}
+      <ClientDiagnosticsPanel />
 
       {/* Footer */}
       <div className="text-center text-[10px] font-mono text-text-muted/40 py-2">

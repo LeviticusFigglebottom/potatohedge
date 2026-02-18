@@ -11,6 +11,8 @@ export interface UniverseStock {
   symbol: string;
   name: string;
   sector: string;
+  /** 1 = ETFs + S&P 500 / top market cap. 2 = high-volume but smaller-cap / non-S&P retail favorites. */
+  tier?: 1 | 2;
 }
 
 export const STOCK_UNIVERSE: UniverseStock[] = [
@@ -71,60 +73,60 @@ export const STOCK_UNIVERSE: UniverseStock[] = [
   { symbol: 'MU', name: 'Micron', sector: 'Technology' },
   { symbol: 'NFLX', name: 'Netflix', sector: 'Communication' },
 
-  // ── High-Volume Non-S&P / Retail Favorites ──
-  { symbol: 'SOFI', name: 'SoFi Technologies', sector: 'Finance' },
-  { symbol: 'HOOD', name: 'Robinhood Markets', sector: 'Finance' },
-  { symbol: 'NIO', name: 'NIO Inc', sector: 'Consumer Disc.' },
-  { symbol: 'MARA', name: 'MARA Holdings', sector: 'Finance' },
-  { symbol: 'RIOT', name: 'Riot Platforms', sector: 'Finance' },
-  { symbol: 'AMC', name: 'AMC Entertainment', sector: 'Communication' },
-  { symbol: 'GME', name: 'GameStop', sector: 'Consumer Disc.' },
-  { symbol: 'RIVN', name: 'Rivian Automotive', sector: 'Consumer Disc.' },
-  { symbol: 'LCID', name: 'Lucid Group', sector: 'Consumer Disc.' },
-  { symbol: 'SNAP', name: 'Snap Inc', sector: 'Communication' },
-  { symbol: 'RBLX', name: 'Roblox', sector: 'Communication' },
-  { symbol: 'DKNG', name: 'DraftKings', sector: 'Consumer Disc.' },
-  { symbol: 'BABA', name: 'Alibaba Group', sector: 'Consumer Disc.' },
-  { symbol: 'JD', name: 'JD.com', sector: 'Consumer Disc.' },
-  { symbol: 'PDD', name: 'PDD Holdings', sector: 'Consumer Disc.' },
-  { symbol: 'SHOP', name: 'Shopify', sector: 'Technology' },
-  { symbol: 'SQ', name: 'Block Inc', sector: 'Finance' },
-  { symbol: 'MSTR', name: 'MicroStrategy', sector: 'Technology' },
-  { symbol: 'NET', name: 'Cloudflare', sector: 'Technology' },
-  { symbol: 'ROKU', name: 'Roku', sector: 'Communication' },
-  { symbol: 'ARM', name: 'Arm Holdings', sector: 'Technology' },
-  { symbol: 'AFRM', name: 'Affirm Holdings', sector: 'Finance' },
-  { symbol: 'UPST', name: 'Upstart Holdings', sector: 'Finance' },
-  { symbol: 'CVNA', name: 'Carvana', sector: 'Consumer Disc.' },
-  { symbol: 'LYFT', name: 'Lyft', sector: 'Industrial' },
-  { symbol: 'PINS', name: 'Pinterest', sector: 'Communication' },
-  { symbol: 'AI', name: 'C3.ai', sector: 'Technology' },
-  { symbol: 'IONQ', name: 'IonQ', sector: 'Technology' },
-  { symbol: 'SOUN', name: 'SoundHound AI', sector: 'Technology' },
-  { symbol: 'PLUG', name: 'Plug Power', sector: 'Industrial' },
-  { symbol: 'FUBO', name: 'fuboTV', sector: 'Communication' },
-  { symbol: 'SE', name: 'Sea Limited', sector: 'Communication' },
-  { symbol: 'GRAB', name: 'Grab Holdings', sector: 'Technology' },
-  { symbol: 'XPEV', name: 'XPeng', sector: 'Consumer Disc.' },
-  { symbol: 'LI', name: 'Li Auto', sector: 'Consumer Disc.' },
-  { symbol: 'BIDU', name: 'Baidu', sector: 'Communication' },
-  { symbol: 'PATH', name: 'UiPath', sector: 'Technology' },
-  { symbol: 'U', name: 'Unity Software', sector: 'Technology' },
-  { symbol: 'CHWY', name: 'Chewy', sector: 'Consumer Disc.' },
-  { symbol: 'OPEN', name: 'Opendoor Technologies', sector: 'Real Estate' },
-  { symbol: 'CLF', name: 'Cleveland-Cliffs', sector: 'Materials' },
-  { symbol: 'VALE', name: 'Vale SA', sector: 'Materials' },
-  { symbol: 'X', name: 'United States Steel', sector: 'Materials' },
-  { symbol: 'RIG', name: 'Transocean', sector: 'Energy' },
-  { symbol: 'ET', name: 'Energy Transfer', sector: 'Energy' },
-  { symbol: 'OKLO', name: 'Oklo Inc', sector: 'Energy' },
-  { symbol: 'ASTS', name: 'AST SpaceMobile', sector: 'Communication' },
-  { symbol: 'RKLB', name: 'Rocket Lab USA', sector: 'Industrial' },
-  { symbol: 'ACHR', name: 'Archer Aviation', sector: 'Industrial' },
-  { symbol: 'JOBY', name: 'Joby Aviation', sector: 'Industrial' },
-  { symbol: 'DNA', name: 'Ginkgo Bioworks', sector: 'Healthcare' },
-  { symbol: 'BILL', name: 'BILL Holdings', sector: 'Technology' },
-  { symbol: 'WOLF', name: 'Wolfspeed', sector: 'Technology' },
+  // ── High-Volume Non-S&P / Retail Favorites (tier 2 — excluded from default screener scan) ──
+  { symbol: 'SOFI', name: 'SoFi Technologies', sector: 'Finance', tier: 2 },
+  { symbol: 'HOOD', name: 'Robinhood Markets', sector: 'Finance', tier: 2 },
+  { symbol: 'NIO', name: 'NIO Inc', sector: 'Consumer Disc.', tier: 2 },
+  { symbol: 'MARA', name: 'MARA Holdings', sector: 'Finance', tier: 2 },
+  { symbol: 'RIOT', name: 'Riot Platforms', sector: 'Finance', tier: 2 },
+  { symbol: 'AMC', name: 'AMC Entertainment', sector: 'Communication', tier: 2 },
+  { symbol: 'GME', name: 'GameStop', sector: 'Consumer Disc.', tier: 2 },
+  { symbol: 'RIVN', name: 'Rivian Automotive', sector: 'Consumer Disc.', tier: 2 },
+  { symbol: 'LCID', name: 'Lucid Group', sector: 'Consumer Disc.', tier: 2 },
+  { symbol: 'SNAP', name: 'Snap Inc', sector: 'Communication', tier: 2 },
+  { symbol: 'RBLX', name: 'Roblox', sector: 'Communication', tier: 2 },
+  { symbol: 'DKNG', name: 'DraftKings', sector: 'Consumer Disc.', tier: 2 },
+  { symbol: 'BABA', name: 'Alibaba Group', sector: 'Consumer Disc.', tier: 2 },
+  { symbol: 'JD', name: 'JD.com', sector: 'Consumer Disc.', tier: 2 },
+  { symbol: 'PDD', name: 'PDD Holdings', sector: 'Consumer Disc.', tier: 2 },
+  { symbol: 'SHOP', name: 'Shopify', sector: 'Technology', tier: 2 },
+  { symbol: 'SQ', name: 'Block Inc', sector: 'Finance', tier: 2 },
+  { symbol: 'MSTR', name: 'MicroStrategy', sector: 'Technology', tier: 2 },
+  { symbol: 'NET', name: 'Cloudflare', sector: 'Technology', tier: 2 },
+  { symbol: 'ROKU', name: 'Roku', sector: 'Communication', tier: 2 },
+  { symbol: 'ARM', name: 'Arm Holdings', sector: 'Technology', tier: 2 },
+  { symbol: 'AFRM', name: 'Affirm Holdings', sector: 'Finance', tier: 2 },
+  { symbol: 'UPST', name: 'Upstart Holdings', sector: 'Finance', tier: 2 },
+  { symbol: 'CVNA', name: 'Carvana', sector: 'Consumer Disc.', tier: 2 },
+  { symbol: 'LYFT', name: 'Lyft', sector: 'Industrial', tier: 2 },
+  { symbol: 'PINS', name: 'Pinterest', sector: 'Communication', tier: 2 },
+  { symbol: 'AI', name: 'C3.ai', sector: 'Technology', tier: 2 },
+  { symbol: 'IONQ', name: 'IonQ', sector: 'Technology', tier: 2 },
+  { symbol: 'SOUN', name: 'SoundHound AI', sector: 'Technology', tier: 2 },
+  { symbol: 'PLUG', name: 'Plug Power', sector: 'Industrial', tier: 2 },
+  { symbol: 'FUBO', name: 'fuboTV', sector: 'Communication', tier: 2 },
+  { symbol: 'SE', name: 'Sea Limited', sector: 'Communication', tier: 2 },
+  { symbol: 'GRAB', name: 'Grab Holdings', sector: 'Technology', tier: 2 },
+  { symbol: 'XPEV', name: 'XPeng', sector: 'Consumer Disc.', tier: 2 },
+  { symbol: 'LI', name: 'Li Auto', sector: 'Consumer Disc.', tier: 2 },
+  { symbol: 'BIDU', name: 'Baidu', sector: 'Communication', tier: 2 },
+  { symbol: 'PATH', name: 'UiPath', sector: 'Technology', tier: 2 },
+  { symbol: 'U', name: 'Unity Software', sector: 'Technology', tier: 2 },
+  { symbol: 'CHWY', name: 'Chewy', sector: 'Consumer Disc.', tier: 2 },
+  { symbol: 'OPEN', name: 'Opendoor Technologies', sector: 'Real Estate', tier: 2 },
+  { symbol: 'CLF', name: 'Cleveland-Cliffs', sector: 'Materials', tier: 2 },
+  { symbol: 'VALE', name: 'Vale SA', sector: 'Materials', tier: 2 },
+  { symbol: 'X', name: 'United States Steel', sector: 'Materials', tier: 2 },
+  { symbol: 'RIG', name: 'Transocean', sector: 'Energy', tier: 2 },
+  { symbol: 'ET', name: 'Energy Transfer', sector: 'Energy', tier: 2 },
+  { symbol: 'OKLO', name: 'Oklo Inc', sector: 'Energy', tier: 2 },
+  { symbol: 'ASTS', name: 'AST SpaceMobile', sector: 'Communication', tier: 2 },
+  { symbol: 'RKLB', name: 'Rocket Lab USA', sector: 'Industrial', tier: 2 },
+  { symbol: 'ACHR', name: 'Archer Aviation', sector: 'Industrial', tier: 2 },
+  { symbol: 'JOBY', name: 'Joby Aviation', sector: 'Industrial', tier: 2 },
+  { symbol: 'DNA', name: 'Ginkgo Bioworks', sector: 'Healthcare', tier: 2 },
+  { symbol: 'BILL', name: 'BILL Holdings', sector: 'Technology', tier: 2 },
+  { symbol: 'WOLF', name: 'Wolfspeed', sector: 'Technology', tier: 2 },
 
   // ── Large-Cap Technology ──
   { symbol: 'AVGO', name: 'Broadcom', sector: 'Technology' },
@@ -482,9 +484,14 @@ export const STOCK_UNIVERSE: UniverseStock[] = [
   { symbol: 'NRG', name: 'NRG Energy', sector: 'Utilities' },
 ];
 
-/** Get symbols only */
+/** Get ALL symbols (includes tier 2 retail favorites) */
 export function getUniverseSymbols(): string[] {
   return STOCK_UNIVERSE.map(s => s.symbol);
+}
+
+/** Get top ~500 by market cap — ETFs + S&P 500 constituents (excludes tier 2 retail/small-cap) */
+export function getTop500Symbols(): string[] {
+  return STOCK_UNIVERSE.filter(s => s.tier !== 2).map(s => s.symbol);
 }
 
 /** Lookup stock metadata */

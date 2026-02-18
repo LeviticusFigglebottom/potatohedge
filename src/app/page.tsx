@@ -20,53 +20,96 @@ import BriefingTab from '@/components/dashboard/BriefingTab';
 import InstitutionalTab from '@/components/dashboard/InstitutionalTab';
 import PaperTradingTab from '@/components/dashboard/PaperTradingTab';
 import TrackedTradesTab from '@/components/dashboard/TrackedTradesTab';
+import SignalTrackerTab from '@/components/dashboard/SignalTrackerTab';
 import DiagnosticsTab from '@/components/dashboard/DiagnosticsTab';
 import PaperMonitor from '@/components/dashboard/PaperMonitor';
 import TrackerMonitor from '@/components/dashboard/TrackerMonitor';
 import CorrelationPanel from '@/components/dashboard/CorrelationPanel';
-import { Activity, Zap, AlertTriangle, X } from 'lucide-react';
+import { Activity, Zap, AlertTriangle, X, Crosshair, CheckCircle2 } from 'lucide-react';
+import { addSignal, loadSignals } from '@/lib/signalTracker';
 
 function ErrorBanner() {
-  const { errors, diagnostics } = useDashboardStore();
+  const { errors } = useDashboardStore();
   const [dismissed, setDismissed] = useState(false);
 
   useEffect(() => { setDismissed(false); }, [errors]);
 
-  if ((errors.length === 0 && !diagnostics) || dismissed) return null;
+  if (errors.length === 0 || dismissed) return null;
 
   const uniqueErrors = [...new Set(errors)];
 
   return (
-    <div className="space-y-2">
-      {uniqueErrors.length > 0 && (
-        <div className="bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-3 flex items-start gap-3">
-          <AlertTriangle className="w-4 h-4 text-red-400 mt-0.5 shrink-0" />
-          <div className="flex-1 min-w-0">
-            <div className="text-sm font-semibold text-red-400 mb-1">API Errors ({uniqueErrors.length})</div>
-            {uniqueErrors.map((err, i) => (
-              <pre key={i} className="text-xs text-red-300/80 font-mono whitespace-pre-wrap break-all mb-1 pb-1 border-b border-red-500/10 last:border-0">{err}</pre>
-            ))}
-          </div>
-          <button onClick={() => setDismissed(true)} className="text-red-400/60 hover:text-red-400 shrink-0">
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-      )}
-      {diagnostics && (
-        <details className="bg-blue-500/10 border border-blue-500/30 rounded-lg px-4 py-3" open>
-          <summary className="text-sm font-semibold text-blue-400 cursor-pointer">Diagnostics (/api/debug + /api/health)</summary>
-          <pre className="text-xs text-blue-300/80 font-mono whitespace-pre-wrap break-all mt-2 max-h-60 overflow-auto">
-            {JSON.stringify(diagnostics, null, 2)}
-          </pre>
-        </details>
-      )}
+    <div className="bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-3 flex items-start gap-3">
+      <AlertTriangle className="w-4 h-4 text-red-400 mt-0.5 shrink-0" />
+      <div className="flex-1 min-w-0">
+        <div className="text-sm font-semibold text-red-400 mb-1">API Errors ({uniqueErrors.length})</div>
+        {uniqueErrors.map((err, i) => (
+          <pre key={i} className="text-xs text-red-300/80 font-mono whitespace-pre-wrap break-all mb-1 pb-1 border-b border-red-500/10 last:border-0">{err}</pre>
+        ))}
+      </div>
+      <button onClick={() => setDismissed(true)} className="text-red-400/60 hover:text-red-400 shrink-0">
+        <X className="w-4 h-4" />
+      </button>
     </div>
+  );
+}
+
+function SignalTrackButton() {
+  const { symbol, quote, recommendations, snapshot, multiGEX } = useDashboardStore();
+  const [tracked, setTracked] = useState(false);
+
+  // Check on mount / symbol change
+  useEffect(() => {
+    const existing = loadSignals();
+    setTracked(existing.some(s => s.symbol === symbol));
+  }, [symbol]);
+
+  const handleTrack = async () => {
+    if (tracked || !quote) return;
+    const recs = recommendations;
+    const snap = snapshot;
+    const gex = multiGEX;
+
+    addSignal({
+      symbol,
+      entryPrice: quote.last,
+      bias: (recs?.overallBias || 'neutral') as 'bullish' | 'bearish' | 'neutral',
+      biasScore: recs?.biasScore || 0,
+      gammaRegime: recs?.gammaRegime || 'neutral',
+      volRegime: recs?.volRegime || 'mid',
+      ivRank: snap?.iv?.ivRank || 0,
+      topSignal: recs?.signals?.[0]?.name || '',
+      gammaFlip: gex?.aggregated?.gammaFlip || null,
+      callWall: gex?.aggregated?.callWall || null,
+      putWall: gex?.aggregated?.putWall || null,
+      source: 'manual',
+    });
+    setTracked(true);
+  };
+
+  return (
+    <button
+      onClick={handleTrack}
+      disabled={tracked || !quote}
+      title={tracked ? `${symbol} already tracked` : `Track ${symbol} signal at current price`}
+      className={`px-3 py-1.5 rounded-md text-xs font-mono border transition-all flex items-center gap-1.5 ${
+        tracked
+          ? 'bg-accent-cyan/10 border-accent-cyan/20 text-accent-cyan cursor-default'
+          : 'bg-bg-tertiary border-border/30 text-text-secondary hover:border-accent-cyan/30 hover:text-accent-cyan'
+      } disabled:opacity-50`}
+    >
+      {tracked ? <CheckCircle2 className="w-3.5 h-3.5" /> : <Crosshair className="w-3.5 h-3.5" />}
+      {tracked ? 'Signal Tracked' : 'Track Signal'}
+    </button>
   );
 }
 
 function OverviewTab() {
   return (
     <div className="space-y-4 animate-fade-in">
+      <div className="flex items-center justify-end">
+        <SignalTrackButton />
+      </div>
       <AnalyticsCards />
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="lg:col-span-2 min-h-[400px]">
@@ -141,6 +184,7 @@ export default function DashboardPage() {
           {activeTab === 'institutional' && <InstitutionalTab />}
           {activeTab === 'briefing' && <BriefingTab />}
           {activeTab === 'tracker' && <TrackedTradesTab />}
+          {activeTab === 'signals' && <SignalTrackerTab />}
           {activeTab === 'paper' && <PaperTradingTab />}
           {activeTab === 'diagnostics' && <DiagnosticsTab />}
           {activeTab === 'chain' && <ChainTab />}

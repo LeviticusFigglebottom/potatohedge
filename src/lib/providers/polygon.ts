@@ -97,6 +97,119 @@ export async function getOptionsSnapshot(
   return allResults;
 }
 
+/**
+ * Lightweight options snapshot for screener — single page, no pagination.
+ * Returns up to 250 contracts per ticker (sufficient for ATM analysis).
+ * Much faster than full snapshot since it skips pagination.
+ */
+export async function getOptionsSnapshotLite(
+  ticker: string
+): Promise<PolygonOptionSnapshot[]> {
+  const url = buildUrl(
+    `/v3/snapshot/options/${ticker.toUpperCase()}`,
+    { limit: '250' }
+  );
+  const res: Response = await fetch(url, {
+    next: { revalidate: 15 },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT),
+  });
+  if (!res.ok)
+    throw new Error(`Polygon snapshot error: ${res.status}`);
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    throw new Error(`Polygon snapshot JSON parse error: ${e instanceof Error ? e.message : 'malformed response'}`);
+  }
+  return data.results || [];
+}
+
+/**
+ * Convert Polygon option snapshots into OptionsChain format (grouped by expiration).
+ * This allows reuse of all existing signal computations (GEX, vanna, charm, etc.)
+ * that expect the OptionsChain/OptionContract types.
+ */
+export function polygonSnapshotToChains(
+  snapshots: PolygonOptionSnapshot[],
+  underlying: string,
+  spotPrice: number,
+  maxExpirations: number = 3,
+): import('@/types/market').OptionsChain[] {
+  // Group by expiration
+  const byExp = new Map<string, PolygonOptionSnapshot[]>();
+  const today = new Date().toISOString().split('T')[0];
+  for (const snap of snapshots) {
+    const exp = snap.details?.expiration_date;
+    if (!exp || exp < today) continue; // skip expired
+    if (!byExp.has(exp)) byExp.set(exp, []);
+    byExp.get(exp)!.push(snap);
+  }
+
+  // Sort expirations ascending, take nearest N
+  const sortedExps = [...byExp.keys()].sort().slice(0, maxExpirations);
+  const now = Date.now();
+
+  return sortedExps.map(exp => {
+    const contracts = byExp.get(exp)!;
+    const expDate = new Date(exp + 'T16:00:00-05:00');
+    const dte = Math.max(0, Math.ceil((expDate.getTime() - now) / 86400000));
+
+    const calls: import('@/types/market').OptionContract[] = [];
+    const puts: import('@/types/market').OptionContract[] = [];
+
+    for (const snap of contracts) {
+      const strike = snap.details.strike_price;
+      const type = snap.details.contract_type === 'call' ? 'call' as const : 'put' as const;
+      const last = snap.day?.close || 0;
+      const iv = snap.implied_volatility || 0;
+      const intrinsic = type === 'call'
+        ? Math.max(0, spotPrice - strike)
+        : Math.max(0, strike - spotPrice);
+
+      const opt: import('@/types/market').OptionContract = {
+        symbol: snap.details.ticker || '',
+        underlying,
+        strike,
+        expiration: exp,
+        type,
+        last,
+        bid: 0,
+        ask: 0,
+        mid: last,
+        volume: snap.day?.volume || 0,
+        openInterest: snap.open_interest || 0,
+        impliedVolatility: iv,
+        delta: snap.greeks?.delta || 0,
+        gamma: snap.greeks?.gamma || 0,
+        theta: snap.greeks?.theta || 0,
+        vega: snap.greeks?.vega || 0,
+        rho: 0,
+        dte,
+        inTheMoney: type === 'call' ? spotPrice > strike : spotPrice < strike,
+        intrinsicValue: intrinsic,
+        extrinsicValue: Math.max(0, last - intrinsic),
+        bidAskSpread: 0,
+        volumeOiRatio: snap.open_interest > 0 ? (snap.day?.volume || 0) / snap.open_interest : 0,
+      };
+
+      if (type === 'call') calls.push(opt);
+      else puts.push(opt);
+    }
+
+    calls.sort((a, b) => a.strike - b.strike);
+    puts.sort((a, b) => a.strike - b.strike);
+
+    return {
+      underlying,
+      underlyingPrice: spotPrice,
+      expiration: exp,
+      calls,
+      puts,
+      timestamp: now,
+    };
+  });
+}
+
 // ─── Historical Equity Bars ────────────────────────────────
 
 export interface PolygonBar {

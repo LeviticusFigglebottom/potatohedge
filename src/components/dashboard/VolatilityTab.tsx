@@ -2,7 +2,7 @@
 
 import { useEffect, useRef } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
-import { Thermometer, Brain, TrendingUp, TrendingDown } from 'lucide-react';
+import { Thermometer, Brain, TrendingUp, TrendingDown, Shield } from 'lucide-react';
 
 // ─── VIX Panel (chart + context + ranges) ─────────────────
 
@@ -876,6 +876,105 @@ function SkewChart() {
   );
 }
 
+// ─── CBOE SKEW Index Panel ─────────────────────────────────
+
+function SKEWPanel() {
+  const { snapshot } = useDashboardStore();
+  const skew = snapshot?.skew;
+  if (!skew) return null;
+
+  const level = skew.current > 150 ? 'Extreme' : skew.current > 140 ? 'Elevated' : skew.current > 125 ? 'Normal' : 'Low';
+  const color = skew.current > 150 ? 'text-red-400' : skew.current > 140 ? 'text-amber-400' : skew.current > 125 ? 'text-text-primary' : 'text-green-400';
+  const bg = skew.current > 150 ? 'bg-red-500/10 text-red-400' : skew.current > 140 ? 'bg-amber-500/10 text-amber-400' : skew.current > 125 ? 'bg-bg-tertiary text-text-muted' : 'bg-green-500/10 text-green-400';
+
+  // SKEW gauge — visual bar showing where current value falls in typical 100-170 range
+  const gaugeMin = 100, gaugeMax = 170;
+  const gaugePct = Math.max(0, Math.min(100, ((skew.current - gaugeMin) / (gaugeMax - gaugeMin)) * 100));
+
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <div className="flex items-center gap-2">
+          <Shield className="w-3.5 h-3.5 text-accent-amber" />
+          <span className="panel-title">CBOE SKEW Index</span>
+        </div>
+        <span className={`text-[10px] font-mono px-2 py-0.5 rounded ${bg}`}>{level} Tail Risk</span>
+      </div>
+
+      {/* Stats row */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 px-4 pt-3 pb-2">
+        <div>
+          <div className="text-[9px] font-mono text-text-muted">Current</div>
+          <div className={`text-lg font-mono font-bold ${color}`}>{skew.current.toFixed(1)}</div>
+        </div>
+        <div>
+          <div className="text-[9px] font-mono text-text-muted">Previous</div>
+          <div className="text-sm font-mono font-semibold text-text-secondary">{skew.previous.toFixed(1)}</div>
+        </div>
+        <div>
+          <div className="text-[9px] font-mono text-text-muted">Change</div>
+          <div className={`text-sm font-mono font-semibold flex items-center gap-0.5 ${skew.change > 0 ? 'text-red-400' : 'text-green-400'}`}>
+            {skew.change > 0 ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
+            {skew.change > 0 ? '+' : ''}{skew.change.toFixed(2)} ({skew.changePercent >= 0 ? '+' : ''}{skew.changePercent.toFixed(1)}%)
+          </div>
+        </div>
+        <div>
+          <div className="text-[9px] font-mono text-text-muted">As Of</div>
+          <div className="text-sm font-mono font-semibold text-text-muted">{skew.date}</div>
+        </div>
+      </div>
+
+      {/* Visual gauge bar */}
+      <div className="px-4 py-2">
+        <div className="relative h-3 bg-bg-tertiary rounded-full overflow-hidden">
+          {/* Zone colors */}
+          <div className="absolute inset-0 flex">
+            <div className="h-full bg-green-500/15" style={{ width: '35.7%' }} /> {/* 100-125 */}
+            <div className="h-full bg-amber-500/10" style={{ width: '21.4%' }} /> {/* 125-140 */}
+            <div className="h-full bg-amber-500/15" style={{ width: '14.3%' }} /> {/* 140-150 */}
+            <div className="h-full bg-red-500/15" style={{ width: '28.6%' }} />   {/* 150-170 */}
+          </div>
+          {/* Current position indicator */}
+          <div
+            className="absolute top-0 h-full w-1 bg-white/80 rounded-full"
+            style={{ left: `${gaugePct}%` }}
+          />
+        </div>
+        <div className="flex justify-between text-[8px] font-mono text-text-muted/50 mt-0.5">
+          <span>100 (Low)</span>
+          <span>125</span>
+          <span>140</span>
+          <span>150</span>
+          <span>170 (Extreme)</span>
+        </div>
+      </div>
+
+      {/* Context */}
+      <div className="px-4 py-3 border-t border-border/20 text-xs font-mono text-text-secondary leading-relaxed space-y-1.5">
+        <p>
+          <strong className={color}>{level}:</strong>{' '}
+          {skew.current > 150
+            ? 'SKEW above 150 — extreme tail-risk pricing. Market makers are charging large premiums for OTM puts vs calls, indicating institutional hedging against crash risk even if VIX appears calm. Historically, extreme SKEW precedes vol spikes within 2-6 weeks.'
+            : skew.current > 140
+            ? 'SKEW elevated — increased tail-risk premium. OTM puts are priced richer than calls, indicating demand for downside protection. Consider long put spreads or portfolio hedges.'
+            : skew.current > 125
+            ? 'SKEW in normal range (125-140) — balanced tail-risk pricing. No unusual demand for crash protection.'
+            : 'SKEW unusually low — minimal tail-risk pricing. OTM puts are relatively cheap — historically attractive entry for long-dated downside hedges.'}
+        </p>
+        {snapshot?.vix && (
+          <p className="text-text-muted/60">
+            {skew.current > 145 && snapshot.vix.price < 18
+              ? `Divergence alert: SKEW (${skew.current.toFixed(0)}) signals tail-risk fear while VIX (${snapshot.vix.price.toFixed(1)}) shows complacency. Smart money may be quietly hedging — this is historically the most dangerous setup.`
+              : skew.current < 125 && snapshot.vix.price > 25
+              ? `Unusual: VIX elevated (${snapshot.vix.price.toFixed(1)}) but SKEW low (${skew.current.toFixed(0)}). Market fears are broad-based (not tail-specific). This pattern often resolves with mean reversion in VIX.`
+              : `VIX at ${snapshot.vix.price.toFixed(1)} with SKEW at ${skew.current.toFixed(0)} — ${skew.current > 140 && snapshot.vix.price > 20 ? 'both elevated, confirming risk-off sentiment' : 'aligned within normal parameters'}.`}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── IV Interpretation ─────────────────────────────────────
 
 function IVInterpretation() {
@@ -919,6 +1018,9 @@ export default function VolatilityTab() {
     <div className="space-y-4 animate-fade-in">
       {/* VIX Panel — full-width with chart, stats, and context */}
       <VIXPanel />
+
+      {/* SKEW Panel — tail risk indicator from FRED */}
+      <SKEWPanel />
 
       {/* Top row: gauge + stats + term structure */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
