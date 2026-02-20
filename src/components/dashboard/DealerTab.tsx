@@ -180,16 +180,18 @@ export default function DealerTab() {
         <KeyLevelsTable />
       </div>
 
-      {/* Gamma Heatmap — strike × expiration exposure surface */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <div className="lg:col-span-2 min-h-[300px]">
-          <GammaHeatmap />
-        </div>
-        <ExpirationBreakdown />
-      </div>
+      {/* 4-Panel Exposure Surface — GEX / DEX / Vanna / Charm */}
+      <GammaHeatmap />
 
-      {/* Interpretation */}
-      <DealerInterpretation />
+      {/* Expiration breakdown + Interpretation side by side */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="lg:col-span-1">
+          <ExpirationBreakdown />
+        </div>
+        <div className="lg:col-span-2">
+          <DealerInterpretation />
+        </div>
+      </div>
 
       {/* Per-expiration breakdown */}
       <PerExpirationTable />
