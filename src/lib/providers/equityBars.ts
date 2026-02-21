@@ -1,6 +1,6 @@
 /**
- * Shared equity history fetcher — tries Polygon first (longer lookback),
- * falls back to Tradier if Polygon returns empty or fails.
+ * Shared equity history fetcher — tries Tradier first (included with Options plan,
+ * no Stocks Basic add-on needed), falls back to Polygon if Tradier fails.
  * Returns bars in a unified format: { o, h, l, c, v, t } (chronological, oldest first).
  */
 
@@ -29,20 +29,10 @@ export async function fetchEquityBars(
   const from = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
   const to = new Date().toISOString().split('T')[0];
 
-  // Try Polygon first (better lookback)
-  try {
-    const bars = await getEquityHistory(ticker, 1, 'day', from, to);
-    if (bars.length > 10) {
-      return bars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, t: b.t }));
-    }
-  } catch {
-    // Polygon failed — fall back to Tradier
-  }
-
-  // Fallback: Tradier daily history
+  // Try Tradier first (included with Options plan — no extra subscription needed)
   try {
     const ohlcv = await getHistory(ticker, '1D', from, to);
-    if (ohlcv.length > 0) {
+    if (ohlcv.length > 10) {
       return ohlcv.map(b => ({
         o: b.open,
         h: b.high,
@@ -51,6 +41,16 @@ export async function fetchEquityBars(
         v: b.volume,
         t: b.time * 1000,
       }));
+    }
+  } catch {
+    // Tradier failed — fall back to Polygon
+  }
+
+  // Fallback: Polygon daily history
+  try {
+    const bars = await getEquityHistory(ticker, 1, 'day', from, to);
+    if (bars.length > 0) {
+      return bars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, t: b.t }));
     }
   } catch {
     // Both providers failed

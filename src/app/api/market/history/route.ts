@@ -90,19 +90,25 @@ export async function GET(request: NextRequest) {
       const history = await getPolygonIntraday(ticker, interval);
       return NextResponse.json(sanitizeBars(history), { headers });
     } else {
-      // Use Polygon for daily/weekly too — 2+ year lookback vs Tradier's ~1 year
+      // Try Tradier first for daily/weekly/monthly (no Stocks Basic add-on needed)
       try {
-        let history = await getPolygonDaily(ticker, interval);
-        // Polygon daily bars only include completed days — the current day's
-        // bar won't appear until after market close. Append a synthetic bar
-        // from the live quote so the chart shows today's price.
+        let history = await getTradierDaily(ticker, interval);
         if (interval === '1D' && history.length > 0) {
           history = await appendTodayBar(ticker, history);
         }
         if (history.length > 10) return NextResponse.json(sanitizeBars(history), { headers });
-      } catch { /* fall through to Tradier */ }
+      } catch { /* fall through to Polygon */ }
 
-      // Fallback to Tradier
+      // Fallback to Polygon
+      try {
+        let history = await getPolygonDaily(ticker, interval);
+        if (interval === '1D' && history.length > 0) {
+          history = await appendTodayBar(ticker, history);
+        }
+        if (history.length > 10) return NextResponse.json(sanitizeBars(history), { headers });
+      } catch { /* fall through to final Tradier fallback */ }
+
+      // Last resort
       const history = await getHistory(ticker, interval);
       return NextResponse.json(sanitizeBars(history), { headers });
     }
@@ -181,6 +187,18 @@ async function getPolygonDaily(
     close: bar.c,
     volume: bar.v,
   }));
+}
+
+async function getTradierDaily(
+  ticker: string,
+  interval: Interval
+): Promise<OHLCV[]> {
+  const tradierInterval = interval === '1W' ? '1W' : interval === '1M' ? '1M' : '1D';
+  const daysBack = interval === '1M' ? 3650 : interval === '1W' ? 1825 : 750;
+  const from = toEasternDate(new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000));
+  const to = toEasternDate(new Date());
+
+  return getHistory(ticker, tradierInterval as Interval, from, to);
 }
 
 /**

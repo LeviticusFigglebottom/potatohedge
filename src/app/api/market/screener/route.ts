@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 import { getQuotes, getExpirations, getOptionsChain } from '@/lib/providers/tradier';
-import { getOptionsSnapshotLite, polygonSnapshotToChains, getEquityHistory } from '@/lib/providers/polygon';
+import { getOptionsSnapshotLite, polygonSnapshotToChains } from '@/lib/providers/polygon';
+import { fetchEquityBars } from '@/lib/providers/equityBars';
 import { getMarketIndicators } from '@/lib/providers/fred';
 import type { Quote, OptionsChain } from '@/types/market';
 
@@ -166,11 +167,11 @@ async function analyzeStock(
     if (useTradier) {
       // Tradier path: identical to overview/recommendations route.
       // Sequential calls with 400ms delays to respect rate limits.
-      const [expirations, rawBars] = await Promise.all([
+      const [expirations, equityBars] = await Promise.all([
         getExpirations(ticker).catch(() => []),
-        getEquityHistory(ticker, 1, 'day', from, to).catch(() => []),
+        fetchEquityBars(ticker, 260).catch(() => []),
       ]);
-      historyBars = rawBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, t: b.t }));
+      historyBars = equityBars;
 
       const nearExps = expirations.slice(0, 3);
       chains = [];
@@ -184,8 +185,8 @@ async function analyzeStock(
     } else {
       // Polygon path: fast bulk scanning (1 API call for all options data).
       const snapshots = await getOptionsSnapshotLite(ticker).catch(() => []);
-      const rawBars = await getEquityHistory(ticker, 1, 'day', from, to).catch(() => []);
-      historyBars = rawBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, t: b.t }));
+      const equityBars = await fetchEquityBars(ticker, 260).catch(() => []);
+      historyBars = equityBars;
       chains = polygonSnapshotToChains(snapshots, ticker, spotPrice, 3);
     }
 
