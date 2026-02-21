@@ -395,17 +395,29 @@ export function calculatePositionValue(legs: TrackedLeg[], useMid: 'entry' | 'ex
 }
 
 /**
- * Compute P/L% using cost basis (abs of entry debit/credit) as denominator.
- * This matches the recommendation engine's intent: profitTargetPct and stopLossPct
- * are defined as "% of cost" — e.g., 50 means take profit at +50% of premium paid
- * (debit) or +50% of credit received (credit spreads).
- *
- * Falls back to maxRisk (spread width) when cost basis is too small (<$25)
- * to avoid wild percentage swings on near-zero-cost positions.
+ * Compute P/L% using the appropriate denominator:
+ * - **Debit spreads** (entryDebit > 0): denominator = cost basis (premium paid).
+ *   profitTargetPct/stopLossPct are "% of premium paid".
+ * - **Credit spreads** (entryDebit < 0): denominator = maxRisk (spread width × qty × 100).
+ *   Using the credit received as denominator produces nonsensical values (e.g., -250%)
+ *   because losses can exceed the credit. maxRisk is the true capital at risk.
+ * - Falls back to maxRisk when cost basis is too small (<$25) to avoid wild swings.
  */
 export function calcPLPct(pl: number, entryDebit: number | null, maxRisk: number | null): number {
-  const costBasis = Math.abs(entryDebit ?? 0);
+  const entry = entryDebit ?? 0;
+
+  // Credit spread: entryDebit is negative → use maxRisk as denominator
+  if (entry < 0) {
+    if (maxRisk && maxRisk !== 0) return (pl / Math.abs(maxRisk)) * 100;
+    // No maxRisk available — fall back to credit received (better than 0)
+    return (pl / Math.abs(entry)) * 100;
+  }
+
+  // Debit spread: use cost basis
+  const costBasis = Math.abs(entry);
   if (costBasis > 25) return (pl / costBasis) * 100;
+
+  // Near-zero cost (e.g., butterfly at even) — use maxRisk
   if (maxRisk && maxRisk !== 0) return (pl / Math.abs(maxRisk)) * 100;
   return 0;
 }
