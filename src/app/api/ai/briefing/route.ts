@@ -705,10 +705,11 @@ function parseAITradeIdeas(text: string): AITradeIdea[] {
   return ideas;
 }
 
-export async function POST() {
+// Support both GET and POST — some proxies/CDNs may convert methods
+async function handleBriefing() {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    return NextResponse.json({ error: 'ANTHROPIC_API_KEY not configured' }, { status: 500 });
+    return NextResponse.json({ error: 'ANTHROPIC_API_KEY not configured. Add it to your environment variables.' }, { status: 500 });
   }
 
   try {
@@ -891,4 +892,12 @@ export async function POST() {
     console.error('[ai/briefing] Error:', message);
     return NextResponse.json({ error: message }, { status: 500 });
   }
+}
+
+export async function POST() {
+  return handleBriefing();
+}
+
+export async function GET() {
+  return handleBriefing();
 }

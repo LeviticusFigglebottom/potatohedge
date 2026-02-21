@@ -236,15 +236,21 @@ function HeatPanel({
         ctx.setLineDash([]);
       }
 
-      // Y-axis labels (strikes)
+      // Y-axis labels (strikes) — show ~6 evenly spaced labels
       if (showYAxis) {
-        const labelEvery = Math.max(1, Math.floor(strikes.length / 6));
+        const numLabels = 6;
+        const labelEvery = Math.max(1, Math.floor(strikes.length / numLabels));
         ctx.fillStyle = '#6b7280';
         ctx.font = '9px "JetBrains Mono"';
         ctx.textAlign = 'right';
         for (let i = 0; i < strikes.length; i += labelEvery) {
           const y = toY(strikes[i]);
-          ctx.fillText(`$${strikes[i]}`, pad.left - 5, y + 3);
+          ctx.fillText(`$${strikes[i].toFixed(0)}`, pad.left - 5, y + 3);
+        }
+        // Always label the last strike
+        if (strikes.length > 1) {
+          const lastY = toY(strikes[strikes.length - 1]);
+          ctx.fillText(`$${strikes[strikes.length - 1].toFixed(0)}`, pad.left - 5, lastY + 3);
         }
       }
 
@@ -508,16 +514,33 @@ export default function GammaHeatmap() {
     const spot = multiGEX.spotPrice;
     const exps = multiGEX.perExpiration;
 
-    // Unique strikes ±8% of spot
+    // Collect strikes near spot with actual exposure data
+    // Use ±4% range, then further limit to ~40 strikes for readability
+    const loBound = spot * 0.96;
+    const hiBound = spot * 1.04;
     const allStrikes = new Set<number>();
     for (const exp of exps) {
       for (const e of exp.exposures) {
-        if (e.strike >= spot * 0.92 && e.strike <= spot * 1.08) {
+        if (e.strike >= loBound && e.strike <= hiBound) {
           allStrikes.add(e.strike);
         }
       }
     }
-    const sortedStrikes = Array.from(allStrikes).sort((a, b) => a - b);
+    let sortedStrikes = Array.from(allStrikes).sort((a, b) => a - b);
+
+    // If still too many strikes, thin to ~40 evenly spaced around spot
+    const MAX_STRIKES = 40;
+    if (sortedStrikes.length > MAX_STRIKES) {
+      const step = Math.ceil(sortedStrikes.length / MAX_STRIKES);
+      // Always keep the strike nearest to spot
+      const nearestIdx = sortedStrikes.reduce((best, s, i) =>
+        Math.abs(s - spot) < Math.abs(sortedStrikes[best] - spot) ? i : best, 0);
+      const thinned = new Set<number>();
+      for (let i = 0; i < sortedStrikes.length; i += step) thinned.add(sortedStrikes[i]);
+      thinned.add(sortedStrikes[nearestIdx]); // ensure spot-nearest is included
+      thinned.add(sortedStrikes[sortedStrikes.length - 1]); // ensure top
+      sortedStrikes = Array.from(thinned).sort((a, b) => a - b);
+    }
 
     // Build index for fast lookup
     const strikeIndex = new Map<number, number>();
@@ -569,7 +592,7 @@ export default function GammaHeatmap() {
       <div className="panel-header">
         <span className="panel-title">Exposure Surface — {symbol}</span>
         <span className="text-[10px] font-mono text-text-muted">
-          {expirations.length} expirations × {strikes.length} strikes | bilinear interpolation
+          {expirations.length} exp × {strikes.length} strikes | ${strikes[0]?.toFixed(0)}–${strikes[strikes.length - 1]?.toFixed(0)} (spot ${formatCurrency(spot)})
         </span>
       </div>
 
