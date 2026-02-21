@@ -705,8 +705,7 @@ function parseAITradeIdeas(text: string): AITradeIdea[] {
   return ideas;
 }
 
-// Support both GET and POST — some proxies/CDNs may convert methods
-async function handleBriefing() {
+export async function GET() {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     return NextResponse.json({ error: 'ANTHROPIC_API_KEY not configured. Add it to your environment variables.' }, { status: 500 });
@@ -895,9 +894,5 @@ async function handleBriefing() {
 }
 
 export async function POST() {
-  return handleBriefing();
-}
-
-export async function GET() {
-  return handleBriefing();
+  return GET();
 }

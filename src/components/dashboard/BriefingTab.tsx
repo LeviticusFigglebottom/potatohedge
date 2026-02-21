@@ -1181,7 +1181,6 @@ export default function BriefingTab() {
       const phaseTimer3 = setTimeout(() => setPhase('Claude is writing the briefing...'), 40000);
 
       const res = await fetch('/api/ai/briefing', {
-        method: 'POST',
         signal: AbortSignal.timeout(120000),
       });
 

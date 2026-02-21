@@ -5,10 +5,9 @@ import { useDashboardStore } from '@/hooks/useDashboardStore';
 import { formatNumber } from '@/lib/utils/format';
 
 /**
- * Horizontal stacked bars showing GEX, Vanna, and Charm contribution
- * per expiration. Helps visualize which expirations dominate the
- * gamma/vanna/charm landscape — critical for anticipating pin risk
- * and expiration-driven vol changes.
+ * Grouped horizontal bar chart: GEX / Vanna / Charm per expiration.
+ * Each metric gets ONE consistent color. Direction (left/right from zero)
+ * indicates positive/negative. Limited to nearest 8 expirations for clarity.
  */
 export default function ExpirationBreakdown() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -33,38 +32,56 @@ export default function ExpirationBreakdown() {
       ctx.scale(dpr, dpr);
 
       const w = rect.width, h = rect.height;
-      const pad = { top: 8, right: 14, bottom: 6, left: 78 };
+      // Reserve space: top for legend, left for expiration labels
+      const pad = { top: 28, right: 14, bottom: 10, left: 82 };
       const cw = w - pad.left - pad.right;
       const ch = h - pad.top - pad.bottom;
 
       ctx.fillStyle = '#0d1117';
       ctx.fillRect(0, 0, w, h);
 
-      const exps = multiGEX.perExpiration;
-      const metrics = [
-        { key: 'totalGEX' as const, label: 'GEX', posColor: '#00e676', negColor: '#ff3d57' },
-        { key: 'totalVanna' as const, label: 'Vanna', posColor: '#a855f7', negColor: '#ff3d57' },
-        { key: 'totalCharm' as const, label: 'Charm', posColor: '#00d4ff', negColor: '#a855f7' },
+      // Limit to 8 nearest expirations for readability
+      const exps = multiGEX.perExpiration.slice(0, 8);
+
+      const METRICS = [
+        { key: 'totalGEX' as const, label: 'GEX', color: '#00e676' },
+        { key: 'totalVanna' as const, label: 'Vanna', color: '#a855f7' },
+        { key: 'totalCharm' as const, label: 'Charm', color: '#38bdf8' },
       ];
 
-      const rowsPerExp = metrics.length;
-      const totalRows = exps.length * rowsPerExp;
-      const groupGap = 6;
-      const barGap = 1;
-      const groupH = (ch - groupGap * (exps.length - 1)) / exps.length;
-      const barH = Math.max(4, (groupH - barGap * (rowsPerExp - 1)) / rowsPerExp);
-
-      // Find max absolute value per metric for independent scaling
-      const maxAbs: Record<string, number> = {};
-      for (const m of metrics) {
-        maxAbs[m.key] = Math.max(1, ...exps.map(e => Math.abs(e[m.key])));
+      // ── Legend at top ──
+      let legX = pad.left;
+      ctx.font = '9px "JetBrains Mono"';
+      for (const m of METRICS) {
+        ctx.fillStyle = m.color;
+        ctx.fillRect(legX, 8, 10, 10);
+        ctx.fillStyle = '#9ca3af';
+        ctx.textAlign = 'left';
+        ctx.fillText(m.label, legX + 14, 17);
+        legX += ctx.measureText(m.label).width + 28;
       }
 
+      // ── Scaling: find global max for normalization ──
+      let globalMax = 1;
+      for (const exp of exps) {
+        for (const m of METRICS) {
+          globalMax = Math.max(globalMax, Math.abs(exp[m.key]));
+        }
+      }
+
+      // ── Layout: groups of 3 bars per expiration ──
+      const groupGap = 8;
+      const barGap = 2;
+      const numMetrics = METRICS.length;
+      const groupH = (ch - groupGap * (exps.length - 1)) / exps.length;
+      const barH = Math.max(5, (groupH - barGap * (numMetrics - 1)) / numMetrics);
+      const halfW = cw / 2;
+      const zeroX = pad.left + halfW;
+
       // Zero line
-      const zeroX = pad.left + cw / 2;
-      ctx.strokeStyle = '#ffffff10';
+      ctx.strokeStyle = '#ffffff18';
       ctx.lineWidth = 1;
-      ctx.setLineDash([3, 3]);
+      ctx.setLineDash([4, 4]);
       ctx.beginPath();
       ctx.moveTo(zeroX, pad.top);
       ctx.lineTo(zeroX, pad.top + ch);
@@ -79,63 +96,58 @@ export default function ExpirationBreakdown() {
         ctx.fillStyle = '#9ca3af';
         ctx.font = '10px "JetBrains Mono"';
         ctx.textAlign = 'right';
-        ctx.fillText(`${exp.expiration.slice(5)} (${exp.dte}d)`, pad.left - 6, groupY + groupH / 2 + 4);
+        ctx.fillText(
+          `${exp.expiration.slice(5)} (${exp.dte}d)`,
+          pad.left - 6,
+          groupY + groupH / 2 + 4,
+        );
 
-        for (let mi = 0; mi < metrics.length; mi++) {
-          const m = metrics[mi];
+        for (let mi = 0; mi < numMetrics; mi++) {
+          const m = METRICS[mi];
           const val = exp[m.key];
-          const norm = val / maxAbs[m.key]; // -1 to +1
+          const norm = val / globalMax; // -1 to +1
+          const barLen = Math.abs(norm) * halfW;
           const barY = groupY + mi * (barH + barGap);
-          const barLen = Math.abs(norm) * (cw / 2);
+          const color = m.color;
+
+          if (barLen < 1) continue;
 
           if (val >= 0) {
-            // Bar extends right from center
-            const gradient = ctx.createLinearGradient(zeroX, barY, zeroX + barLen, barY);
-            gradient.addColorStop(0, hexToRgba(m.posColor, 0.3));
-            gradient.addColorStop(1, hexToRgba(m.posColor, 0.8));
-            ctx.fillStyle = gradient;
-            ctx.beginPath();
-            roundedRect(ctx, zeroX, barY, barLen, barH, 2);
-            ctx.fill();
+            // Right from center
+            const grad = ctx.createLinearGradient(zeroX, 0, zeroX + barLen, 0);
+            grad.addColorStop(0, hexAlpha(color, 0.35));
+            grad.addColorStop(1, hexAlpha(color, 0.85));
+            ctx.fillStyle = grad;
           } else {
-            // Bar extends left from center
-            const gradient = ctx.createLinearGradient(zeroX - barLen, barY, zeroX, barY);
-            gradient.addColorStop(0, hexToRgba(m.negColor, 0.8));
-            gradient.addColorStop(1, hexToRgba(m.negColor, 0.3));
-            ctx.fillStyle = gradient;
-            ctx.beginPath();
-            roundedRect(ctx, zeroX - barLen, barY, barLen, barH, 2);
-            ctx.fill();
+            // Left from center
+            const grad = ctx.createLinearGradient(zeroX - barLen, 0, zeroX, 0);
+            grad.addColorStop(0, hexAlpha(color, 0.85));
+            grad.addColorStop(1, hexAlpha(color, 0.35));
+            ctx.fillStyle = grad;
           }
 
-          // Value label on the bar
-          const labelX = val >= 0 ? zeroX + barLen + 4 : zeroX - barLen - 4;
-          ctx.fillStyle = val >= 0 ? m.posColor : m.negColor;
-          ctx.font = '8px "JetBrains Mono"';
-          ctx.textAlign = val >= 0 ? 'left' : 'right';
-          if (barLen > 20) {
-            ctx.fillText(formatNumber(val), labelX, barY + barH - 1);
+          ctx.beginPath();
+          const bx = val >= 0 ? zeroX : zeroX - barLen;
+          roundedRect(ctx, bx, barY, barLen, barH, 2);
+          ctx.fill();
+
+          // Value label beside bar
+          if (barLen > 18) {
+            const lx = val >= 0 ? zeroX + barLen + 4 : zeroX - barLen - 4;
+            ctx.fillStyle = color;
+            ctx.font = '8px "JetBrains Mono"';
+            ctx.textAlign = val >= 0 ? 'left' : 'right';
+            ctx.fillText(formatNumber(val), lx, barY + barH - 1);
           }
         }
       }
-
-      // Metric legend at top-right
-      const legX = w - 14;
-      ctx.font = '8px "JetBrains Mono"';
-      ctx.textAlign = 'right';
-      metrics.forEach((m, i) => {
-        ctx.fillStyle = m.posColor;
-        ctx.fillRect(legX - 48, pad.top + i * 12, 6, 6);
-        ctx.fillStyle = '#9ca3af';
-        ctx.fillText(m.label, legX, pad.top + i * 12 + 7);
-      });
     };
 
     draw();
 
-    const resizeObserver = new ResizeObserver(draw);
-    resizeObserver.observe(container);
-    return () => resizeObserver.disconnect();
+    const obs = new ResizeObserver(draw);
+    obs.observe(container);
+    return () => obs.disconnect();
   }, [multiGEX]);
 
   return (
@@ -143,7 +155,7 @@ export default function ExpirationBreakdown() {
       <div className="panel-header">
         <span className="panel-title">Exposure by Expiration — {symbol}</span>
       </div>
-      <div ref={containerRef} className="relative flex-1 min-h-[160px]">
+      <div ref={containerRef} className="relative flex-1 min-h-[180px]">
         {!multiGEX?.perExpiration?.length ? (
           <div className="absolute inset-0 flex items-center justify-center text-text-muted text-sm font-mono">
             No data
@@ -156,14 +168,17 @@ export default function ExpirationBreakdown() {
   );
 }
 
-function hexToRgba(hex: string, alpha: number): string {
+function hexAlpha(hex: string, a: number): string {
   const r = parseInt(hex.slice(1, 3), 16);
   const g = parseInt(hex.slice(3, 5), 16);
   const b = parseInt(hex.slice(5, 7), 16);
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  return `rgba(${r},${g},${b},${a})`;
 }
 
-function roundedRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
+function roundedRect(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, w: number, h: number, r: number,
+) {
   r = Math.min(r, w / 2, h / 2);
   ctx.moveTo(x + r, y);
   ctx.lineTo(x + w - r, y);

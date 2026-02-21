@@ -156,7 +156,7 @@ function HeatPanel({
       const pad = {
         top: 22,
         right: 42,
-        bottom: showXAxis ? 34 : 8,
+        bottom: showXAxis ? 42 : 8,
         left: showYAxis ? 52 : 8,
       };
       const cw = w - pad.left - pad.right;
@@ -236,7 +236,7 @@ function HeatPanel({
         ctx.setLineDash([]);
       }
 
-      // Y-axis labels (strikes) — show ~6 evenly spaced labels
+      // Y-axis: strike price labels — show ~6 evenly spaced
       if (showYAxis) {
         const numLabels = 6;
         const labelEvery = Math.max(1, Math.floor(strikes.length / numLabels));
@@ -252,20 +252,38 @@ function HeatPanel({
           const lastY = toY(strikes[strikes.length - 1]);
           ctx.fillText(`$${strikes[strikes.length - 1].toFixed(0)}`, pad.left - 5, lastY + 3);
         }
+        // Rotated Y-axis title
+        ctx.save();
+        ctx.fillStyle = '#4b5563';
+        ctx.font = '8px "JetBrains Mono"';
+        ctx.textAlign = 'center';
+        ctx.translate(8, pad.top + ch / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillText('STRIKE PRICE', 0, 0);
+        ctx.restore();
       }
 
-      // X-axis labels (expirations)
+      // X-axis: expiration date labels
       if (showXAxis) {
         ctx.fillStyle = '#6b7280';
         ctx.font = '9px "JetBrains Mono"';
         ctx.textAlign = 'center';
+        // Show a subset of labels if too many expirations
+        const maxXLabels = Math.floor(cw / 50);
+        const xStep = Math.max(1, Math.ceil(expirations.length / maxXLabels));
         expirations.forEach((exp, i) => {
+          if (i % xStep !== 0 && i !== expirations.length - 1) return;
           const x = toX(i);
+          ctx.fillStyle = '#6b7280';
           ctx.fillText(exp.date.slice(5), x, pad.top + ch + 14);
           ctx.fillStyle = '#555570';
           ctx.fillText(`${exp.dte}d`, x, pad.top + ch + 26);
-          ctx.fillStyle = '#6b7280';
         });
+        // X-axis title
+        ctx.fillStyle = '#4b5563';
+        ctx.font = '8px "JetBrains Mono"';
+        ctx.textAlign = 'center';
+        ctx.fillText('EXPIRATION', pad.left + cw / 2, pad.top + ch + 34);
       }
 
       // Panel title
@@ -306,7 +324,7 @@ function HeatPanel({
     if (!canvas || !container) return;
     const rect = canvas.getBoundingClientRect();
     const my = e.clientY - rect.top;
-    const pad = { top: 22, bottom: showXAxis ? 34 : 8 };
+    const pad = { top: 22, bottom: showXAxis ? 42 : 8 };
     const ch = rect.height - pad.top - pad.bottom;
     const frac = 1 - (my - pad.top) / ch;
     const minS = strikes[0], maxS = strikes[strikes.length - 1];
