@@ -105,13 +105,22 @@ async function extractFirstFileFromZip(buf: Uint8Array): Promise<string> {
 
 /**
  * Parse swap CSV and aggregate by underlier ticker.
+ * Uses streaming line iteration to avoid doubling memory with split('\n').
  */
 function parseSwapCSV(csv: string, today: string, weekEnd: string): Map<string, SwapData> {
   const map = new Map<string, SwapData>();
-  const lines = csv.split('\n');
-  if (lines.length < 2) return map;
 
-  const header = lines[0].toLowerCase();
+  // Reject excessively large CSVs to prevent OOM on serverless (2GB limit)
+  if (csv.length > 80_000_000) {
+    console.warn(`[dtcc] CSV too large (${(csv.length / 1e6).toFixed(1)}MB), skipping to prevent OOM`);
+    return map;
+  }
+
+  // Read header line
+  let headerEnd = csv.indexOf('\n');
+  if (headerEnd === -1) return map;
+
+  const header = csv.substring(0, headerEnd).toLowerCase();
   const cols = header.split(',').map(c => c.trim().replace(/"/g, ''));
 
   const underlierIdx = cols.findIndex(c =>
@@ -129,9 +138,21 @@ function parseSwapCSV(csv: string, today: string, weekEnd: string): Map<string, 
 
   if (underlierIdx === -1 || expirationIdx === -1) return map;
 
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
+  // Iterate line-by-line without creating a massive array via split('\n')
+  let pos = headerEnd + 1;
+  while (pos < csv.length) {
+    let lineEnd = csv.indexOf('\n', pos);
+    if (lineEnd === -1) lineEnd = csv.length;
+
+    // Trim inline to avoid substring allocation for blank lines
+    let lineStart = pos;
+    let lineEndTrim = lineEnd;
+    while (lineStart < lineEndTrim && (csv.charCodeAt(lineStart) === 32 || csv.charCodeAt(lineStart) === 13)) lineStart++;
+    while (lineEndTrim > lineStart && (csv.charCodeAt(lineEndTrim - 1) === 32 || csv.charCodeAt(lineEndTrim - 1) === 13)) lineEndTrim--;
+    pos = lineEnd + 1;
+
+    if (lineStart >= lineEndTrim) continue;
+    const line = csv.substring(lineStart, lineEndTrim);
 
     const fields = line.split(',').map(f => f.trim().replace(/"/g, ''));
 

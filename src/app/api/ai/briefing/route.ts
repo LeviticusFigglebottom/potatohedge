@@ -16,7 +16,7 @@ import {
 } from '@/lib/math/analytics';
 import { generateRecommendations, type RecommendationInput, type TradeIdea } from '@/lib/math/recommendations';
 import type { EquityBar } from '@/lib/providers/equityBars';
-import { getMarketSwapSummary } from '@/lib/providers/dtcc';
+// DTCC swap ZIP skipped in this route — decompressing peaks at 200-400MB, OOM-kills on Vercel
 import { fetchRegSHOThreshold, fetchShortInterest, fetchShortSaleVolume, type ShortInterestData, type ShortVolumeData } from '@/lib/providers/finra';
 import { scanMarketFlow, type FlowResult } from '@/lib/providers/polygonFlow';
 
@@ -42,7 +42,7 @@ const INDICES = ['SPY', 'QQQ', 'IWM'];
 const SECTOR_ETFS = ['XLF', 'XLE', 'XLK', 'XLV', 'XLI', 'XLRE', 'XLU', 'XLC', 'XLB', 'XLP', 'XLY'];
 const MAG7 = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA'];
 const ALL_TICKERS = [...INDICES, ...SECTOR_ETFS, ...MAG7];
-const CONCURRENCY = 5;
+const CONCURRENCY = 3; // Reduced from 5 to stay under Vercel's 2048MB memory limit
 
 interface StockScan {
   symbol: string;
@@ -739,9 +739,11 @@ export async function GET() {
 
       // Start institutional data fetches IMMEDIATELY — they run in parallel
       // with stock scanning (saves 5-10s vs running them sequentially after)
+      // NOTE: DTCC swap ZIP skipped — decompressing the cumulative equity swap
+      // report peaks at 200-400MB which OOM-kills on Vercel's 2048MB limit.
       const institutionalPromise = Promise.all([
         getQuote('VIX').catch(() => null),
-        raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 4000, emptySwap),
+        Promise.resolve(emptySwap),
         raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
         raceTimeout(fetchShortInterest().catch(() => new Map<string, ShortInterestData>()), 5000, new Map<string, ShortInterestData>()),
         raceTimeout(fetchShortSaleVolume().catch(() => new Map<string, ShortVolumeData>()), 5000, new Map<string, ShortVolumeData>()),

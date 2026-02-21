@@ -95,8 +95,9 @@ export async function GET(request: NextRequest) {
     const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
       Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 
+    // DTCC swap ZIP skipped — decompressing peaks at 200-400MB, OOM-kills on Vercel
     const swapT = Date.now();
-    const swapResult = await raceTimeout(dtccMod.getSwapDataForTicker(ticker).catch((e: Error) => ({ _err: e.message })), 4000, { _err: 'timeout' });
+    const swapResult = { _err: 'skipped-oom' };
     const swapMs = Date.now() - swapT;
 
     const regSHOT = Date.now();

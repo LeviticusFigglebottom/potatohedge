@@ -255,8 +255,9 @@ export async function GET(request: NextRequest) {
 
     const emptyFlow = { tickerFlow: { ticker, netPremium: 0, callPremium: 0, putPremium: 0, callVolume: 0, putVolume: 0, contractsActive: 0 }, alerts: [] as { tradeType: string; sentiment: string }[] };
     const emptyIndicators = { vix: null, skew: null };
+    // DTCC swap ZIP skipped — decompressing peaks at 200-400MB, OOM-kills on Vercel
     const [swapData, regSHOSet, siData, flowData, indicators] = await Promise.all([
-      raceTimeout(getSwapDataForTicker(ticker).catch(() => null), 4000, null),
+      Promise.resolve(null as Awaited<ReturnType<typeof getSwapDataForTicker>>),
       raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
       raceTimeout(getShortInterestForTicker(ticker).catch(() => null), 5000, null),
       raceTimeout(scanTickerFlow(ticker).catch(() => emptyFlow), 5000, emptyFlow),
