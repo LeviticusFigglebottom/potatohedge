@@ -37,12 +37,12 @@ function isMarketOpenNow(): boolean {
   return time >= 570 && time <= 960; // 9:30 AM - 4:00 PM ET
 }
 
-// Stocks to analyze for the briefing
+// Stocks to analyze for the briefing (reduced from 21 to 14 for memory)
 const INDICES = ['SPY', 'QQQ', 'IWM'];
-const SECTOR_ETFS = ['XLF', 'XLE', 'XLK', 'XLV', 'XLI', 'XLRE', 'XLU', 'XLC', 'XLB', 'XLP', 'XLY'];
-const MAG7 = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA'];
+const SECTOR_ETFS = ['XLF', 'XLE', 'XLK', 'XLV', 'XLI'];
+const MAG7 = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA'];
 const ALL_TICKERS = [...INDICES, ...SECTOR_ETFS, ...MAG7];
-const CONCURRENCY = 5;
+const CONCURRENCY = 3;
 
 interface StockScan {
   symbol: string;
@@ -143,11 +143,11 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
     const [quote, expirations, historyBars] = await Promise.all([
       getQuote(ticker),
       getExpirations(ticker),
-      fetchEquityBars(ticker, 250),
+      fetchEquityBars(ticker, 120), // 120 bars (vs 250) to reduce memory
     ]);
     const spotPrice = quote.last;
     if (!spotPrice || spotPrice <= 0) return null;
-    const nearExps = expirations.slice(0, 3); // 3 expirations for briefing (balance speed vs accuracy)
+    const nearExps = expirations.slice(0, 2); // 2 expirations to reduce memory
     if (nearExps.length === 0) return null;
 
     const chains = await Promise.all(
@@ -791,7 +791,7 @@ export async function GET() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const body: Record<string, any> = {
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 8192,
+      max_tokens: 4096,
       messages: [{ role: 'user', content: prompt }],
     };
 

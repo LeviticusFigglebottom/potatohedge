@@ -35,15 +35,18 @@ export async function GET(_req: NextRequest) {
       alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
     };
 
-    // ── All data sources in parallel ──
-    const [swapSummary, regSHOResult, siResult, svResult, indicators, flowResult] = await Promise.all([
+    // ── Data sources: fetch lighter sources first, then heavy flow scan ──
+    // Split into two phases to reduce peak memory (combined was >2GB → OOM)
+    const [swapSummary, regSHOResult, siResult, svResult, indicators] = await Promise.all([
       raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 6000, emptySwap),
       raceTimeout(fetchRegSHOWithDate().catch(() => emptyRegSHO), 5000, emptyRegSHO),
       raceTimeout(fetchShortInterestWithDate().catch(() => emptySI), 6000, emptySI),
       raceTimeout(fetchShortSaleVolumeWithDate().catch(() => emptySV), 6000, emptySV),
       raceTimeout(getMarketIndicators().catch(() => emptyIndicators), 5000, emptyIndicators),
-      raceTimeout(scanMarketFlow().catch(() => emptyFlow), 10000, emptyFlow),
     ]);
+
+    // Flow scan runs after lighter data is fetched and ready to be serialized
+    const flowResult = await raceTimeout(scanMarketFlow().catch(() => emptyFlow), 8000, emptyFlow);
 
     // ── Process short data (each section isolated so one bad source can't crash all) ──
     let regSHOList: string[] = [];
@@ -143,8 +146,8 @@ export async function GET(_req: NextRequest) {
 
       // Options Flow (DIY from Polygon)
       marketFlow: flowResult?.flow ?? null,
-      flowAlerts: (flowResult?.alerts ?? []).slice(0, 30),
-      perTickerFlow: flowResult?.perTickerFlow ?? [],
+      flowAlerts: (flowResult?.alerts ?? []).slice(0, 20),
+      perTickerFlow: (flowResult?.perTickerFlow ?? []).slice(0, 10),
       flowDeveloper: flowResult?.isDeveloper ?? false,
 
       // Short Pressure
