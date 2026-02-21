@@ -20,8 +20,9 @@ function apiKey(): string {
   return process.env.POLYGON_API_KEY || '';
 }
 
-// Major indices + mega-caps for broad market flow picture
-const WATCHLIST = ['SPY', 'QQQ', 'IWM', 'NVDA', 'TSLA', 'AAPL', 'AMZN', 'META', 'MSFT', 'AMD'];
+// Major indices + top mega-caps for broad market flow picture
+// Reduced from 10 to 5 to stay under Vercel 2GB memory limit
+const WATCHLIST = ['SPY', 'QQQ', 'IWM', 'NVDA', 'TSLA'];
 
 // ─── Types ──────────────────────────────────────────────────
 
@@ -85,7 +86,7 @@ let developerPlan: boolean | null = null;
 async function fetchSnapshotPage(ticker: string): Promise<PolygonOptionSnapshot[]> {
   const url = new URL(`${BASE}/v3/snapshot/options/${ticker}`);
   url.searchParams.set('apiKey', apiKey());
-  url.searchParams.set('limit', '250');
+  url.searchParams.set('limit', '100');
 
   const res = await fetch(url.toString(), {
     signal: AbortSignal.timeout(FETCH_TIMEOUT),
@@ -298,10 +299,15 @@ export async function scanMarketFlow(): Promise<FlowResult> {
     };
   }
 
-  // Fetch all watchlist snapshots in parallel
-  const results = await Promise.allSettled(
-    WATCHLIST.map(t => fetchSnapshotPage(t))
-  );
+  // Fetch watchlist snapshots in small batches to limit peak memory
+  const BATCH = 2;
+  const results: PromiseSettledResult<PolygonOptionSnapshot[]>[] = [];
+  for (let i = 0; i < WATCHLIST.length; i += BATCH) {
+    const batch = await Promise.allSettled(
+      WATCHLIST.slice(i, i + BATCH).map(t => fetchSnapshotPage(t))
+    );
+    results.push(...batch);
+  }
 
   let totalCallPremium = 0, totalPutPremium = 0;
   let totalCallVolume = 0, totalPutVolume = 0;

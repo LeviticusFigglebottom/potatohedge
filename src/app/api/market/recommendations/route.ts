@@ -123,11 +123,11 @@ export async function GET(request: NextRequest) {
     const [quote, expirations, historyBars] = await Promise.all([
       getQuote(ticker),
       getExpirations(ticker),
-      fetchEquityBars(ticker, 250),
+      fetchEquityBars(ticker, 120),
     ]);
 
     const spotPrice = quote.last;
-    const nearExps = expirations.slice(0, 3); // 3 expirations max (was 4) to reduce API calls
+    const nearExps = expirations.slice(0, 2); // 2 expirations to reduce memory
 
     const chains = await Promise.all(
       nearExps.map(e => getOptionsChain(ticker, e.date).catch(() => null))

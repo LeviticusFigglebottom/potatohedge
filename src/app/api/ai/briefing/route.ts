@@ -17,10 +17,10 @@ import {
 import { generateRecommendations, type RecommendationInput, type TradeIdea } from '@/lib/math/recommendations';
 import type { EquityBar } from '@/lib/providers/equityBars';
 import { getMarketSwapSummary } from '@/lib/providers/dtcc';
-import { fetchRegSHOThreshold, fetchShortInterest, fetchShortSaleVolume, type ShortInterestData, type ShortVolumeData } from '@/lib/providers/finra';
-import { scanMarketFlow, type FlowResult } from '@/lib/providers/polygonFlow';
+import { fetchRegSHOThreshold } from '@/lib/providers/finra';
+import type { FlowResult } from '@/lib/providers/polygonFlow';
 
-export const maxDuration = 60; // Briefing: scan 21 stocks + Claude analysis
+export const maxDuration = 60;
 
 function isMarketOpenNow(): boolean {
   const fmt = new Intl.DateTimeFormat('en-US', {
@@ -37,12 +37,12 @@ function isMarketOpenNow(): boolean {
   return time >= 570 && time <= 960; // 9:30 AM - 4:00 PM ET
 }
 
-// Stocks to analyze for the briefing (reduced from 21 to 14 for memory)
+// Stocks to analyze — reduced aggressively to stay under Vercel 2GB memory limit
+// (14 stocks + scanMarketFlow + short interest Maps was causing OOM)
 const INDICES = ['SPY', 'QQQ', 'IWM'];
-const SECTOR_ETFS = ['XLF', 'XLE', 'XLK', 'XLV', 'XLI'];
-const MAG7 = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA'];
-const ALL_TICKERS = [...INDICES, ...SECTOR_ETFS, ...MAG7];
-const CONCURRENCY = 3;
+const KEY_STOCKS = ['NVDA', 'TSLA', 'AAPL', 'MSFT', 'AMZN'];
+const ALL_TICKERS = [...INDICES, ...KEY_STOCKS];
+const CONCURRENCY = 2;
 
 interface StockScan {
   symbol: string;
@@ -143,11 +143,11 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
     const [quote, expirations, historyBars] = await Promise.all([
       getQuote(ticker),
       getExpirations(ticker),
-      fetchEquityBars(ticker, 120), // 120 bars (vs 250) to reduce memory
+      fetchEquityBars(ticker, 80), // 80 bars to reduce memory
     ]);
     const spotPrice = quote.last;
     if (!spotPrice || spotPrice <= 0) return null;
-    const nearExps = expirations.slice(0, 2); // 2 expirations to reduce memory
+    const nearExps = expirations.slice(0, 1); // 1 expiration only to reduce memory
     if (nearExps.length === 0) return null;
 
     const chains = await Promise.all(
@@ -329,8 +329,7 @@ function buildBriefingPrompt(
   flowData: FlowResult,
 ): string {
   const indices = stocks.filter(s => INDICES.includes(s.symbol));
-  const sectors = stocks.filter(s => SECTOR_ETFS.includes(s.symbol));
-  const mag7 = stocks.filter(s => MAG7.includes(s.symbol));
+  const keyStocks = stocks.filter(s => KEY_STOCKS.includes(s.symbol));
 
   const fmtStock = (s: StockScan) => {
     const gexLabel = s.totalGEX >= 0 ? `+${abbr(s.totalGEX)}` : abbr(s.totalGEX);
@@ -387,11 +386,8 @@ VIX: ${vixPrice.toFixed(2)} (${vixChangePct >= 0 ? '+' : ''}${vixChangePct.toFix
 ─── INDEX ANALYSIS ───
 ${indices.map(fmtStock).join('\n\n')}
 
-─── SECTOR ETFs ───
-${sectors.map(fmtStock).join('\n\n')}
-
-─── MAGNIFICENT 7 ───
-${mag7.map(fmtStock).join('\n\n')}`;
+─── KEY STOCKS ───
+${keyStocks.map(fmtStock).join('\n\n')}`;
 
   // Real-time options flow data
   if (flowData.flow.tickersScanned > 0) {
@@ -524,7 +520,7 @@ Then analyze:
 
 3. **INDEX DIVERGENCES** — Are SPY, QQQ, IWM aligned or divergent? What does the split mean? Is this rotation or broad trend? Which index has the cleanest directional setup based on gamma+vanna+charm alignment?
 
-4. **MAGNIFICENT 7 BREAKDOWN** — For each Mag7 stock with notable positioning, state the directional lean and which Greek(s) drive it. Flag any that diverge from their index. Count how many are long vs short — does narrow leadership make QQQ vulnerable?
+4. **KEY STOCKS BREAKDOWN** — For each key stock with notable positioning, state the directional lean and which Greek(s) drive it. Flag any that diverge from their index.
 
 ${flowData.flow.tickersScanned > 0 ? '5. **OPTIONS FLOW ANALYSIS** — Analyze the real-time options premium flow. What does the net premium tell us? Which tickers have the most aggressive institutional positioning? Are sweeps/blocks confirming or diverging from dealer gamma positioning? Cross-reference flow direction with GEX regime for each ticker.\n\n' : ''}${swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0 ? '6. **SWAP MATURITIES** — Interpret swap maturities. Extreme clusters create forced dealer rebalancing. Cross-reference with flow alerts: are institutions positioning ahead of maturity unwinds?\n\n' : ''}${regSHOList.length > 0 || shortInterestData.length > 0 ? '7. **SHORT INTEREST / REG SHO** — Notable names with persistent FTDs or high days-to-cover. Cross-reference with options flow: are shorts being squeezed (bullish flow + high SI)?\n\n' : ''}8. **KEY LEVELS** — For SPY specifically: gamma flip, call wall, put wall, max pain. What happens at each level.
 
@@ -726,22 +722,16 @@ export async function GET() {
       topMaturities: [] as { symbol: string; count: number; notional: number }[],
       asOf: '',
     };
-    const emptyFlow: FlowResult = {
-      flow: { netCallPremium: 0, netPutPremium: 0, netPremium: 0, totalCallVolume: 0, totalPutVolume: 0, putCallRatio: 0, sentiment: 'neutral', tickersScanned: 0, contractsAnalyzed: 0 },
-      alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
-    };
 
-    // Start institutional data fetches IMMEDIATELY — they run in parallel
-    // with stock scanning (saves 5-10s vs running them sequentially after)
+    // Start lightweight institutional data fetches in parallel with stock scanning
+    // REMOVED scanMarketFlow, fetchShortInterest, fetchShortSaleVolume to avoid OOM
+    // (those are available in the dedicated /api/market/institutional endpoint)
     const institutionalPromise = Promise.all([
       getQuote('VIX').catch(() => null),
       raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 4000, emptySwap),
       raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
-      raceTimeout(fetchShortInterest().catch(() => new Map<string, ShortInterestData>()), 5000, new Map<string, ShortInterestData>()),
-      raceTimeout(fetchShortSaleVolume().catch(() => new Map<string, ShortVolumeData>()), 5000, new Map<string, ShortVolumeData>()),
-      raceTimeout(scanMarketFlow().catch(() => emptyFlow), 8000, emptyFlow),
     ]);
-    phase('Institutional data fetches started');
+    phase('Lightweight institutional data fetches started');
 
     // Phase 1: Scan all stocks in parallel batches (runs concurrently with institutional data)
     const results: StockScan[] = [];
@@ -755,29 +745,20 @@ export async function GET() {
     phase(`Stock scanning done: ${results.length}/${ALL_TICKERS.length} scanned`);
 
     // Wait for institutional data (likely already done since stock scanning takes longer)
-    const [vixQuote, swapSummary, regSHOSet, shortInterestMap, shortVolumeMap, flowResult] = await institutionalPromise;
+    const [vixQuote, swapSummary, regSHOSet] = await institutionalPromise;
     phase('Institutional data ready');
     const vixPrice = vixQuote?.last ?? 0;
     const vixChangePct = vixQuote?.changePct ?? 0;
     const regSHOList = Array.from(regSHOSet).filter(s => /^[A-Z]+$/.test(s)).sort();
 
-    // Build short interest highlights (3-100 DTC, meaningful positions only — OTC data)
+    // Empty flow result — flow data is available from /api/market/institutional
+    const emptyFlow: FlowResult = {
+      flow: { netCallPremium: 0, netPutPremium: 0, netPremium: 0, totalCallVolume: 0, totalPutVolume: 0, putCallRatio: 0, sentiment: 'neutral', tickersScanned: 0, contractsAnalyzed: 0 },
+      alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
+    };
+    const flowResult = emptyFlow;
     const shortInterestData: { symbol: string; daysToCover: number; shortInterest: number }[] = [];
-    for (const [sym, data] of shortInterestMap) {
-      if (data.daysToCover >= 3 && data.daysToCover <= 100 && data.shortInterest >= 50000 && data.avgDailyVolume >= 1000) {
-        shortInterestData.push({ symbol: sym, daysToCover: data.daysToCover, shortInterest: data.shortInterest });
-      }
-    }
-    shortInterestData.sort((a, b) => b.daysToCover - a.daysToCover);
-
-    // Build short volume highlights (>40% short ratio with significant volume)
     const shortVolumeData: { symbol: string; shortRatio: number; shortVolume: number; totalVolume: number }[] = [];
-    for (const [sym, data] of shortVolumeMap) {
-      if (data.shortRatio > 0.40 && data.totalVolume > 100000) {
-        shortVolumeData.push({ symbol: sym, shortRatio: data.shortRatio, shortVolume: data.shortVolume, totalVolume: data.totalVolume });
-      }
-    }
-    shortVolumeData.sort((a, b) => b.shortRatio - a.shortRatio);
 
     if (results.length === 0) {
       return NextResponse.json({ error: 'Failed to scan any stocks' }, { status: 500 });
@@ -791,7 +772,7 @@ export async function GET() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const body: Record<string, any> = {
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 4096,
+      max_tokens: 3000,
       messages: [{ role: 'user', content: prompt }],
     };
 

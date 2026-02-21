@@ -10,7 +10,7 @@ import { getMarketIndicators, isFREDAvailable } from '@/lib/providers/fred';
 import { scanMarketFlow, type FlowResult } from '@/lib/providers/polygonFlow';
 import { saveDaily, type HistoryRecord } from '@/lib/persistence';
 
-export const maxDuration = 15;
+export const maxDuration = 20;
 
 /** Race a promise against a hard deadline */
 function raceTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
@@ -35,18 +35,22 @@ export async function GET(_req: NextRequest) {
       alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
     };
 
-    // ── Data sources: fetch lighter sources first, then heavy flow scan ──
-    // Split into two phases to reduce peak memory (combined was >2GB → OOM)
-    const [swapSummary, regSHOResult, siResult, svResult, indicators] = await Promise.all([
+    // ── Data sources: fetch sequentially to limit peak memory (parallel was >2GB → OOM) ──
+    // Phase 1: DTCC + FRED (lightest)
+    const [swapSummary, indicators] = await Promise.all([
       raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 6000, emptySwap),
-      raceTimeout(fetchRegSHOWithDate().catch(() => emptyRegSHO), 5000, emptyRegSHO),
-      raceTimeout(fetchShortInterestWithDate().catch(() => emptySI), 6000, emptySI),
-      raceTimeout(fetchShortSaleVolumeWithDate().catch(() => emptySV), 6000, emptySV),
       raceTimeout(getMarketIndicators().catch(() => emptyIndicators), 5000, emptyIndicators),
     ]);
 
-    // Flow scan runs after lighter data is fetched and ready to be serialized
-    const flowResult = await raceTimeout(scanMarketFlow().catch(() => emptyFlow), 8000, emptyFlow);
+    // Phase 2: FINRA data (medium)
+    const [regSHOResult, siResult, svResult] = await Promise.all([
+      raceTimeout(fetchRegSHOWithDate().catch(() => emptyRegSHO), 5000, emptyRegSHO),
+      raceTimeout(fetchShortInterestWithDate().catch(() => emptySI), 6000, emptySI),
+      raceTimeout(fetchShortSaleVolumeWithDate().catch(() => emptySV), 6000, emptySV),
+    ]);
+
+    // Phase 3: Polygon flow scan (heaviest — runs alone to limit peak memory)
+    const flowResult = await raceTimeout(scanMarketFlow().catch(() => emptyFlow), 10000, emptyFlow);
 
     // ── Process short data (each section isolated so one bad source can't crash all) ──
     let regSHOList: string[] = [];
