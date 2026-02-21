@@ -40,8 +40,9 @@ export interface SnapshotData {
   iv: { currentIV: number; ivRank: number; ivPercentile: number; iv30dMA: number; iv52wHigh: number; iv52wLow: number; hvCurrent: number; ivHvRatio: number; interpretation: string };
   termStructure: { expiration: string; dte: number; atmIV: number }[];
   skewSurface: { expiration: string; dte: number; points: { strike: number; iv: number; type: string; delta: number }[] }[];
-  historicalVol: { hv20: number; hv60: number };
-  ivTimeSeries?: { time: number; hv20: number; ivProxy: number; ivRank: number }[];
+  historicalVol: { hv10: number; hv20: number; hv30: number; hv60: number };
+  ivTimeSeries?: { time: number; hv10: number; hv20: number; hv30: number; hv60: number; ivProxy: number; ivRank: number }[];
+  volCone?: { window: number; current: number; p5: number; p25: number; median: number; p75: number; p95: number }[];
   vix?: { price: number; change: number; changePct: number } | null;
   vixTimeSeries?: { time: number; vix: number }[];
   skew?: { current: number; previous: number; change: number; changePercent: number; date: string } | null;
