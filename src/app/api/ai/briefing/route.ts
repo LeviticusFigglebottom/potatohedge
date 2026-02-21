@@ -83,6 +83,14 @@ interface StockScan {
   nearestDTE: number;
   weeklyExp?: string;
   monthlyExp?: string;
+  // Volatility regime context
+  vrp: number; // IV - HV (Volatility Risk Premium in decimal)
+  hv10: number;
+  hv30: number;
+  hv60: number;
+  termStructureDirection: 'contango' | 'backwardation' | 'flat';
+  nearTermIV: number;
+  farTermIV: number;
   // Intraday price action
   open: number;
   high: number;
@@ -254,6 +262,29 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
     const profile = computeStockProfile(historyBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c })), spotPrice, hvCurrent);
     const correlationCtx = computeQuickCorrelationCtx(historyBars, hvCurrent);
 
+    // Additional HV windows for vol regime context
+    const hv10 = computeHistoricalVolatility(closes, 10);
+    const hv30 = computeHistoricalVolatility(closes, 30);
+    const hv60 = computeHistoricalVolatility(closes, 60);
+    const vrp = currentIV - hvCurrent; // Volatility Risk Premium
+
+    // Term structure direction from multiple chains
+    let nearTermIV = currentIV;
+    let farTermIV = currentIV;
+    let termStructureDirection: 'contango' | 'backwardation' | 'flat' = 'flat';
+    if (chains.length >= 2) {
+      const getChainATMIV = (chain: typeof chains[0]) => {
+        const atm = [...chain.calls, ...chain.puts]
+          .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < atmTolerance && o.impliedVolatility > 0.01)
+          .sort((a, b) => Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice));
+        return atm.length > 0 ? atm.slice(0, 4).reduce((s, o) => s + o.impliedVolatility, 0) / Math.min(4, atm.length) : 0;
+      };
+      nearTermIV = getChainATMIV(chains[0]) || currentIV;
+      farTermIV = getChainATMIV(chains[chains.length - 1]) || currentIV;
+      const diff = farTermIV - nearTermIV;
+      termStructureDirection = diff > 0.005 ? 'contango' : diff < -0.005 ? 'backwardation' : 'flat';
+    }
+
     // Resolve expiration dates from the full list (not just the 3 we fetched chains for)
     // This ensures we can find a monthly expiration even if it's not in nearExps
     const weeklyExp = expirations.find(e => e.dte >= 5 && e.dte <= 10)?.date;
@@ -298,6 +329,9 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
       nearestDTE: nearExps[0]?.dte || 0,
       weeklyExp,
       monthlyExp,
+      // Volatility regime
+      vrp, hv10, hv30, hv60,
+      termStructureDirection, nearTermIV, farTermIV,
       // Intraday price action
       open: quote.open,
       high: quote.high,
@@ -339,8 +373,11 @@ function buildBriefingPrompt(
     const range = s.high > 0 && s.low > 0 ? s.high - s.low : 0;
     const rangePos = range > 0 ? ((s.price - s.low) / range * 100).toFixed(0) : '—';
     const relVol = s.avgVolume > 0 ? (s.volume / s.avgVolume * 100).toFixed(0) : '—';
+    const vrpPp = s.vrp * 100;
+    const vrpLabel = vrpPp > 0 ? `+${vrpPp.toFixed(1)}pp (sellers' edge)` : `${vrpPp.toFixed(1)}pp (buyers' edge)`;
     const lines = [
       `${s.symbol}: $${s.price.toFixed(2)} (${s.changePct >= 0 ? '+' : ''}${s.changePct.toFixed(2)}%) | Bias: ${s.biasScore > 0 ? '+' : ''}${s.biasScore} ${s.bias} | Gamma: ${s.gammaRegime} | IV: ${s.volRegime} (rank ${s.ivRank}, ${(s.currentIV * 100).toFixed(0)}% IV vs ${(s.hvCurrent * 100).toFixed(0)}% HV) | PCR: ${s.volumePCR.toFixed(2)} | Skew: ${s.skewBias}`,
+      `  VRP: ${vrpLabel} | HV10: ${(s.hv10 * 100).toFixed(0)}% | HV20: ${(s.hvCurrent * 100).toFixed(0)}% | HV30: ${(s.hv30 * 100).toFixed(0)}% | HV60: ${(s.hv60 * 100).toFixed(0)}% | Term Structure: ${s.termStructureDirection} (near ${(s.nearTermIV * 100).toFixed(0)}% → far ${(s.farTermIV * 100).toFixed(0)}%)`,
       `  GEX: ${gexLabel} | DEX: ${dexLabel} | Vanna: ${s.vannaRegime} | Charm: ${s.charmRegime} | ATR: ${s.atrPercent.toFixed(1)}% | Daily 1σ: ${(s.dailySigma * 100).toFixed(2)}%`,
       `  Intraday: O=$${s.open.toFixed(2)} H=$${s.high.toFixed(2)} L=$${s.low.toFixed(2)} | Range: $${range.toFixed(2)} (${rangePos}% from low) | Vol: ${(s.volume / 1e6).toFixed(1)}M (${relVol}% of avg)`,
       `  Levels: γFlip=${s.gammaFlip ? '$' + s.gammaFlip.toFixed(0) : 'N/A'} CW=${s.callWall ? '$' + s.callWall.toFixed(0) : 'N/A'} PW=${s.putWall ? '$' + s.putWall.toFixed(0) : 'N/A'} MaxPain=$${s.maxPain.toFixed(0)}`,
@@ -392,6 +429,22 @@ ${sectors.map(fmtStock).join('\n\n')}
 
 ─── MAGNIFICENT 7 ───
 ${mag7.map(fmtStock).join('\n\n')}`;
+
+  // Volatility Regime Summary
+  const vrpStocks = stocks.filter(s => INDICES.includes(s.symbol));
+  if (vrpStocks.length > 0) {
+    prompt += `\n\n─── VOLATILITY REGIME SUMMARY ───`;
+    prompt += `\n(VRP = IV - HV20. Positive = sellers' edge. Negative = buyers' edge. Term structure: contango = normal, backwardation = event risk)`;
+    for (const s of vrpStocks) {
+      const vrpPp = s.vrp * 100;
+      const hvTrend = s.hv10 > s.hv60 * 1.1 ? 'EXPANDING' : s.hv10 < s.hv60 * 0.9 ? 'COMPRESSING' : 'stable';
+      prompt += `\n${s.symbol}: VRP ${vrpPp > 0 ? '+' : ''}${vrpPp.toFixed(1)}pp | IV Rank ${s.ivRank} | IV/HV ratio ${(s.currentIV / (s.hvCurrent || 0.01)).toFixed(2)} | HV trend: ${hvTrend} (10d: ${(s.hv10 * 100).toFixed(0)}% → 60d: ${(s.hv60 * 100).toFixed(0)}%) | Term: ${s.termStructureDirection}`;
+    }
+    const avgVRP = vrpStocks.reduce((s, v) => s + v.vrp, 0) / vrpStocks.length * 100;
+    const avgIVRank = Math.round(vrpStocks.reduce((s, v) => s + v.ivRank, 0) / vrpStocks.length);
+    prompt += `\nMarket avg VRP: ${avgVRP > 0 ? '+' : ''}${avgVRP.toFixed(1)}pp | Avg IV Rank: ${avgIVRank}`;
+    prompt += `\nRegime: ${avgVRP > 3 ? 'SELL PREMIUM — IV significantly overprices realized risk across indices' : avgVRP > 0 ? 'Mild seller\'s edge — IV modestly above HV' : avgVRP > -3 ? 'Neutral — IV near fair value' : 'BUY PREMIUM — IV underprices realized vol, options are cheap'}`;
+  }
 
   // Real-time options flow data
   if (flowData.flow.tickersScanned > 0) {
@@ -522,13 +575,19 @@ Then analyze:
 
 2. **GAMMA + VANNA + CHARM REGIME** — What's the gamma regime for SPY/QQQ/IWM? Crucially, analyze the VANNA and CHARM readings: which direction do they push dealer hedging? Do they confirm or contradict the gamma signal? If vanna and charm diverge, explain which dominates in the current vol regime (VIX level). Reference gamma flip levels and what happens if breached.
 
-3. **INDEX DIVERGENCES** — Are SPY, QQQ, IWM aligned or divergent? What does the split mean? Is this rotation or broad trend? Which index has the cleanest directional setup based on gamma+vanna+charm alignment?
+3. **VOLATILITY REGIME & RISK PREMIUM** — This is critical edge-finding analysis. For each index and notable single name:
+   - **VRP (Volatility Risk Premium)**: Is IV above or below realized vol? Positive VRP = options overpriced (sellers' edge). Negative VRP = options underpriced (buyers' edge). Reference the VRP numbers provided for each stock.
+   - **HV Term Structure**: Compare HV10 vs HV20 vs HV30 vs HV60. Rising short-term HV (HV10 > HV60) = vol expansion. Falling (HV10 < HV60) = vol compression. This tells you whether realized vol is accelerating or decelerating.
+   - **IV Term Structure**: Contango (far IV > near IV) is normal. Backwardation (near IV > far IV) signals imminent event risk — premium sellers should avoid near-term. Reference the term structure direction and near/far IV levels.
+   - **Net Assessment**: State clearly: "sell premium" vs "buy premium" vs "neutral" for each major name, and WHY based on VRP + term structure + IV rank. This directly informs the trade ideas section.
 
-4. **MAGNIFICENT 7 BREAKDOWN** — For each Mag7 stock with notable positioning, state the directional lean and which Greek(s) drive it. Flag any that diverge from their index. Count how many are long vs short — does narrow leadership make QQQ vulnerable?
+4. **INDEX DIVERGENCES** — Are SPY, QQQ, IWM aligned or divergent? What does the split mean? Is this rotation or broad trend? Which index has the cleanest directional setup based on gamma+vanna+charm alignment?
 
-${flowData.flow.tickersScanned > 0 ? '5. **OPTIONS FLOW ANALYSIS** — Analyze the real-time options premium flow. What does the net premium tell us? Which tickers have the most aggressive institutional positioning? Are sweeps/blocks confirming or diverging from dealer gamma positioning? Cross-reference flow direction with GEX regime for each ticker.\n\n' : ''}${swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0 ? '6. **SWAP MATURITIES** — Interpret swap maturities. Extreme clusters create forced dealer rebalancing. Cross-reference with flow alerts: are institutions positioning ahead of maturity unwinds?\n\n' : ''}${regSHOList.length > 0 || shortInterestData.length > 0 ? '7. **SHORT INTEREST / REG SHO** — Notable names with persistent FTDs or high days-to-cover. Cross-reference with options flow: are shorts being squeezed (bullish flow + high SI)?\n\n' : ''}8. **KEY LEVELS** — For SPY specifically: gamma flip, call wall, put wall, max pain. What happens at each level.
+5. **MAGNIFICENT 7 BREAKDOWN** — For each Mag7 stock with notable positioning, state the directional lean and which Greek(s) drive it. Flag any that diverge from their index. Count how many are long vs short — does narrow leadership make QQQ vulnerable?
 
-9. **OPTIONS TRADE IDEAS** — This is critical. Using all available data (dealer Greeks, flow, IV regime, key levels, intraday price action, algorithm trade ideas above), present **3-5 specific, actionable short-term options plays**. For EACH trade, provide ALL of these fields in a structured format:
+${flowData.flow.tickersScanned > 0 ? '6. **OPTIONS FLOW ANALYSIS** — Analyze the real-time options premium flow. What does the net premium tell us? Which tickers have the most aggressive institutional positioning? Are sweeps/blocks confirming or diverging from dealer gamma positioning? Cross-reference flow direction with GEX regime for each ticker.\n\n' : ''}${swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0 ? '7. **SWAP MATURITIES** — Interpret swap maturities. Extreme clusters create forced dealer rebalancing. Cross-reference with flow alerts: are institutions positioning ahead of maturity unwinds?\n\n' : ''}${regSHOList.length > 0 || shortInterestData.length > 0 ? '8. **SHORT INTEREST / REG SHO** — Notable names with persistent FTDs or high days-to-cover. Cross-reference with options flow: are shorts being squeezed (bullish flow + high SI)?\n\n' : ''}9. **KEY LEVELS** — For SPY specifically: gamma flip, call wall, put wall, max pain. What happens at each level.
+
+10. **OPTIONS TRADE IDEAS** — This is critical. Using all available data (dealer Greeks, flow, IV regime, VRP, key levels, intraday price action, algorithm trade ideas above), present **3-5 specific, actionable short-term options plays**. For EACH trade, provide ALL of these fields in a structured format:
 
 | Field | Required Detail |
 |-------|----------------|
@@ -552,7 +611,7 @@ ${flowData.flow.tickersScanned > 0 ? '5. **OPTIONS FLOW ANALYSIS** — Analyze t
 6. **Position value floor**: Each contract in the position must have a notional value of at least $100 (i.e., option mid price × 100 shares ≥ $100, so mid ≥ $1.00 per leg for single-leg trades, or net spread premium ≥ $0.50).
 7. **Expiration selection**: Credit strategies (iron condors, credit spreads) MUST use 30-45 DTE for meaningful premium — NEVER use weekly expirations for premium-selling strategies (near-expiry OTM options are worth pennies). Debit strategies can use 14-21 DTE. Only event plays (gamma flip straddle, expiration pin) should use weekly/0DTE. State the DTE clearly in your expiration field.
 
-Prioritize trades where multiple signals converge: gamma positioning + flow direction + key level proximity + IV regime. Prefer defined-risk strategies (spreads) over naked options. Reference the algorithm trade ideas data above — use their ATR-derived strikes as the foundation, then adjust based on key levels and flow data.
+Prioritize trades where multiple signals converge: gamma positioning + flow direction + key level proximity + IV regime + VRP. Use the VRP data to determine strategy type: positive VRP (IV > HV) favors credit strategies; negative VRP favors debit strategies. Use HV term structure to gauge vol momentum. Prefer defined-risk strategies (spreads) over naked options. Reference the algorithm trade ideas data above — use their ATR-derived strikes as the foundation, then adjust based on key levels and flow data.
 
 CRITICAL FORMAT REQUIREMENT: Start each trade idea with "TRADE N:" (e.g., "TRADE 1: SPY BULL PUT SPREAD") followed by the fields in either table or colon format. This exact prefix is required for the UI to parse and display your trade ideas. Example:
 

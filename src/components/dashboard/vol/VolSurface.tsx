@@ -57,13 +57,15 @@ export default function VolSurface() {
     // Collect all IV values for color scale
     const allIVs: number[] = [];
     for (const exp of exps) {
-      for (const p of exp.points) allIVs.push(p.iv);
+      for (const p of exp.points) {
+        if (isFinite(p.iv) && p.iv > 0) allIVs.push(p.iv);
+      }
     }
     if (allIVs.length < 5) return;
     allIVs.sort((a, b) => a - b);
-    const minIV = allIVs[Math.floor(allIVs.length * 0.03)];
-    const maxIV = allIVs[Math.floor(allIVs.length * 0.97)];
-    const ivRange = maxIV - minIV || 0.01;
+    const minIV = allIVs[Math.floor(allIVs.length * 0.03)] ?? 0.1;
+    const maxIV = allIVs[Math.floor(allIVs.length * 0.97)] ?? 0.5;
+    const ivRange = (isFinite(maxIV) && isFinite(minIV) && maxIV > minIV) ? maxIV - minIV : 0.01;
 
     // Grid: X = moneyness (-10% to +10%), Y = DTE
     const moneyMin = -0.10, moneyMax = 0.10;
@@ -175,8 +177,15 @@ export default function VolSurface() {
     ctx.fillStyle = '#555570';
     ctx.font = '7px "JetBrains Mono"';
     ctx.textAlign = 'left';
-    ctx.fillText(`${(maxIV * 100).toFixed(0)}%`, barX - 1, barTop - 3);
-    ctx.fillText(`${(minIV * 100).toFixed(0)}%`, barX - 1, barTop + barH + 8);
+    const maxLabel = isFinite(maxIV) ? `${(maxIV * 100).toFixed(0)}%` : '';
+    const minLabel = isFinite(minIV) ? `${(minIV * 100).toFixed(0)}%` : '';
+    ctx.fillText(maxLabel, barX - 1, barTop - 3);
+    ctx.fillText(minLabel, barX - 1, barTop + barH + 8);
+    // Legend label
+    ctx.fillStyle = '#8888a060';
+    ctx.font = '7px "JetBrains Mono"';
+    ctx.textAlign = 'center';
+    ctx.fillText('IV', barX + barW / 2, barTop + barH + 18);
 
     // Title overlays
     ctx.font = '8px "JetBrains Mono"';
@@ -192,6 +201,21 @@ export default function VolSurface() {
     return null;
   }
 
+  // Compute surface context for explanation
+  const expsForContext = snapshot.skewSurface.filter(e => e.dte >= 2 && e.dte <= 180);
+  const surfaceContext = (() => {
+    if (expsForContext.length < 1) return null;
+    const spot = snapshot.spotPrice;
+    const nearest = expsForContext[0];
+    const putSideIVs = nearest.points.filter(p => p.strike < spot * 0.97).map(p => p.iv);
+    const callSideIVs = nearest.points.filter(p => p.strike > spot * 1.03).map(p => p.iv);
+    const avgPutIV = putSideIVs.length > 0 ? putSideIVs.reduce((s, v) => s + v, 0) / putSideIVs.length : 0;
+    const avgCallIV = callSideIVs.length > 0 ? callSideIVs.reduce((s, v) => s + v, 0) / callSideIVs.length : 0;
+    if (avgPutIV === 0 || avgCallIV === 0) return null;
+    const skewRatio = avgPutIV / avgCallIV;
+    return { skewRatio, avgPutIV, avgCallIV, dte: nearest.dte };
+  })();
+
   return (
     <div className="panel flex flex-col">
       <div className="panel-header">
@@ -200,11 +224,23 @@ export default function VolSurface() {
           <InfoTip text="The IV surface shows implied volatility across strikes (x-axis, as moneyness) and expirations (y-axis, DTE). Hot colors = high IV, cool colors = low IV. The 'smile' or 'smirk' shape reveals how the market prices tail risk. Steep put-side gradient = expensive downside protection. Flat surface = uniform vol expectations. Use this to identify relative value: sell where IV is locally high, buy where it's low (Sinclair, Ch. 6: Trading the Surface)." />
         </div>
         <span className="badge badge-purple">
-          {snapshot.skewSurface.filter(e => e.dte >= 2 && e.dte <= 180).length} expirations
+          {expsForContext.length} expirations
         </span>
       </div>
       <div ref={containerRef} className="flex-1 min-h-[280px]">
         <canvas ref={canvasRef} className="w-full h-full" />
+      </div>
+      <div className="px-4 py-2 border-t border-border/20 text-[11px] font-mono text-text-secondary">
+        {surfaceContext
+          ? surfaceContext.skewRatio > 1.15
+            ? `Put-side IV (${(surfaceContext.avgPutIV * 100).toFixed(0)}%) significantly exceeds call-side (${(surfaceContext.avgCallIV * 100).toFixed(0)}%) at ${surfaceContext.dte}d — steep put skew indicates heavy demand for downside protection. OTM put spreads are rich for sellers.`
+            : surfaceContext.skewRatio > 1.05
+            ? `Moderate put skew — put IV (${(surfaceContext.avgPutIV * 100).toFixed(0)}%) slightly above call IV (${(surfaceContext.avgCallIV * 100).toFixed(0)}%) at ${surfaceContext.dte}d. Normal skew pattern for most equities.`
+            : surfaceContext.skewRatio < 0.95
+            ? `Unusual call skew — call-side IV (${(surfaceContext.avgCallIV * 100).toFixed(0)}%) exceeds put-side (${(surfaceContext.avgPutIV * 100).toFixed(0)}%) at ${surfaceContext.dte}d. Elevated upside demand suggests squeeze or melt-up expectations.`
+            : `Flat surface — put IV (${(surfaceContext.avgPutIV * 100).toFixed(0)}%) ≈ call IV (${(surfaceContext.avgCallIV * 100).toFixed(0)}%) at ${surfaceContext.dte}d. No directional skew bias; symmetric vol expectations.`
+          : 'X-axis: moneyness (OTM puts left, OTM calls right). Y-axis: days to expiration. Color: implied volatility (cool=low, hot=high).'
+        }
       </div>
     </div>
   );

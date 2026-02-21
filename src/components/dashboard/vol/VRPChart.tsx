@@ -4,17 +4,23 @@ import { useEffect, useRef, useState } from 'react';
 import { useDashboardStore, type SnapshotData } from '@/hooks/useDashboardStore';
 import InfoTip from './InfoTip';
 
-type Timeframe = '1M' | '3M' | '6M' | '1Y';
+export type Timeframe = '1M' | '3M' | '6M' | '1Y';
 type HVKey = 'hv10' | 'hv20' | 'hv30' | 'hv60';
 
-const TF_DAYS: Record<Timeframe, number> = { '1M': 21, '3M': 63, '6M': 126, '1Y': 252 };
+export const TF_DAYS: Record<Timeframe, number> = { '1M': 21, '3M': 63, '6M': 126, '1Y': 252 };
 const HV_LABELS: Record<HVKey, string> = { hv10: '10d', hv20: '20d', hv30: '30d', hv60: '60d' };
 
-export default function VRPChart() {
+interface VRPChartProps {
+  timeframe: Timeframe;
+  onTimeframeChange: (tf: Timeframe) => void;
+}
+
+export default function VRPChart({ timeframe, onTimeframeChange }: VRPChartProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const { snapshot } = useDashboardStore();
-  const [tf, setTf] = useState<Timeframe>('6M');
+  const tf = timeframe;
+  const setTf = onTimeframeChange;
   const [hvKey, setHvKey] = useState<HVKey>('hv20');
 
   useEffect(() => {

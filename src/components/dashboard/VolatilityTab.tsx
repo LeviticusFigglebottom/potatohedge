@@ -1,19 +1,19 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import { Thermometer, Brain, TrendingUp, TrendingDown, Shield } from 'lucide-react';
 
 // New modular vol components
 import InfoTip from './vol/InfoTip';
-import VRPChart from './vol/VRPChart';
+import VRPChart, { type Timeframe, TF_DAYS } from './vol/VRPChart';
 import VolSurface from './vol/VolSurface';
 import VolCone from './vol/VolCone';
 import { IVGauge, IVStats, TermStructureChart, SkewChart } from './vol/VolPanels';
 
 // ─── VIX Panel (chart + context + ranges) ─────────────────
 
-function VIXPanel() {
+function VIXPanel({ timeframe }: { timeframe: Timeframe }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const { snapshot } = useDashboardStore();
@@ -43,7 +43,9 @@ function VIXPanel() {
     ctx.fillStyle = '#12121a';
     ctx.fillRect(0, 0, w, h);
 
-    const data = vixSeries;
+    // Filter VIX data by shared timeframe
+    const maxPts = TF_DAYS[timeframe];
+    const data = vixSeries.slice(-maxPts);
     const vixValues = data.map(d => d.vix * 100);
     const sortedVix = [...vixValues].sort((a, b) => a - b);
     const vp2 = sortedVix[Math.floor(sortedVix.length * 0.02)] ?? sortedVix[0];
@@ -188,11 +190,14 @@ function VIXPanel() {
     ctx.setLineDash([]);
     ctx.fillStyle = '#8888a0';
     ctx.fillText('20d MA', pad.left + 44, pad.top + 10);
-  }, [snapshot, vix, vixSeries]);
+  }, [snapshot, vix, vixSeries, timeframe]);
 
   if (!vix) return null;
 
-  const vixValues = vixSeries?.map(d => d.vix * 100) || [];
+  // Use timeframe-filtered data for stats too
+  const maxStatPts = TF_DAYS[timeframe];
+  const filteredVixSeries = vixSeries?.slice(-maxStatPts);
+  const vixValues = filteredVixSeries?.map(d => d.vix * 100) || [];
   const high52w = vixValues.length > 0 ? Math.max(...vixValues) : 0;
   const low52w = vixValues.length > 0 ? Math.min(...vixValues) : 0;
   const avg = vixValues.length > 0 ? vixValues.reduce((s, v) => s + v, 0) / vixValues.length : 0;
@@ -219,7 +224,10 @@ function VIXPanel() {
           <span className="panel-title">CBOE Volatility Index (VIX)</span>
           <InfoTip text="The VIX measures the market's 30-day expected volatility derived from S&P 500 options. It's the benchmark 'fear gauge.' Low VIX (<15) = complacency, options are cheap across the market. High VIX (>25) = fear, options are expensive. Mean-reverting: extreme spikes tend to fade within weeks. Compare your stock's IV to VIX to gauge relative richness." />
         </div>
-        <span className={`text-[10px] font-mono px-2 py-0.5 rounded ${regimeBg}`}>{regimeLabel}</span>
+        <div className="flex items-center gap-2">
+          <span className="text-[9px] font-mono text-text-muted">{timeframe}</span>
+          <span className={`text-[10px] font-mono px-2 py-0.5 rounded ${regimeBg}`}>{regimeLabel}</span>
+        </div>
       </div>
 
       <div className="grid grid-cols-4 md:grid-cols-8 gap-2 px-4 pt-3 pb-2">
@@ -249,11 +257,11 @@ function VIXPanel() {
           <div className="text-sm font-mono font-semibold text-text-muted">{avg > 0 ? avg.toFixed(1) : '—'}</div>
         </div>
         <div>
-          <div className="text-[9px] font-mono text-text-muted">52w High</div>
+          <div className="text-[9px] font-mono text-text-muted">{timeframe} High</div>
           <div className="text-sm font-mono font-semibold text-red-400/60">{high52w > 0 ? high52w.toFixed(1) : '—'}</div>
         </div>
         <div>
-          <div className="text-[9px] font-mono text-text-muted">52w Low</div>
+          <div className="text-[9px] font-mono text-text-muted">{timeframe} Low</div>
           <div className="text-sm font-mono font-semibold text-green-400/60">{low52w > 0 ? low52w.toFixed(1) : '—'}</div>
         </div>
         {ivPct > 0 && (
@@ -415,6 +423,7 @@ function IVInterpretation() {
 
 export default function VolatilityTab() {
   const { snapshot, loading } = useDashboardStore();
+  const [volTimeframe, setVolTimeframe] = useState<Timeframe>('6M');
 
   if (loading.snapshot && !snapshot) {
     return (
@@ -440,7 +449,7 @@ export default function VolatilityTab() {
       </div>
 
       {/* Section 2: Volatility Risk Premium — the primary edge-finding chart */}
-      <VRPChart />
+      <VRPChart timeframe={volTimeframe} onTimeframeChange={setVolTimeframe} />
 
       {/* Section 3: Volatility Surface + Vol Cone */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -458,7 +467,7 @@ export default function VolatilityTab() {
       <IVInterpretation />
 
       {/* Section 6: Market Vol Indices */}
-      <VIXPanel />
+      <VIXPanel timeframe={volTimeframe} />
       <SKEWPanel />
 
       {/* Footer */}
