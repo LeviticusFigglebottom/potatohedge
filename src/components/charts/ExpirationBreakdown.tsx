@@ -61,12 +61,11 @@ export default function ExpirationBreakdown() {
         legX += ctx.measureText(m.label).width + 28;
       }
 
-      // ── Scaling: find global max for normalization ──
-      let globalMax = 1;
-      for (const exp of exps) {
-        for (const m of METRICS) {
-          globalMax = Math.max(globalMax, Math.abs(exp[m.key]));
-        }
+      // ── Scaling: per-metric max so each metric is independently visible ──
+      // (GEX is typically orders of magnitude larger than Vanna/Charm)
+      const maxPerMetric: Record<string, number> = {};
+      for (const m of METRICS) {
+        maxPerMetric[m.key] = Math.max(1, ...exps.map(e => Math.abs(e[m.key])));
       }
 
       // ── Layout: groups of 3 bars per expiration ──
@@ -105,7 +104,7 @@ export default function ExpirationBreakdown() {
         for (let mi = 0; mi < numMetrics; mi++) {
           const m = METRICS[mi];
           const val = exp[m.key];
-          const norm = val / globalMax; // -1 to +1
+          const norm = val / maxPerMetric[m.key]; // -1 to +1 (independent per metric)
           const barLen = Math.abs(norm) * halfW;
           const barY = groupY + mi * (barH + barGap);
           const color = m.color;

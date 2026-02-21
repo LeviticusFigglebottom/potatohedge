@@ -706,12 +706,16 @@ function parseAITradeIdeas(text: string): AITradeIdea[] {
 }
 
 export async function GET() {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return NextResponse.json({ error: 'ANTHROPIC_API_KEY not configured. Add it to your environment variables.' }, { status: 500 });
-  }
+  const t0 = Date.now();
+  const phase = (msg: string) => console.log(`[ai/briefing] ${msg} (+${Date.now() - t0}ms)`);
 
   try {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json({ error: 'ANTHROPIC_API_KEY not configured. Add it to your environment variables.' }, { status: 500 });
+    }
+    phase('Starting briefing generation');
+
     // Helper: race a promise against a hard deadline
     const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
       Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
@@ -737,6 +741,7 @@ export async function GET() {
       raceTimeout(fetchShortSaleVolume().catch(() => new Map<string, ShortVolumeData>()), 5000, new Map<string, ShortVolumeData>()),
       raceTimeout(scanMarketFlow().catch(() => emptyFlow), 8000, emptyFlow),
     ]);
+    phase('Institutional data fetches started');
 
     // Phase 1: Scan all stocks in parallel batches (runs concurrently with institutional data)
     const results: StockScan[] = [];
@@ -747,9 +752,11 @@ export async function GET() {
         if (r) results.push(r);
       }
     }
+    phase(`Stock scanning done: ${results.length}/${ALL_TICKERS.length} scanned`);
 
     // Wait for institutional data (likely already done since stock scanning takes longer)
     const [vixQuote, swapSummary, regSHOSet, shortInterestMap, shortVolumeMap, flowResult] = await institutionalPromise;
+    phase('Institutional data ready');
     const vixPrice = vixQuote?.last ?? 0;
     const vixChangePct = vixQuote?.changePct ?? 0;
     const regSHOList = Array.from(regSHOSet).filter(s => /^[A-Z]+$/.test(s)).sort();
@@ -777,7 +784,9 @@ export async function GET() {
     }
 
     // Phase 2: Build prompt and call Claude
+    phase('Building Claude prompt');
     const prompt = buildBriefingPrompt(results, vixPrice, vixChangePct, swapSummary, regSHOList, shortInterestData, shortVolumeData, flowResult);
+    phase(`Prompt built (${prompt.length} chars). Calling Claude API...`);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const body: Record<string, any> = {
@@ -888,7 +897,7 @@ export async function GET() {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error ?? 'Unknown error');
-    console.error('[ai/briefing] Error:', message);
+    phase(`FAILED: ${message}`);
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

@@ -1191,7 +1191,21 @@ export default function BriefingTab() {
       if (!res.ok) {
         const text = await res.text().catch(() => '');
         let msg = `HTTP ${res.status}`;
-        try { const j = JSON.parse(text); msg = j.error || msg; } catch { if (text.length < 200) msg = text || msg; }
+        try {
+          const j = JSON.parse(text);
+          msg = j.error || msg;
+        } catch {
+          // Vercel/platform error pages are HTML — extract useful info
+          if (text.includes('FUNCTION_INVOCATION_TIMEOUT')) {
+            msg = 'Function timed out — the briefing scan takes ~60s. Your Vercel plan may need a higher timeout limit.';
+          } else if (text.includes('FUNCTION_INVOCATION_FAILED')) {
+            msg = 'Function crashed — likely out of memory. Try again or check Vercel logs.';
+          } else if (text.length > 0 && text.length < 300) {
+            msg = text;
+          } else if (res.status === 500) {
+            msg = 'Server error (no details returned). Check Vercel function logs for the /api/ai/briefing route.';
+          }
+        }
         throw new Error(msg);
       }
 
