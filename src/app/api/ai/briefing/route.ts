@@ -720,150 +720,172 @@ export async function GET() {
     const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
       Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 
-    const emptySwap = {
-      totalMaturitiesToday: 0, totalNotionalToday: 0,
-      totalMaturitiesWeek: 0, totalNotionalWeek: 0,
-      topMaturities: [] as { symbol: string; count: number; notional: number }[],
-      asOf: '',
-    };
-    const emptyFlow: FlowResult = {
-      flow: { netCallPremium: 0, netPutPremium: 0, netPremium: 0, totalCallVolume: 0, totalPutVolume: 0, putCallRatio: 0, sentiment: 'neutral', tickersScanned: 0, contractsAnalyzed: 0 },
-      alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
-    };
+    // ════════════════════════════════════════════════════════════
+    // PHASE 1: Scan stocks + fetch institutional data + build prompt
+    // Wrapped in async scope so institutional Maps/Sets/arrays become
+    // GC-eligible before the Claude API call starts (reduces peak memory)
+    // ════════════════════════════════════════════════════════════
+    const { results, prompt, vixPrice, tradeIdeas } = await (async () => {
+      const emptySwap = {
+        totalMaturitiesToday: 0, totalNotionalToday: 0,
+        totalMaturitiesWeek: 0, totalNotionalWeek: 0,
+        topMaturities: [] as { symbol: string; count: number; notional: number }[],
+        asOf: '',
+      };
+      const emptyFlow: FlowResult = {
+        flow: { netCallPremium: 0, netPutPremium: 0, netPremium: 0, totalCallVolume: 0, totalPutVolume: 0, putCallRatio: 0, sentiment: 'neutral', tickersScanned: 0, contractsAnalyzed: 0 },
+        alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
+      };
 
-    // Start institutional data fetches IMMEDIATELY — they run in parallel
-    // with stock scanning (saves 5-10s vs running them sequentially after)
-    const institutionalPromise = Promise.all([
-      getQuote('VIX').catch(() => null),
-      raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 4000, emptySwap),
-      raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
-      raceTimeout(fetchShortInterest().catch(() => new Map<string, ShortInterestData>()), 5000, new Map<string, ShortInterestData>()),
-      raceTimeout(fetchShortSaleVolume().catch(() => new Map<string, ShortVolumeData>()), 5000, new Map<string, ShortVolumeData>()),
-      raceTimeout(scanMarketFlow().catch(() => emptyFlow), 8000, emptyFlow),
-    ]);
-    phase('Institutional data fetches started');
+      // Start institutional data fetches IMMEDIATELY — they run in parallel
+      // with stock scanning (saves 5-10s vs running them sequentially after)
+      const institutionalPromise = Promise.all([
+        getQuote('VIX').catch(() => null),
+        raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 4000, emptySwap),
+        raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
+        raceTimeout(fetchShortInterest().catch(() => new Map<string, ShortInterestData>()), 5000, new Map<string, ShortInterestData>()),
+        raceTimeout(fetchShortSaleVolume().catch(() => new Map<string, ShortVolumeData>()), 5000, new Map<string, ShortVolumeData>()),
+        raceTimeout(scanMarketFlow().catch(() => emptyFlow), 8000, emptyFlow),
+      ]);
+      phase('Institutional data fetches started');
 
-    // Phase 1: Scan all stocks in parallel batches (runs concurrently with institutional data)
-    const results: StockScan[] = [];
-    for (let i = 0; i < ALL_TICKERS.length; i += CONCURRENCY) {
-      const batch = ALL_TICKERS.slice(i, i + CONCURRENCY);
-      const batchResults = await Promise.all(batch.map(t => scanStock(t)));
-      for (const r of batchResults) {
-        if (r) results.push(r);
+      // Scan all stocks in parallel batches (runs concurrently with institutional data)
+      const scanResults: StockScan[] = [];
+      for (let i = 0; i < ALL_TICKERS.length; i += CONCURRENCY) {
+        const batch = ALL_TICKERS.slice(i, i + CONCURRENCY);
+        const batchResults = await Promise.all(batch.map(t => scanStock(t)));
+        for (const r of batchResults) {
+          if (r) scanResults.push(r);
+        }
       }
-    }
-    phase(`Stock scanning done: ${results.length}/${ALL_TICKERS.length} scanned`);
+      phase(`Stock scanning done: ${scanResults.length}/${ALL_TICKERS.length} scanned`);
 
-    // Wait for institutional data (likely already done since stock scanning takes longer)
-    const [vixQuote, swapSummary, regSHOSet, shortInterestMap, shortVolumeMap, flowResult] = await institutionalPromise;
-    phase('Institutional data ready');
-    const vixPrice = vixQuote?.last ?? 0;
-    const vixChangePct = vixQuote?.changePct ?? 0;
-    const regSHOList = Array.from(regSHOSet).filter(s => /^[A-Z]+$/.test(s)).sort();
+      // Wait for institutional data (likely already done since stock scanning takes longer)
+      const [vixQuote, swapSummary, regSHOSet, shortInterestMap, shortVolumeMap, flowResult] = await institutionalPromise;
+      phase('Institutional data ready');
+      const vp = vixQuote?.last ?? 0;
+      const vpc = vixQuote?.changePct ?? 0;
+      const regSHOList = Array.from(regSHOSet).filter(s => /^[A-Z]+$/.test(s)).sort();
 
-    // Build short interest highlights (3-100 DTC, meaningful positions only — OTC data)
-    const shortInterestData: { symbol: string; daysToCover: number; shortInterest: number }[] = [];
-    for (const [sym, data] of shortInterestMap) {
-      if (data.daysToCover >= 3 && data.daysToCover <= 100 && data.shortInterest >= 50000 && data.avgDailyVolume >= 1000) {
-        shortInterestData.push({ symbol: sym, daysToCover: data.daysToCover, shortInterest: data.shortInterest });
+      // Build short interest highlights (3-100 DTC, meaningful positions only — OTC data)
+      const shortInterestData: { symbol: string; daysToCover: number; shortInterest: number }[] = [];
+      for (const [sym, data] of shortInterestMap) {
+        if (data.daysToCover >= 3 && data.daysToCover <= 100 && data.shortInterest >= 50000 && data.avgDailyVolume >= 1000) {
+          shortInterestData.push({ symbol: sym, daysToCover: data.daysToCover, shortInterest: data.shortInterest });
+        }
       }
-    }
-    shortInterestData.sort((a, b) => b.daysToCover - a.daysToCover);
+      shortInterestData.sort((a, b) => b.daysToCover - a.daysToCover);
 
-    // Build short volume highlights (>40% short ratio with significant volume)
-    const shortVolumeData: { symbol: string; shortRatio: number; shortVolume: number; totalVolume: number }[] = [];
-    for (const [sym, data] of shortVolumeMap) {
-      if (data.shortRatio > 0.40 && data.totalVolume > 100000) {
-        shortVolumeData.push({ symbol: sym, shortRatio: data.shortRatio, shortVolume: data.shortVolume, totalVolume: data.totalVolume });
+      // Build short volume highlights (>40% short ratio with significant volume)
+      const shortVolumeData: { symbol: string; shortRatio: number; shortVolume: number; totalVolume: number }[] = [];
+      for (const [sym, data] of shortVolumeMap) {
+        if (data.shortRatio > 0.40 && data.totalVolume > 100000) {
+          shortVolumeData.push({ symbol: sym, shortRatio: data.shortRatio, shortVolume: data.shortVolume, totalVolume: data.totalVolume });
+        }
       }
-    }
-    shortVolumeData.sort((a, b) => b.shortRatio - a.shortRatio);
+      shortVolumeData.sort((a, b) => b.shortRatio - a.shortRatio);
+
+      // Build prompt
+      phase('Building Claude prompt');
+      const builtPrompt = buildBriefingPrompt(scanResults, vp, vpc, swapSummary, regSHOList, shortInterestData, shortVolumeData, flowResult);
+
+      // Build structured trade ideas for the UI (for paper trading buttons)
+      const ideas = scanResults
+        .flatMap(s => s.trades.map(t => ({
+          ticker: s.symbol,
+          spot: s.price,
+          bias: s.bias,
+          biasScore: s.biasScore,
+          strategy: t.strategy,
+          direction: t.direction,
+          confidence: t.confidence,
+          score: t.score,
+          strikes: t.strikes,
+          expiration: t.expiration,
+          targetExp: t.targetExp,
+          entry: t.entry,
+          risk: t.risk,
+          reasoning: t.reasoning,
+          tags: t.tags,
+          profitTargetPct: t.profitTargetPct,
+          stopLossPct: t.stopLossPct,
+          nearestExp: s.nearestExp,
+          nearestDTE: s.nearestDTE,
+          weeklyExp: s.weeklyExp,
+          monthlyExp: s.monthlyExp,
+          ivRank: s.ivRank,
+          currentIV: s.currentIV,
+          gammaFlip: s.gammaFlip,
+          callWall: s.callWall,
+          putWall: s.putWall,
+        })))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 15);
+
+      return { results: scanResults, prompt: builtPrompt, vixPrice: vp, tradeIdeas: ideas };
+    })();
+    // shortInterestMap, shortVolumeMap, regSHOSet, swapSummary, flowResult,
+    // shortInterestData, shortVolumeData, regSHOList are now GC-eligible
 
     if (results.length === 0) {
       return NextResponse.json({ error: 'Failed to scan any stocks' }, { status: 500 });
     }
 
-    // Phase 2: Build prompt and call Claude
-    phase('Building Claude prompt');
-    const prompt = buildBriefingPrompt(results, vixPrice, vixChangePct, swapSummary, regSHOList, shortInterestData, shortVolumeData, flowResult);
     phase(`Prompt built (${prompt.length} chars). Calling Claude API...`);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const body: Record<string, any> = {
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 8192,
-      messages: [{ role: 'user', content: prompt }],
-    };
+    // ════════════════════════════════════════════════════════════
+    // PHASE 2: Call Claude API
+    // Wrapped so request body, response buffers, and allContent array
+    // are released after extracting the final text
+    // ════════════════════════════════════════════════════════════
+    const text = await (async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const body: Record<string, any> = {
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 8192,
+        messages: [{ role: 'user', content: prompt }],
+      };
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let allContent: any[] = [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let allContent: any[] = [];
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(100000),
-      });
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(100000),
+        });
 
-      if (!response.ok) {
-        const err = await response.text().catch(() => 'Unknown error');
-        throw new Error(`Claude API: ${response.status} — ${err}`);
+        if (!response.ok) {
+          const err = await response.text().catch(() => 'Unknown error');
+          throw new Error(`Claude API: ${response.status} — ${err}`);
+        }
+
+        const result = await response.json();
+        allContent = [...allContent, ...(result.content || [])];
+
+        if (result.stop_reason !== 'pause_turn') break;
+        body.messages = [
+          { role: 'user', content: prompt },
+          { role: 'assistant', content: allContent },
+        ];
       }
 
-      const result = await response.json();
-      allContent = [...allContent, ...(result.content || [])];
+      return allContent
+        .filter((b: { type: string }) => b.type === 'text')
+        .map((b: { text: string }) => b.text)
+        .join('\n') || 'No response generated.';
+    })();
+    // body, allContent, response buffers now GC-eligible
 
-      if (result.stop_reason !== 'pause_turn') break;
-      body.messages = [
-        { role: 'user', content: prompt },
-        { role: 'assistant', content: allContent },
-      ];
-    }
-
-    const text = allContent
-      .filter((b: { type: string }) => b.type === 'text')
-      .map((b: { text: string }) => b.text)
-      .join('\n') || 'No response generated.';
-
-    // Build structured trade ideas for the UI (for paper trading buttons)
-    const tradeIdeas = results
-      .flatMap(s => s.trades.map(t => ({
-        ticker: s.symbol,
-        spot: s.price,
-        bias: s.bias,
-        biasScore: s.biasScore,
-        strategy: t.strategy,
-        direction: t.direction,
-        confidence: t.confidence,
-        score: t.score,
-        strikes: t.strikes,
-        expiration: t.expiration,
-        targetExp: t.targetExp,
-        entry: t.entry,
-        risk: t.risk,
-        reasoning: t.reasoning,
-        tags: t.tags,
-        profitTargetPct: t.profitTargetPct,
-        stopLossPct: t.stopLossPct,
-        nearestExp: s.nearestExp,
-        nearestDTE: s.nearestDTE,
-        weeklyExp: s.weeklyExp,
-        monthlyExp: s.monthlyExp,
-        ivRank: s.ivRank,
-        currentIV: s.currentIV,
-        gammaFlip: s.gammaFlip,
-        callWall: s.callWall,
-        putWall: s.putWall,
-      })))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 15);
-
-    // Parse Claude's AI-generated trade ideas from the narrative
+    // ════════════════════════════════════════════════════════════
+    // PHASE 3: Build response
+    // ════════════════════════════════════════════════════════════
     const parsedAIIdeas = parseAITradeIdeas(text);
     console.log(`[ai/briefing] Parsed ${parsedAIIdeas.length} AI trade ideas from narrative (${text.length} chars). Tickers: ${parsedAIIdeas.map(i => i.ticker).join(', ') || 'none'}`);
 
