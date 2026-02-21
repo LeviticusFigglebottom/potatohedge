@@ -10,7 +10,7 @@ import { getMarketIndicators, isFREDAvailable } from '@/lib/providers/fred';
 import { scanMarketFlow, type FlowResult } from '@/lib/providers/polygonFlow';
 import { saveDaily, type HistoryRecord } from '@/lib/persistence';
 
-export const maxDuration = 20;
+export const maxDuration = 15;
 
 /** Race a promise against a hard deadline */
 function raceTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
@@ -35,22 +35,15 @@ export async function GET(_req: NextRequest) {
       alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
     };
 
-    // ── Data sources: fetch sequentially to limit peak memory (parallel was >2GB → OOM) ──
-    // Phase 1: DTCC + FRED (lightest)
-    const [swapSummary, indicators] = await Promise.all([
+    // ── All data sources in parallel ──
+    const [swapSummary, regSHOResult, siResult, svResult, indicators, flowResult] = await Promise.all([
       raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 6000, emptySwap),
-      raceTimeout(getMarketIndicators().catch(() => emptyIndicators), 5000, emptyIndicators),
-    ]);
-
-    // Phase 2: FINRA data (medium)
-    const [regSHOResult, siResult, svResult] = await Promise.all([
       raceTimeout(fetchRegSHOWithDate().catch(() => emptyRegSHO), 5000, emptyRegSHO),
       raceTimeout(fetchShortInterestWithDate().catch(() => emptySI), 6000, emptySI),
       raceTimeout(fetchShortSaleVolumeWithDate().catch(() => emptySV), 6000, emptySV),
+      raceTimeout(getMarketIndicators().catch(() => emptyIndicators), 5000, emptyIndicators),
+      raceTimeout(scanMarketFlow().catch(() => emptyFlow), 10000, emptyFlow),
     ]);
-
-    // Phase 3: Polygon flow scan (heaviest — runs alone to limit peak memory)
-    const flowResult = await raceTimeout(scanMarketFlow().catch(() => emptyFlow), 10000, emptyFlow);
 
     // ── Process short data (each section isolated so one bad source can't crash all) ──
     let regSHOList: string[] = [];
@@ -150,8 +143,8 @@ export async function GET(_req: NextRequest) {
 
       // Options Flow (DIY from Polygon)
       marketFlow: flowResult?.flow ?? null,
-      flowAlerts: (flowResult?.alerts ?? []).slice(0, 20),
-      perTickerFlow: (flowResult?.perTickerFlow ?? []).slice(0, 10),
+      flowAlerts: (flowResult?.alerts ?? []).slice(0, 30),
+      perTickerFlow: flowResult?.perTickerFlow ?? [],
       flowDeveloper: flowResult?.isDeveloper ?? false,
 
       // Short Pressure

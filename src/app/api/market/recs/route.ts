@@ -68,7 +68,7 @@ export async function GET(request: NextRequest) {
   // Step 4: fetchEquityBars
   const t3 = Date.now();
   try {
-    const history = await bars.fetchEquityBars(ticker, 120);
+    const history = await bars.fetchEquityBars(ticker, 400);
     steps.equityBars = { ok: true, ms: Date.now() - t3, data: { bars: history.length } };
   } catch (e) {
     steps.equityBars = { ok: false, ms: Date.now() - t3, error: (e as Error).message };
