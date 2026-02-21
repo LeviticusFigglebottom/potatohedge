@@ -85,9 +85,19 @@ async function extractFirstFileFromZip(buf: Uint8Array): Promise<string> {
 
   const compressionMethod = view.getUint16(8, true);
   const compressedSize = view.getUint32(18, true);
+  const uncompressedSize = view.getUint32(22, true);
   const filenameLength = view.getUint16(26, true);
   const extraLength = view.getUint16(28, true);
   const dataOffset = 30 + filenameLength + extraLength;
+
+  // Guard: reject files that would decompress to >50MB to prevent OOM on serverless
+  if (uncompressedSize > 50_000_000) {
+    throw new Error(`ZIP content too large (${(uncompressedSize / 1e6).toFixed(1)}MB), skipping to prevent OOM`);
+  }
+  // Also check compressed size — if >15MB, decompressed is likely huge
+  if (compressedSize > 15_000_000) {
+    throw new Error(`ZIP compressed data too large (${(compressedSize / 1e6).toFixed(1)}MB), skipping`);
+  }
 
   const compressedData = buf.subarray(dataOffset, dataOffset + compressedSize);
 

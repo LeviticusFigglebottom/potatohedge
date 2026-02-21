@@ -36,8 +36,11 @@ export async function GET(_req: NextRequest) {
     };
 
     // ── All data sources in parallel ──
+    // NOTE: DTCC swap ZIP skipped — decompressing the cumulative equity swap
+    // report peaks at 200-400MB which OOM-kills on Vercel's 2048MB limit.
+    // The early size guard in extractFirstFileFromZip will also reject large files.
     const [swapSummary, regSHOResult, siResult, svResult, indicators, flowResult] = await Promise.all([
-      raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 6000, emptySwap),
+      Promise.resolve(emptySwap),
       raceTimeout(fetchRegSHOWithDate().catch(() => emptyRegSHO), 5000, emptyRegSHO),
       raceTimeout(fetchShortInterestWithDate().catch(() => emptySI), 6000, emptySI),
       raceTimeout(fetchShortSaleVolumeWithDate().catch(() => emptySV), 6000, emptySV),
