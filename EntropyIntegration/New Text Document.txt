@@ -1,0 +1,778 @@
+# ENTROPY T13 — EXACT IMPLEMENTATION SPECIFICATION
+
+## FOR THE IMPLEMENTING SESSION
+
+This document contains the **complete, line-accurate specification** of the T13 entropy options strategy. Every constant, every function, every threshold is extracted directly from the production algo. The implementing session has access to the PotatoHedge repo and should integrate this as a new tab/module.
+
+**Architecture:** Python backend script (cron at 3:50pm ET weekdays) + Next.js API route to read state + React dashboard component. The Python script runs the algo logic identically to the backtest. Next.js reads the results from SQLite for display.
+
+**Why Python, not TypeScript:** The algo has 900 lines of numerical computation (BSM solver, entropy, Greeks). Porting to TypeScript introduces translation bugs that defeat the purpose. The entire point is running IDENTICAL logic to the validated backtest. Python runs as a cron job, writes to SQLite, Next.js reads it.
+
+---
+
+## SECTION 1: CONSTANTS (exact values, do not change)
+
+```python
+TICKER        = "SPY"
+LOOKBACK      = 21          # Rolling window for medians/percentiles
+RISK_FREE     = 0.05        # Constant risk-free rate for BSM
+MIN_DTE       = 14          # Minimum days to expiry for contracts
+MAX_DTE       = 45          # Maximum days to expiry
+TARGET_DTE    = 28          # Preferred expiry target
+MAX_ALLOC     = 0.12        # Max allocation per strategy (12% of PV)
+MAX_CONTRACTS = 25          # Hard ceiling on contract count per trade
+CLOSE_DTE     = 5           # Close positions at 5 DTE
+PROFIT_PCT    = 0.50        # Credit TP: close at 50% of premium collected
+STOP_MULT     = 2.0         # Credit SL: 2× premium. Debit SL: 1× premium
+WARMUP_DAYS   = 30          # Days of entropy history before signals fire
+MAX_LONG_CALLS = 2          # Max concurrent long-call strategies
+SPREAD_FILTER = 0.15        # Reject contracts where spread > 15% of mid
+INITIAL_CASH  = 100_000     # Paper account starting capital
+```
+
+---
+
+## SECTION 2: DATA REQUIREMENTS
+
+### What to fetch from Tradier daily at ~3:50pm ET
+
+**SPY spot price:**
+```
+GET /v1/markets/quotes?symbols=SPY
+→ quote.last (float)
+```
+
+**Option expirations in range:**
+```
+GET /v1/markets/options/expirations?symbol=SPY&includeAllRoots=true
+→ Filter to expirations where 14 ≤ DTE ≤ 45
+```
+
+**Full chain for each valid expiration:**
+```
+GET /v1/markets/options/chains?symbol=SPY&expiration={date}
+→ For each contract extract:
+   symbol    (string, OCC format like "SPY250718C00600000")
+   strike    (float)
+   expiry    (date string "YYYY-MM-DD")
+   dte       (int, computed: expiry - today)
+   is_call   (bool, option_type == "call")
+   bid       (float, default 0)
+   ask       (float, default 0)
+   mid       (float, (bid+ask)/2)
+   volume    (int, default 0)
+```
+
+**For position management — quote individual held options:**
+```
+GET /v1/markets/quotes?symbols={option_symbol}
+→ bid, ask → mid for current valuation
+```
+
+**Paper account value:**
+```
+GET /v1/accounts/{account_id}/balances
+→ balances.total_equity (float)
+```
+
+**Paper order placement:**
+```
+POST /v1/accounts/{account_id}/orders
+body: class=option, symbol=SPY, option_symbol={sym},
+      side=buy_to_open|sell_to_open|buy_to_close|sell_to_close,
+      quantity={n}, type=market, duration=day
+```
+
+---
+
+## SECTION 3: FUNCTION 1 — BSM PRICING
+
+Used to compute implied volatility from market prices.
+
+```python
+import numpy as np
+from scipy.stats import norm as sp_norm
+from scipy.optimize import brentq
+
+def bsm_price(S, K, T, r, sig, is_call):
+    """Black-Scholes-Merton option price.
+    S=spot, K=strike, T=years to expiry, r=risk-free, sig=volatility"""
+    if T <= 0 or sig <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    d1 = (np.log(S / K) + (r + 0.5 * sig**2) * T) / (sig * np.sqrt(T))
+    d2 = d1 - sig * np.sqrt(T)
+    if is_call:
+        return S * sp_norm.cdf(d1) - K * np.exp(-r * T) * sp_norm.cdf(d2)
+    return K * np.exp(-r * T) * sp_norm.cdf(-d2) - S * sp_norm.cdf(-d1)
+```
+
+---
+
+## SECTION 4: FUNCTION 2 — IMPLIED VOLATILITY SOLVER
+
+Brent's method root-finding. Search range 0.01 to 5.0 (1% to 500% vol).
+
+```python
+def bsm_iv(price, S, K, T, r, is_call):
+    """Solve for implied volatility given market price.
+    Returns None if unsolvable."""
+    if T <= 1e-6 or price <= 0 or S <= 0 or K <= 0:
+        return None
+    # Reject prices below 90% of intrinsic (stale/bad data)
+    intr = max(S - K * np.exp(-r * T), 0) if is_call else max(K * np.exp(-r * T) - S, 0)
+    if price < intr * 0.90:
+        return None
+    try:
+        return brentq(
+            lambda s: bsm_price(S, K, T, r, s, is_call) - price,
+            0.01, 5.0, xtol=1e-5, maxiter=80
+        )
+    except:
+        return None
+```
+
+---
+
+## SECTION 5: FUNCTION 3 — GREEKS
+
+Computed from the solved IV. Vega is per 1% vol move (divided by 100). Theta is per calendar day (divided by 365).
+
+```python
+def bsm_greeks(S, K, T, r, sig, is_call):
+    """Compute delta, gamma, vega, theta from BSM."""
+    if T <= 0 or sig <= 0:
+        return {"delta": 0, "gamma": 0, "vega": 0, "theta": 0}
+    sq = np.sqrt(T)
+    d1 = (np.log(S / K) + (r + 0.5 * sig**2) * T) / (sig * sq)
+    d2 = d1 - sig * sq
+    pdf = sp_norm.pdf(d1)
+    gamma = pdf / (S * sig * sq)
+    vega = S * pdf * sq / 100          # per 1% vol move
+    if is_call:
+        delta = sp_norm.cdf(d1)
+        theta = (-(S * pdf * sig) / (2 * sq) - r * K * np.exp(-r * T) * sp_norm.cdf(d2)) / 365
+    else:
+        delta = sp_norm.cdf(d1) - 1
+        theta = (-(S * pdf * sig) / (2 * sq) + r * K * np.exp(-r * T) * sp_norm.cdf(-d2)) / 365
+    return {"delta": delta, "gamma": gamma, "vega": vega, "theta": theta}
+```
+
+---
+
+## SECTION 6: FUNCTION 4 — NORMALIZED SHANNON ENTROPY
+
+The core measurement function. Takes a distribution (array of values), normalizes to probabilities, computes Shannon entropy, then divides by max possible entropy (log2 of bin count) to get a 0-to-1 scale.
+
+```python
+def h_norm(dist):
+    """Normalized Shannon entropy. 0 = perfectly concentrated, 1 = uniform."""
+    d = np.asarray(dist, dtype=float)
+    d = d[d > 0]                    # Remove zeros
+    if len(d) <= 1:
+        return 0.0
+    d = d / d.sum()                 # Normalize to probabilities
+    h = float(-np.sum(d * np.log2(d)))  # Shannon entropy
+    return h / np.log2(len(d))      # Normalize to [0, 1]
+```
+
+---
+
+## SECTION 7: FUNCTION 5 — COMPUTE ENTROPY (the big one)
+
+This is the heart of the algo. Takes the raw chain + spot price, computes 12 entropy dimensions, 3 composites, and auxiliary metrics. Returns a dict.
+
+### Step 7a: Build records array
+
+For each contract in the chain:
+1. Skip if `mid <= 0` or `bid <= 0`
+2. Skip if `dte <= 0`
+3. Compute `T = dte / 365.0`
+4. Solve for IV using `bsm_iv(mid, spot, K, T, 0.05, is_call)`
+5. Skip if IV solve fails (returns None)
+6. Compute greeks using `bsm_greeks(spot, K, T, 0.05, iv, is_call)`
+7. Append record with: symbol, strike, expiry, dte, is_call, mid, bid, ask, spread (ask-bid), volume, iv, delta, gamma, vega, theta, moneyness (K/spot)
+
+**Minimum 10 valid records required.** If fewer, return None.
+
+### Step 7b: 12 entropy dimensions
+
+Each dimension aggregates a property by a grouping key, then measures how spread out that aggregation is.
+
+**1. H_vol_term_n — Volume by expiration**
+```python
+ev = {}  # expiry → total volume
+for r in recs:
+    ev[r['expiry']] = ev.get(r['expiry'], 0) + r['volume']
+ve = np.array(list(ev.values()))
+H_vol_term_n = h_norm(ve) if ve.sum() > 0 else None
+```
+
+**2. H_vol_k_n — Volume by strike**
+```python
+sv = {}  # strike → total volume
+for r in recs:
+    sv[r['strike']] = sv.get(r['strike'], 0) + r['volume']
+vk = np.array(list(sv.values()))
+H_vol_k_n = h_norm(vk) if vk.sum() > 0 else None
+```
+
+**3. H_prem_term_n — Dollar premium by expiration**
+```python
+ep = {}  # expiry → total dollar premium
+for r in recs:
+    ep[r['expiry']] = ep.get(r['expiry'], 0) + r['mid'] * r['volume'] * 100
+pe = np.abs(np.array(list(ep.values())))
+H_prem_term_n = h_norm(pe) if pe.sum() > 0 else None
+```
+
+**4. H_vegavol_n — Vega-weighted volume by strike**
+```python
+svv = {}  # strike → vega × volume
+for r in recs:
+    vv = abs(r['vega']) * r['volume']
+    if vv > 0:
+        svv[r['strike']] = svv.get(r['strike'], 0) + vv
+va = np.array(list(svv.values())) if svv else np.array([])
+H_vegavol_n = h_norm(va) if len(va) > 3 and va.sum() > 0 else None
+```
+
+**5. H_dgamma_n + dgamma_conc5 — Dollar gamma by strike**
+```python
+sdg = {}  # strike → dollar gamma
+for r in recs:
+    dg = abs(r['gamma'] * r['mid'] * r['volume'] * spot**2 * 0.01)
+    if dg > 0:
+        sdg[r['strike']] = sdg.get(r['strike'], 0) + dg
+da = np.array(list(sdg.values())) if sdg else np.array([])
+if len(da) > 3 and da.sum() > 0:
+    H_dgamma_n = h_norm(da)
+    sd = sorted(da, reverse=True)
+    dgamma_conc5 = sum(sd[:5]) / da.sum()  # Top-5 strike concentration ratio
+else:
+    H_dgamma_n = None
+    dgamma_conc5 = None
+```
+
+**6. H_gvx_n — Gamma × volume by strike**
+```python
+sgv = {}  # strike → gamma × volume × 100
+for r in recs:
+    gv = abs(r['gamma'] * r['volume'] * 100)
+    if gv > 0:
+        sgv[r['strike']] = sgv.get(r['strike'], 0) + gv
+ga = np.array(list(sgv.values())) if sgv else np.array([])
+H_gvx_n = h_norm(ga) if len(ga) > 3 and ga.sum() > 0 else None
+```
+
+**7. H_dflow_n — Delta-bucket flow (10 bins from 0 to 1)**
+```python
+da_arr = np.array([abs(r['delta']) for r in recs])
+vl_arr = np.array([r['volume'] for r in recs])
+bins = np.linspace(0, 1, 11)  # [0.0, 0.1, 0.2, ..., 1.0]
+bv = np.zeros(10)
+for b in range(10):
+    mask = (da_arr >= bins[b]) & (da_arr < bins[b + 1])
+    bv[b] = vl_arr[mask].sum()
+H_dflow_n = h_norm(bv) if bv.sum() > 0 else None
+```
+
+**8. H_spread_k_n — Average spread by strike**
+```python
+ssp = {}  # strike → sum of spreads
+ssc = {}  # strike → count
+for r in recs:
+    if r['spread'] > 0:
+        ssp[r['strike']] = ssp.get(r['strike'], 0) + r['spread']
+        ssc[r['strike']] = ssc.get(r['strike'], 0) + 1
+sk = np.array([ssp[k] / ssc[k] for k in ssp]) if ssp else np.array([])
+H_spread_k_n = h_norm(sk) if len(sk) > 3 else None
+```
+
+**9. H_moneyness_n — Volume by moneyness bucket**
+```python
+mb = [0, 0.90, 0.95, 0.97, 0.99, 1.01, 1.03, 1.05, 1.10, 2.0]  # 9 buckets
+mv = np.zeros(len(mb) - 1)
+for r in recs:
+    if r['volume'] > 0:
+        for b in range(len(mb) - 1):
+            if mb[b] <= r['moneyness'] < mb[b + 1]:
+                mv[b] += r['volume']
+                break
+H_moneyness_n = h_norm(mv) if mv.sum() > 0 else None
+```
+
+**10. H_charm_n — Gamma×volume/DTE by DTE bucket**
+```python
+db = [0, 5, 10, 15, 20, 30, 45]  # 6 buckets
+cv = np.zeros(len(db) - 1)
+for r in recs:
+    if abs(r['delta']) > 0 and r['dte'] > 0:
+        gv = r['gamma'] * r['volume'] / max(r['dte'], 1)
+        for b in range(len(db) - 1):
+            if db[b] < r['dte'] <= db[b + 1]:
+                cv[b] += abs(gv)
+                break
+H_charm_n = h_norm(cv) if cv.sum() > 0 else None
+```
+
+### Step 7c: Auxiliary metrics
+
+**PCR (put/call ratio):**
+```python
+calls = [r for r in recs if r['is_call']]
+puts = [r for r in recs if not r['is_call']]
+cvol = sum(r['volume'] for r in calls)
+pvol = sum(r['volume'] for r in puts)
+pcr_vol = pvol / cvol if cvol > 0 else None
+
+cdv = sum(r['mid'] * r['volume'] for r in calls)  # call dollar volume
+pdv = sum(r['mid'] * r['volume'] for r in puts)   # put dollar volume
+pcr_dollar = pdv / cdv if cdv > 0 else None
+```
+
+**IV mean (near-term):**
+```python
+near = [r for r in recs if 7 <= r['dte'] <= 45]
+ivs = [r['iv'] for r in near if r['iv'] > 0]
+iv_mean = float(np.mean(ivs)) if len(ivs) > 5 else None
+```
+
+**Put skew:**
+```python
+atm = [r for r in near if 0.98 <= r['moneyness'] <= 1.02]
+otp = [r for r in near if not r['is_call'] and r['moneyness'] < 0.97]
+atm_iv = np.mean([r['iv'] for r in atm if r['iv'] > 0]) if atm else None
+if otp and atm_iv and not np.isnan(atm_iv):
+    ov = [r['iv'] for r in otp if r['iv'] > 0]
+    put_skew = float(np.mean(ov)) - atm_iv if ov else None
+else:
+    put_skew = None
+```
+
+### Step 7d: Three composites
+
+```python
+# comp_volume = mean of volume-related entropies
+cv_keys = ['H_vol_term_n', 'H_prem_term_n', 'H_vol_k_n', 'H_vegavol_n']
+cv_vals = [m[k] for k in cv_keys if m.get(k) is not None]
+comp_volume = float(np.mean(cv_vals)) if cv_vals else None
+
+# comp_greek = mean of Greek-related entropies
+gk_keys = ['H_gvx_n', 'H_dflow_n', 'H_vegavol_n', 'H_dgamma_n', 'H_charm_n']
+gk_vals = [m[k] for k in gk_keys if m.get(k) is not None]
+comp_greek = float(np.mean(gk_vals)) if gk_vals else None
+
+# composite = mean of ALL _n entropy metrics
+all_n = [k for k in m if k.endswith('_n') and m[k] is not None]
+all_v = [m[k] for k in all_n]
+composite = float(np.mean(all_v)) if all_v else None
+```
+
+---
+
+## SECTION 8: FUNCTION 6 — ROLLING STATISTICS
+
+Operate on the stored entropy history (last 60 days in a deque/DB).
+
+```python
+def med(history, key, lookback=21):
+    """21-day rolling median. Returns None if < 10 values available."""
+    vals = [h[key] for h in history[-lookback:] if h.get(key) is not None]
+    return float(np.median(vals)) if len(vals) >= lookback // 2 else None
+
+def pct(history, key, percentile):
+    """Rolling percentile over full history window."""
+    vals = [h[key] for h in history if h.get(key) is not None]
+    return float(np.percentile(vals, percentile)) if len(vals) >= 10 else None
+
+def diff(history, key, lag=1):
+    """1-day difference of a metric."""
+    if len(history) < lag + 1:
+        return None
+    curr = history[-1].get(key)
+    prev = history[-1 - lag].get(key)
+    return curr - prev if curr is not None and prev is not None else None
+```
+
+**Critical detail for d1cv percentile:** The 1-day diff of comp_volume (`d1cv`) must be stored back into the history record so that `pct('_d1cv', 20)` can compute the 20th percentile of recent daily changes:
+```python
+d1cv = diff(history, 'comp_volume', 1)
+if d1cv is not None:
+    history[-1]['_d1cv'] = d1cv
+# Then: p20_d1cv = pct(history, '_d1cv', 20)
+```
+
+---
+
+## SECTION 9: FUNCTION 7 — SIGNAL EVALUATION (6 strategies)
+
+Each returns: `fire` (bool), `strength` (0-1), `trade_type` (string), `rationale` (string).
+
+Helper:
+```python
+def strength(a, b):
+    """How far a is below b, as fraction of b. Clamped [0, 1]."""
+    return max(0, min((b - a) / abs(b), 1)) if b and b != 0 else 0
+```
+
+### Strategy 1: S_LowVolEnt
+```
+CONDITION: comp_volume < median(comp_volume, 21d)
+TRADE TYPE: if iv_mean < median(iv_mean) → "buy_call" else → "sell_put"
+STRENGTH: strength(comp_volume, median)
+```
+
+### Strategy 2: S_VolCollapse
+```
+CONDITION: d1cv < percentile(_d1cv, 20)
+  where d1cv = today's comp_volume - yesterday's comp_volume
+  and percentile is computed over all stored _d1cv values
+TRADE TYPE: always "bull_call_spread"
+STRENGTH: max(0, min(abs(d1cv / p20_d1cv) - 1, 1))  if p20 != 0 and fire
+```
+
+### Strategy 3: S_LowEntLowIV
+```
+CONDITION: composite < median(composite) AND iv_mean < median(iv_mean)
+TRADE TYPE: always "buy_call_longer" (25-45 DTE)
+STRENGTH: average of strength(composite, med) and strength(iv_mean, med)
+```
+
+### Strategy 4: S_LowGreekEnt
+```
+CONDITION: comp_greek < median(comp_greek)
+TRADE TYPE: always "sell_put"
+STRENGTH: strength(comp_greek, median)
+```
+
+### Strategy 5: S_SkewFlow
+```
+CONDITION: comp_volume < median(comp_volume) AND put_skew > median(put_skew)
+TRADE TYPE: always "sell_put_spread"
+STRENGTH: average of strength(cv, cv_m) and min((put_skew - med) / abs(med), 1)
+```
+
+### Strategy 6: S_PCRContrarian
+```
+CONDITION: pcr_dollar > percentile(pcr_dollar, 80)
+TRADE TYPE: always "sell_put"
+STRENGTH: max(0, min((pcr - p80) / p80, 1))
+```
+
+---
+
+## SECTION 10: FUNCTION 8 — CONTRACT SELECTION
+
+For each trade type, select specific option contracts from the chain.
+
+**Common setup for all types:**
+```python
+# Filter to contracts not already held
+avail = [r for r in chain_recs if r['symbol'] not in used_symbols]
+# Filter to DTE range
+elig = [r for r in avail if 14 <= r['dte'] <= 45]
+# Sort by closeness to 28-day target
+elig.sort(key=lambda r: abs(r['dte'] - 28))
+# Select the expiration closest to target
+best_exp = elig[0]['expiry']
+# Get all contracts at that expiration
+ae = [r for r in elig if r['expiry'] == best_exp]
+calls = sorted([r for r in ae if r['is_call']], key=lambda r: r['strike'])
+puts = sorted([r for r in ae if not r['is_call']], key=lambda r: r['strike'])
+atm_strike = min(ae, key=lambda r: abs(r['moneyness'] - 1.0))['strike']
+```
+
+### buy_call
+```
+1. Filter calls where abs(strike - atm_strike) <= 2 and mid > 0
+2. Pick closest to moneyness 1.0
+3. REJECT if spread >= mid × 0.15
+4. Return: symbol, qty_sign=+1, strike, expiry, mid
+```
+
+### buy_call_longer
+```
+1. From ALL avail (not just best_exp): calls where 25 <= dte <= 45
+   and abs(moneyness - 1.0) < 0.02 and mid > 0
+2. Pick closest to moneyness 1.0
+3. REJECT if spread >= mid × 0.15
+4. Return: symbol, qty_sign=+1, strike, expiry, mid
+```
+
+### sell_put
+```
+1. Filter puts where 0.955 < moneyness < 0.995 and mid > 0.10
+2. Pick closest to moneyness 0.97 (3% OTM)
+3. REJECT if spread >= mid × 0.15
+4. Return: symbol, qty_sign=-1, strike, expiry, mid
+```
+
+### bull_call_spread
+```
+LONG LEG: calls where abs(moneyness - 1.0) < 0.02, pick closest to 1.0
+SHORT LEG: calls where 1.02 < moneyness < 1.05, pick closest to 1.03
+VALIDATE: long mid > short mid (net debit)
+Return both legs with long qty_sign=+1, short qty_sign=-1
+```
+
+### sell_put_spread
+```
+SHORT LEG: puts where 0.96 < moneyness < 0.995 and mid > 0.10, pick closest to 0.98
+LONG LEG: puts where 0.935 < moneyness < 0.975 and mid > 0.05, pick closest to 0.95
+VALIDATE: short strike > long strike AND short mid > long mid (net credit)
+Return both legs with short qty_sign=-1, long qty_sign=+1
+```
+
+---
+
+## SECTION 11: FUNCTION 9 — POSITION SIZING
+
+```python
+def compute_allocation(portfolio_value, n_actionable_signals, committed_capital):
+    """How much to allocate per strategy."""
+    avail = portfolio_value * 0.85 - committed_capital
+    avail = max(avail, 0)
+    slots = max(n_actionable_signals, 1)
+    return min(avail / slots, portfolio_value * 0.12)  # MAX_ALLOC cap
+
+def compute_contracts(alloc, mid, strike, qty_sign, portfolio_value):
+    """How many contracts to trade."""
+    prem = mid * 100  # per-contract premium in dollars
+
+    if qty_sign > 0:  # buying
+        n = max(1, int(alloc / prem))
+    else:  # selling
+        margin = max(prem * 3, strike * 100 * 0.15)
+        n = max(1, int(alloc / margin))
+
+    # Hard ceiling
+    max_c = max(8, min(int(portfolio_value / 12500), 25))
+    n = min(n, max_c)
+    return n
+```
+
+**Additional margin check for credit (sell) positions:**
+```python
+if qty_sign < 0:
+    estimated_margin = n * strike * 100 * 0.15
+    if estimated_margin > free_margin * 0.80:
+        n = max(1, int(free_margin * 0.60 / (strike * 100 * 0.15)))
+```
+
+**For spreads:** Compute n for each leg independently, take the minimum, then apply spread margin check:
+```python
+width = abs(strike1 - strike2)
+spread_margin = width * 100 * n
+if spread_margin > free_margin * 0.70:
+    n = max(1, int(free_margin * 0.50 / (width * 100)))
+    n = min(n, max_contracts)
+```
+
+---
+
+## SECTION 12: FUNCTION 10 — POSITION MANAGEMENT (TP/SL/DTE)
+
+Run BEFORE signal evaluation every day. For each open position:
+
+```
+STEP 1: Compute DTE = expiry_date - today
+  If DTE <= 5 → CLOSE (reason: DTE)
+
+STEP 2: Get current mid price for the option
+  current_value = current_mid × 100 × abs(qty)
+  
+STEP 3: Compute P&L
+  If long (qty > 0):   pnl = current_value - entry_cost
+  If short (qty < 0):  pnl = entry_cost - current_value
+
+STEP 4: Check thresholds
+  IF CREDIT POSITION (is_credit = True):
+    credit = abs(entry_cost)
+    TP: pnl >= credit × 0.50     → CLOSE (reason: TP)
+    SL: pnl < -credit × 2.0      → CLOSE (reason: SL)
+
+  IF DEBIT POSITION (is_credit = False):
+    debit = abs(entry_cost)
+    SL: pnl < -debit × 1.0       → CLOSE (reason: SL)
+    TP: pnl >= debit × 1.0       → CLOSE (reason: TP)
+```
+
+**Critical: entry_cost is set at ORDER TIME to `mid × 100 × abs(qty)`. In the backtest, this is corrected to actual fill price via OnOrderEvent. For Tradier paper trading, use the fill price from the order confirmation response instead of the snapshot mid.**
+
+---
+
+## SECTION 13: FUNCTION 11 — EXECUTION GUARDS
+
+Before executing any signal, check these gates IN ORDER:
+
+```
+1. Strategy already has open position? → SKIP
+2. Strategy already traded today? → SKIP
+3. Strategy closed today (no re-entry same day)? → SKIP
+4. Month is September? → SKIP (September skip)
+5. Trade type is long-call AND active long-call count >= 2? → SKIP
+6. Contract selection returns nothing? → SKIP
+```
+
+**Execution priority:** Sort actionable signals by strength (highest first). Execute in that order, updating used_symbols set after each.
+
+---
+
+## SECTION 14: DAILY EXECUTION FLOW (the main loop)
+
+This runs ONCE per day at 3:50pm ET:
+
+```
+1. CHECK: Already ran today? → exit
+2. FETCH: SPY spot price from Tradier
+3. FETCH: SPY option chain (all expirations in 14-45 DTE range)
+4. COMPUTE: Entropy metrics from chain (Section 7)
+5. STORE: Metrics to entropy_history (SQLite)
+6. CHECK: History length < 30? → exit (warming up)
+7. MANAGE: Check all open positions for TP/SL/DTE exits (Section 12)
+8. EVALUATE: All 6 signals against rolling medians (Section 9)
+9. FILTER: Which signals are firing AND don't have active positions?
+10. ALLOCATE: Compute per-strategy allocation (Section 11)
+11. SELECT: Best contract for each firing signal (Section 10)
+12. SIZE: Compute contract count (Section 11)
+13. EXECUTE: Place paper orders via Tradier (highest strength first)
+14. LOG: Everything to SQLite for dashboard display
+```
+
+---
+
+## SECTION 15: DATABASE SCHEMA
+
+```sql
+CREATE TABLE entropy_history (
+    date TEXT PRIMARY KEY,
+    spot REAL,
+    metrics_json TEXT,          -- JSON blob of all entropy metrics
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy TEXT NOT NULL,     -- e.g. "S_LowVolEnt"
+    symbol TEXT NOT NULL,       -- OCC option symbol
+    trade_type TEXT,            -- buy_call, sell_put, etc.
+    qty INTEGER,               -- positive=long, negative=short
+    entry_price REAL,          -- mid at signal time
+    entry_cost REAL,           -- mid × 100 × abs(qty) (corrected to fill)
+    entry_date TEXT,
+    strike REAL,
+    expiry TEXT,
+    is_credit INTEGER,         -- 1=credit, 0=debit
+    is_open INTEGER DEFAULT 1,
+    close_date TEXT,
+    close_reason TEXT,         -- TP, SL, DTE
+    close_pnl REAL,
+    fill_corrected INTEGER DEFAULT 0
+);
+
+CREATE TABLE trades_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT,
+    strategy TEXT,
+    action TEXT,               -- OPEN, CLOSE_TP, CLOSE_SL, CLOSE_DTE
+    symbol TEXT,
+    qty INTEGER,
+    price REAL,
+    details TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE equity_curve (
+    date TEXT PRIMARY KEY,
+    portfolio_value REAL,
+    cash REAL,
+    positions_value REAL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE signals_log (
+    date TEXT,
+    strategy TEXT,
+    fired INTEGER,             -- 0 or 1
+    strength REAL,
+    trade_type TEXT,
+    rationale TEXT,
+    executed INTEGER DEFAULT 0,
+    PRIMARY KEY (date, strategy)
+);
+```
+
+---
+
+## SECTION 16: NEXT.JS API ROUTE
+
+Read-only SQLite access. Expose these endpoints via query param `?view=`:
+
+- **dashboard**: Latest entropy + open positions + today's signals + recent trades + equity curve + stats (total trades, win rate, open count)
+- **signals&days=30**: Signal fire history
+- **positions&status=open|closed|all**: Position list
+- **equity**: Full equity curve
+- **history&days=60**: Entropy time series for charting
+
+Use `better-sqlite3` npm package for read-only access.
+
+---
+
+## SECTION 17: REACT DASHBOARD REQUIREMENTS
+
+Display the following in an "Entropy Engine" tab:
+
+1. **Entropy gauges**: comp_volume, comp_greek, composite — each showing current value vs 21-day median, with green indicator when below median (signal territory)
+2. **Signal status panel**: All 6 strategies showing fire/skip/executed state with trade type and rationale
+3. **Open positions**: Strategy, symbol, qty, strike, expiry, entry price, current P&L
+4. **Equity curve**: Area chart of daily portfolio value
+5. **Recent trades**: Chronological log with strategy, action, P&L
+6. **Auxiliary metrics**: iv_mean, put_skew, pcr_dollar, chain size
+7. **September skip indicator**: Warning banner when active
+
+Auto-refresh every 60 seconds.
+
+---
+
+## SECTION 18: CRON SETUP
+
+```bash
+# Run at 3:50pm ET every weekday
+# Adjust for server timezone (this example assumes UTC)
+50 19 * * 1-5 cd /path/to/potatohedge && python3 entropy_engine.py >> engine.log 2>&1
+```
+
+The engine handles duplicate-run protection internally (checks if today's date already exists in entropy_history).
+
+---
+
+## SECTION 19: WARMUP PROCEDURE
+
+The engine needs 30 trading days of entropy history before signals fire. Options to accelerate:
+
+**Option A: Wait 6 weeks.** Run the cron daily, signals start firing after day 30.
+
+**Option B: Backfill from Polygon.** Use Polygon's historical options snapshot endpoint to fetch chain data for the past 60 trading days, run `compute_entropy()` on each, insert into `entropy_history` table. This gives you a warm start on day 1.
+
+```
+Polygon endpoint: GET /v3/snapshot/options/{underlyingAsset}
+Requires Options Starter tier ($29/mo)
+Fetch one snapshot per trading day for past 60 days
+```
+
+---
+
+## SECTION 20: VALIDATION AFTER DEPLOYMENT
+
+After 30+ trading days of live running, verify:
+
+| Metric | Expected (from backtest) | Red flag |
+|--------|-------------------------|----------|
+| Signal fire rate | ~30% of evaluations | < 15% or > 50% |
+| comp_volume range | 0.60 – 0.90 | Outside 0.4 – 1.0 |
+| comp_greek range | 0.55 – 0.85 | Outside 0.3 – 1.0 |
+| Strategies firing | All 6 at some point | Any strategy never firing |
+| Contract selection success | > 80% | < 50% (spread filter too tight?) |
+| Win rate | ~72% | < 55% |
+| Avg credit TP | $300-800 | < $100 (sizing too small) |
+| Avg debit TP | $5K-20K | < $1K (not running long enough) |
