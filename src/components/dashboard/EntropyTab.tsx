@@ -1,0 +1,589 @@
+'use client';
+
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { Brain, Activity, Zap, TrendingUp, AlertTriangle, Clock, DollarSign } from 'lucide-react';
+import InfoTip from './vol/InfoTip';
+
+// ─── Types ──────────────────────────────────────────────────
+
+interface SignalItem {
+  strategy: string;
+  fired: number;
+  strength: number;
+  trade_type: string;
+  rationale: string;
+  executed: number;
+}
+
+interface OpenPosition {
+  id: number;
+  strategy: string;
+  symbol: string;
+  trade_type: string;
+  qty: number;
+  entry_price: number;
+  entry_cost: number;
+  entry_date: string;
+  strike: number;
+  expiry: string;
+  is_credit: number;
+}
+
+interface RecentTrade {
+  date: string;
+  strategy: string;
+  action: string;
+  symbol: string;
+  qty: number;
+  price: number;
+  details: string;
+}
+
+interface EquityPoint {
+  date: string;
+  portfolio_value: number;
+  cash: number;
+  positions_value: number;
+}
+
+interface EntropyData {
+  status: 'no_db' | 'warmup' | 'active';
+  warmup: { current: number; required: number };
+  date: string | null;
+  spot: number | null;
+  metrics: Record<string, number | null> | null;
+  medians: Record<string, number | null>;
+  signals: { date: string; items: SignalItem[] };
+  openPositions: OpenPosition[];
+  recentTrades: RecentTrade[];
+  equity: EquityPoint[];
+  stats: { totalTrades: number; wins: number; winRate: number; totalPnl: number; openCount: number };
+}
+
+// ─── Helpers ────────────────────────────────────────────────
+
+const fmt4 = (v: number | null | undefined) => v != null ? v.toFixed(4) : '—';
+const fmtPct = (v: number | null | undefined) => v != null ? `${(v * 100).toFixed(1)}%` : '—';
+const fmtRatio = (v: number | null | undefined) => v != null ? v.toFixed(3) : '—';
+const fmtDollar = (v: number) => v >= 0 ? `$${v.toFixed(2)}` : `-$${Math.abs(v).toFixed(2)}`;
+
+function daysUntil(expiry: string): number {
+  const now = new Date();
+  const exp = new Date(expiry);
+  return Math.max(0, Math.ceil((exp.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)));
+}
+
+const GAUGE_INFO: Record<string, string> = {
+  comp_volume: 'Volume-weighted entropy composite. Measures disorder in option volume distribution across strikes and expirations. Lower values indicate concentrated (directional) flow — a potential signal.',
+  comp_greek: 'Greek-weighted entropy composite. Captures disorder in delta/gamma exposure across the chain. Low values suggest the market is pricing a specific move.',
+  composite: 'Master composite combining volume and greek entropy with auxiliary metrics. The primary signal driver — values below the 21-day median indicate exploitable structure.',
+};
+
+const STRATEGY_LABELS: Record<string, string> = {
+  S_LowVolEnt: 'Low Volume Entropy',
+  S_VolCollapse: 'Volatility Collapse',
+  S_LowEntLowIV: 'Low Entropy + Low IV',
+  S_LowGreekEnt: 'Low Greek Entropy',
+  S_SkewFlow: 'Skew Flow',
+  S_PCRContrarian: 'PCR Contrarian',
+};
+
+const ACTION_COLORS: Record<string, string> = {
+  OPEN: 'text-accent-cyan',
+  CLOSE_TP: 'text-accent-green',
+  CLOSE_SL: 'text-accent-red',
+  CLOSE_DTE: 'text-accent-amber',
+};
+
+// ─── Component ──────────────────────────────────────────────
+
+export default function EntropyTab() {
+  const [data, setData] = useState<EntropyData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const fetchData = useCallback(async () => {
+    try {
+      const res = await fetch('/api/entropy?view=dashboard');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      setData(json);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchData();
+    const interval = setInterval(fetchData, 60_000);
+    return () => clearInterval(interval);
+  }, [fetchData]);
+
+  // ─── Equity Chart ───────────────────────────────────────
+  useEffect(() => {
+    if (!data?.equity?.length || !canvasRef.current || !containerRef.current) return;
+
+    const canvas = canvasRef.current;
+    const container = containerRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const rect = container.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    canvas.style.width = `${rect.width}px`;
+    canvas.style.height = `${rect.height}px`;
+    ctx.scale(dpr, dpr);
+
+    const w = rect.width;
+    const h = rect.height;
+    const pad = { top: 20, right: 50, bottom: 30, left: 60 };
+    const cw = w - pad.left - pad.right;
+    const ch = h - pad.top - pad.bottom;
+
+    ctx.fillStyle = '#12121a';
+    ctx.fillRect(0, 0, w, h);
+
+    const equity = data.equity;
+    if (equity.length < 2) return;
+
+    const values = equity.map(e => e.portfolio_value);
+    const minV = Math.min(...values) * 0.995;
+    const maxV = Math.max(...values) * 1.005;
+    const range = maxV - minV || 1;
+
+    const toX = (i: number) => pad.left + (i / (equity.length - 1)) * cw;
+    const toY = (v: number) => pad.top + ch - ((v - minV) / range) * ch;
+
+    // Grid lines
+    ctx.strokeStyle = '#1a1a2520';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.top + (ch / 4) * i;
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y);
+      ctx.lineTo(w - pad.right, y);
+      ctx.stroke();
+    }
+
+    // Area fill
+    ctx.beginPath();
+    ctx.moveTo(toX(0), toY(values[0]));
+    for (let i = 1; i < equity.length; i++) {
+      ctx.lineTo(toX(i), toY(values[i]));
+    }
+    ctx.lineTo(toX(equity.length - 1), pad.top + ch);
+    ctx.lineTo(toX(0), pad.top + ch);
+    ctx.closePath();
+    const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + ch);
+    grad.addColorStop(0, '#00d4ff18');
+    grad.addColorStop(1, '#00d4ff02');
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    ctx.moveTo(toX(0), toY(values[0]));
+    for (let i = 1; i < equity.length; i++) {
+      ctx.lineTo(toX(i), toY(values[i]));
+    }
+    ctx.strokeStyle = '#00d4ff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Y axis labels
+    ctx.fillStyle = '#555570';
+    ctx.font = '9px "JetBrains Mono"';
+    ctx.textAlign = 'right';
+    for (let i = 0; i <= 4; i++) {
+      const val = maxV - (range / 4) * i;
+      ctx.fillText(`$${val.toFixed(0)}`, pad.left - 5, pad.top + (ch / 4) * i + 3);
+    }
+
+    // X axis dates
+    ctx.textAlign = 'center';
+    const labelCount = Math.min(6, equity.length);
+    for (let i = 0; i < labelCount; i++) {
+      const idx = Math.floor((i / (labelCount - 1)) * (equity.length - 1));
+      const d = new Date(equity[idx].date);
+      ctx.fillText(`${d.getMonth() + 1}/${d.getDate()}`, toX(idx), h - pad.bottom + 14);
+    }
+
+    // Current value badge
+    const lastVal = values[values.length - 1];
+    const firstVal = values[0];
+    const pnlPct = ((lastVal - firstVal) / firstVal) * 100;
+    ctx.font = 'bold 10px "JetBrains Mono"';
+    ctx.textAlign = 'right';
+    ctx.fillStyle = pnlPct >= 0 ? '#00e676' : '#ff3d57';
+    ctx.fillText(
+      `$${lastVal.toFixed(0)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`,
+      w - pad.right - 4,
+      pad.top + 12,
+    );
+  }, [data?.equity]);
+
+  // ─── September check ────────────────────────────────────
+  const isSeptember = new Date().getMonth() === 8;
+
+  // ─── Render ─────────────────────────────────────────────
+
+  if (loading && !data) {
+    return (
+      <div className="p-8 flex items-center justify-center">
+        <span className="text-sm font-mono text-text-muted animate-pulse">Loading entropy engine...</span>
+      </div>
+    );
+  }
+
+  if (error && !data) {
+    return (
+      <div className="p-8 flex items-center justify-center">
+        <span className="text-sm font-mono text-accent-red">Error: {error}</span>
+      </div>
+    );
+  }
+
+  if (!data) return null;
+
+  // ─── Status banners ─────────────────────────────────────
+
+  if (data.status === 'no_db') {
+    return (
+      <div className="p-8">
+        <div className="panel p-6 flex flex-col items-center gap-3 text-center">
+          <Brain className="w-8 h-8 text-text-muted" />
+          <p className="text-sm font-mono text-text-secondary">
+            Entropy engine has not been initialized yet.
+          </p>
+          <p className="text-xs font-mono text-text-muted">
+            Run the entropy pipeline to build the database: <code className="text-accent-cyan">npm run entropy:init</code>
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (data.status === 'warmup') {
+    const pct = Math.round((data.warmup.current / data.warmup.required) * 100);
+    return (
+      <div className="p-8">
+        <div className="panel p-6 flex flex-col items-center gap-4">
+          <Brain className="w-8 h-8 text-accent-amber animate-pulse" />
+          <p className="text-sm font-mono text-text-secondary">
+            Warming up: {data.warmup.current}/{data.warmup.required} days
+          </p>
+          <div className="w-full max-w-md h-2 bg-bg-primary rounded-full overflow-hidden">
+            <div
+              className="h-full bg-accent-amber rounded-full transition-all"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <p className="text-xs font-mono text-text-muted">
+            The engine needs {data.warmup.required} days of data to compute stable medians.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Active dashboard ───────────────────────────────────
+
+  const { metrics, medians, signals, openPositions, recentTrades, equity, stats } = data;
+
+  return (
+    <div className="flex flex-col gap-4 p-4">
+      {/* September skip warning */}
+      {isSeptember && (
+        <div className="flex items-center gap-2 px-4 py-2.5 rounded-md bg-accent-amber/10 border border-accent-amber/20">
+          <AlertTriangle className="w-4 h-4 text-accent-amber shrink-0" />
+          <span className="text-xs font-mono text-accent-amber">
+            September — historically the worst month for equity markets. The entropy engine skips new entries this month.
+          </span>
+        </div>
+      )}
+
+      {/* Header row: date + spot */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <Brain className="w-5 h-5 text-accent-purple" />
+          <span className="text-sm font-mono text-text-primary font-semibold">Entropy Engine</span>
+          {data.date && (
+            <span className="text-xs font-mono text-text-muted">{data.date}</span>
+          )}
+        </div>
+        {data.spot != null && (
+          <span className="text-xs font-mono text-text-secondary">
+            SPY <span className="text-text-primary">${data.spot.toFixed(2)}</span>
+          </span>
+        )}
+      </div>
+
+      {/* Section 1: Entropy Gauges */}
+      <div className="panel">
+        <div className="panel-header">
+          <div className="flex items-center gap-1.5">
+            <Activity className="w-3.5 h-3.5 text-accent-cyan" />
+            <span className="panel-title">Entropy Composites</span>
+          </div>
+        </div>
+        <div className="grid grid-cols-3 gap-4 p-4">
+          {(['comp_volume', 'comp_greek', 'composite'] as const).map((key) => {
+            const current = metrics?.[key] ?? null;
+            const median = medians?.[key] ?? null;
+            const inSignal = current != null && median != null && current < median;
+            const pctOfMedian = current != null && median != null && median > 0
+              ? Math.min((current / median) * 100, 150)
+              : 50;
+
+            return (
+              <div key={key} className="flex flex-col gap-2 p-3 rounded-md bg-bg-primary/50">
+                <div className="flex items-center gap-1">
+                  <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">
+                    {key.replace('comp_', '').replace('composite', 'master')}
+                  </span>
+                  <InfoTip text={GAUGE_INFO[key]} />
+                </div>
+                <div className="flex items-baseline gap-2">
+                  <span className={`text-lg font-mono font-bold ${inSignal ? 'text-accent-green' : 'text-accent-red'}`}>
+                    {fmt4(current)}
+                  </span>
+                  <span className="text-[10px] font-mono text-text-muted">
+                    med {fmt4(median)}
+                  </span>
+                </div>
+                {/* Bar indicator */}
+                <div className="h-1.5 bg-bg-primary rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full transition-all ${inSignal ? 'bg-accent-green' : 'bg-accent-red'}`}
+                    style={{ width: `${Math.max(5, Math.min(100, pctOfMedian))}%` }}
+                  />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Section 2: Auxiliary Metrics */}
+      <div className="panel">
+        <div className="panel-header">
+          <div className="flex items-center gap-1.5">
+            <Zap className="w-3.5 h-3.5 text-accent-amber" />
+            <span className="panel-title">Auxiliary Metrics</span>
+          </div>
+        </div>
+        <div className="grid grid-cols-3 gap-4 p-4">
+          {[
+            { key: 'iv_mean', label: 'IV Mean', format: fmtPct, medFormat: fmtPct },
+            { key: 'put_skew', label: 'Put Skew', format: (v: number | null | undefined) => v != null ? `${(v * 100).toFixed(1)}pp` : '—', medFormat: (v: number | null | undefined) => v != null ? `${(v * 100).toFixed(1)}pp` : '—' },
+            { key: 'pcr_dollar', label: 'PCR Dollar', format: fmtRatio, medFormat: fmtRatio },
+          ].map(({ key, label, format, medFormat }) => {
+            const current = metrics?.[key] ?? null;
+            const median = medians?.[key] ?? null;
+            return (
+              <div key={key} className="flex flex-col gap-1 p-3 rounded-md bg-bg-primary/50">
+                <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">{label}</span>
+                <span className="text-sm font-mono font-bold text-text-primary">{format(current)}</span>
+                <span className="text-[10px] font-mono text-text-muted">med {medFormat(median)}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Section 3: Signal Status */}
+      <div className="panel">
+        <div className="panel-header">
+          <div className="flex items-center gap-1.5">
+            <Zap className="w-3.5 h-3.5 text-accent-green" />
+            <span className="panel-title">Signal Status</span>
+          </div>
+          {signals?.date && (
+            <span className="text-[10px] font-mono text-text-muted">{signals.date}</span>
+          )}
+        </div>
+        <div className="grid grid-cols-2 gap-3 p-4">
+          {(['S_LowVolEnt', 'S_VolCollapse', 'S_LowEntLowIV', 'S_LowGreekEnt', 'S_SkewFlow', 'S_PCRContrarian'] as const).map((strat) => {
+            const item = signals?.items?.find(s => s.strategy === strat);
+            const fired = item?.fired === 1;
+            const executed = item?.executed === 1;
+
+            return (
+              <div key={strat} className="flex items-center gap-3 p-2.5 rounded-md bg-bg-primary/50">
+                {/* Status dot */}
+                <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${fired ? 'bg-accent-green shadow-[0_0_6px_rgba(0,230,118,0.4)]' : 'bg-text-muted/20'}`} />
+
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono text-text-primary truncate">
+                      {STRATEGY_LABELS[strat] || strat}
+                    </span>
+                    {executed && (
+                      <span className="px-1.5 py-0.5 text-[8px] font-mono font-bold bg-accent-green/20 text-accent-green rounded uppercase tracking-wider">
+                        Executed
+                      </span>
+                    )}
+                  </div>
+                  {item && (
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className="text-[10px] font-mono text-accent-cyan">{item.trade_type}</span>
+                      {/* Strength bar */}
+                      <div className="flex-1 h-1 bg-bg-primary rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-accent-purple rounded-full"
+                          style={{ width: `${Math.max(5, Math.min(100, item.strength * 100))}%` }}
+                        />
+                      </div>
+                      <span className="text-[9px] font-mono text-text-muted">{(item.strength * 100).toFixed(0)}%</span>
+                    </div>
+                  )}
+                  {item?.rationale && (
+                    <p className="text-[9px] font-mono text-text-muted mt-0.5 truncate">{item.rationale}</p>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Section 4: Open Positions */}
+      {openPositions?.length > 0 && (
+        <div className="panel">
+          <div className="panel-header">
+            <div className="flex items-center gap-1.5">
+              <DollarSign className="w-3.5 h-3.5 text-accent-cyan" />
+              <span className="panel-title">Open Positions</span>
+              <span className="text-[10px] font-mono text-text-muted">({openPositions.length})</span>
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs font-mono">
+              <thead>
+                <tr className="border-b border-border/20">
+                  {['Strategy', 'Symbol', 'Type', 'Qty', 'Strike', 'Expiry', 'Entry Price', 'Entry Cost', 'DTE'].map(h => (
+                    <th key={h} className="px-3 py-2 text-left text-[10px] text-text-muted font-normal uppercase tracking-wider">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {openPositions.map((pos) => (
+                  <tr key={pos.id} className="border-b border-border/10 hover:bg-bg-primary/30">
+                    <td className="px-3 py-2 text-text-secondary">{pos.strategy}</td>
+                    <td className="px-3 py-2 text-text-primary">{pos.symbol}</td>
+                    <td className="px-3 py-2 text-text-secondary">{pos.trade_type}</td>
+                    <td className={`px-3 py-2 ${pos.qty > 0 ? 'text-accent-green' : 'text-accent-red'}`}>
+                      {pos.qty > 0 ? `+${pos.qty}` : pos.qty}
+                    </td>
+                    <td className="px-3 py-2 text-text-secondary">${pos.strike.toFixed(2)}</td>
+                    <td className="px-3 py-2 text-text-secondary">{pos.expiry}</td>
+                    <td className="px-3 py-2 text-text-secondary">${pos.entry_price.toFixed(2)}</td>
+                    <td className="px-3 py-2 text-text-secondary">{fmtDollar(pos.entry_cost)}</td>
+                    <td className="px-3 py-2 text-text-secondary">{daysUntil(pos.expiry)}d</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Section 5: Equity Curve */}
+      {equity?.length > 1 && (
+        <div className="panel flex flex-col">
+          <div className="panel-header">
+            <div className="flex items-center gap-1.5">
+              <TrendingUp className="w-3.5 h-3.5 text-accent-cyan" />
+              <span className="panel-title">Equity Curve</span>
+            </div>
+          </div>
+          <div ref={containerRef} className="flex-1 min-h-[250px]">
+            <canvas ref={canvasRef} className="w-full h-full" />
+          </div>
+        </div>
+      )}
+
+      {/* Section 6: Recent Trades */}
+      {recentTrades?.length > 0 && (
+        <div className="panel">
+          <div className="panel-header">
+            <div className="flex items-center gap-1.5">
+              <Clock className="w-3.5 h-3.5 text-accent-purple" />
+              <span className="panel-title">Recent Trades</span>
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs font-mono">
+              <thead>
+                <tr className="border-b border-border/20">
+                  {['Date', 'Strategy', 'Action', 'Symbol', 'Qty', 'P&L'].map(h => (
+                    <th key={h} className="px-3 py-2 text-left text-[10px] text-text-muted font-normal uppercase tracking-wider">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {recentTrades.map((trade, i) => (
+                  <tr key={i} className="border-b border-border/10 hover:bg-bg-primary/30">
+                    <td className="px-3 py-2 text-text-muted">{trade.date}</td>
+                    <td className="px-3 py-2 text-text-secondary">{trade.strategy}</td>
+                    <td className={`px-3 py-2 font-semibold ${ACTION_COLORS[trade.action] || 'text-text-secondary'}`}>
+                      {trade.action}
+                    </td>
+                    <td className="px-3 py-2 text-text-primary">{trade.symbol}</td>
+                    <td className="px-3 py-2 text-text-secondary">{trade.qty}</td>
+                    <td className="px-3 py-2 text-text-secondary">{trade.details}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Section 7: Stats Summary */}
+      {stats && (
+        <div className="panel">
+          <div className="panel-header">
+            <div className="flex items-center gap-1.5">
+              <TrendingUp className="w-3.5 h-3.5 text-accent-green" />
+              <span className="panel-title">Performance Summary</span>
+            </div>
+          </div>
+          <div className="grid grid-cols-4 gap-4 p-4">
+            <div className="flex flex-col gap-1 p-3 rounded-md bg-bg-primary/50">
+              <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">Total Trades</span>
+              <span className="text-lg font-mono font-bold text-text-primary">{stats.totalTrades}</span>
+            </div>
+            <div className="flex flex-col gap-1 p-3 rounded-md bg-bg-primary/50">
+              <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">Win Rate</span>
+              <span className={`text-lg font-mono font-bold ${stats.winRate >= 50 ? 'text-accent-green' : 'text-accent-red'}`}>
+                {stats.winRate.toFixed(1)}%
+              </span>
+            </div>
+            <div className="flex flex-col gap-1 p-3 rounded-md bg-bg-primary/50">
+              <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">Total P&L</span>
+              <span className={`text-lg font-mono font-bold ${stats.totalPnl >= 0 ? 'text-accent-green' : 'text-accent-red'}`}>
+                {fmtDollar(stats.totalPnl)}
+              </span>
+            </div>
+            <div className="flex flex-col gap-1 p-3 rounded-md bg-bg-primary/50">
+              <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">Open Positions</span>
+              <span className="text-lg font-mono font-bold text-accent-cyan">{stats.openCount}</span>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
