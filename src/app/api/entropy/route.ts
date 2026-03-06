@@ -7,7 +7,7 @@ export const dynamic = 'force-dynamic';
 function getDb() {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const Database = require('better-sqlite3');
-  const dbPath = process.env.ENGINE_DB_PATH || path.join(process.cwd(), 'entropy_engine.db');
+  const dbPath = process.env.ENGINE_DB_PATH || path.join(process.cwd(), 'data', 'entropy_engine.db');
   if (!fs.existsSync(dbPath)) return null;
   return new Database(dbPath, { readonly: true });
 }

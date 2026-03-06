@@ -6,3 +6,9 @@ out/
 .env.local
 .env.production.local
 .env.development.local
+
+# Entropy engine data (persists across deploys)
+data/*.db
+data/*.db-journal
+data/*.db-wal
+entropy_engine.log
