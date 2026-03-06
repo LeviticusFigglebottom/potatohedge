@@ -4,10 +4,18 @@ import fs from 'fs';
 
 export const dynamic = 'force-dynamic';
 
+function resolveDbPath(): string {
+  if (process.env.ENGINE_DB_PATH) return process.env.ENGINE_DB_PATH;
+  // Check cwd/data first (local dev), then /tmp (serverless)
+  const cwdPath = path.join(process.cwd(), 'data', 'entropy_engine.db');
+  if (fs.existsSync(cwdPath)) return cwdPath;
+  return path.join('/tmp', 'entropy-data', 'entropy_engine.db');
+}
+
 function getDb() {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const Database = require('better-sqlite3');
-  const dbPath = process.env.ENGINE_DB_PATH || path.join(process.cwd(), 'data', 'entropy_engine.db');
+  const dbPath = resolveDbPath();
   if (!fs.existsSync(dbPath)) return null;
   return new Database(dbPath, { readonly: true });
 }

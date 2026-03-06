@@ -171,12 +171,27 @@ type BetterSqlite3Database = {
   close(): void;
 };
 
-function getDb(): BetterSqlite3Database {
-  const dbPath = process.env.ENGINE_DB_PATH || path.join(process.cwd(), 'data', 'entropy_engine.db');
-  const dir = path.dirname(dbPath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+function resolveDbPath(): string {
+  if (process.env.ENGINE_DB_PATH) return process.env.ENGINE_DB_PATH;
+  // Try cwd/data first (local dev), fall back to /tmp/entropy (serverless/containers)
+  const cwdData = path.join(process.cwd(), 'data');
+  try {
+    if (!fs.existsSync(cwdData)) fs.mkdirSync(cwdData, { recursive: true });
+    // Test writability
+    const testFile = path.join(cwdData, '.write-test');
+    fs.writeFileSync(testFile, '');
+    fs.unlinkSync(testFile);
+    return path.join(cwdData, 'entropy_engine.db');
+  } catch {
+    // cwd not writable (serverless) — use /tmp
+    const tmpDir = path.join('/tmp', 'entropy-data');
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+    return path.join(tmpDir, 'entropy_engine.db');
   }
+}
+
+function getDb(): BetterSqlite3Database {
+  const dbPath = resolveDbPath();
   return new Database(dbPath);
 }
 
