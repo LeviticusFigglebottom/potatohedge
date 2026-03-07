@@ -615,10 +615,17 @@ export default function EntropyTab() {
           {(['comp_volume', 'comp_greek', 'composite'] as const).map((key) => {
             const current = metrics?.[key] ?? null;
             const median = medians?.[key] ?? null;
-            const inSignal = current != null && median != null && current < median;
-            const pctOfMedian = current != null && median != null && median > 0
+            const hasMedian = median != null;
+            const inSignal = hasMedian && current != null && current < median;
+            const pctOfMedian = current != null && hasMedian && median > 0
               ? Math.min((current / median) * 100, 150)
-              : 50;
+              : current != null ? 75 : 0;
+            const barColor = hasMedian
+              ? (inSignal ? 'bg-accent-green' : 'bg-accent-red')
+              : 'bg-accent-purple';
+            const textColor = hasMedian
+              ? (inSignal ? 'text-accent-green' : 'text-accent-red')
+              : 'text-accent-purple';
 
             return (
               <div key={key} className="flex flex-col gap-2 p-3 rounded-md bg-bg-primary/50">
@@ -629,17 +636,17 @@ export default function EntropyTab() {
                   <InfoTip text={GAUGE_INFO[key]} />
                 </div>
                 <div className="flex items-baseline gap-2">
-                  <span className={`text-lg font-mono font-bold ${inSignal ? 'text-accent-green' : 'text-accent-red'}`}>
+                  <span className={`text-lg font-mono font-bold ${textColor}`}>
                     {fmt4(current)}
                   </span>
                   <span className="text-[10px] font-mono text-text-muted">
-                    med {fmt4(median)}
+                    {hasMedian ? `med ${fmt4(median)}` : 'no median yet'}
                   </span>
                 </div>
                 {/* Bar indicator */}
                 <div className="h-1.5 bg-bg-primary rounded-full overflow-hidden">
                   <div
-                    className={`h-full rounded-full transition-all ${inSignal ? 'bg-accent-green' : 'bg-accent-red'}`}
+                    className={`h-full rounded-full transition-all ${barColor}`}
                     style={{ width: `${Math.max(5, Math.min(100, pctOfMedian))}%` }}
                   />
                 </div>
@@ -676,7 +683,67 @@ export default function EntropyTab() {
         </div>
       </div>
 
-      {/* Section 2.5: Entropy History Chart (especially useful during warmup) */}
+      {/* Section 2.5: Individual Entropy Metrics Breakdown */}
+      {metrics && (
+        <div className="panel">
+          <div className="panel-header">
+            <div className="flex items-center gap-1.5">
+              <Activity className="w-3.5 h-3.5 text-accent-purple" />
+              <span className="panel-title">Entropy Breakdown</span>
+            </div>
+            {data.date && (
+              <span className="text-[10px] font-mono text-text-muted">{data.date}</span>
+            )}
+          </div>
+          <div className="grid grid-cols-2 gap-3 p-4">
+            {[
+              { key: 'H_vol_term_n', label: 'Volume by Expiry', desc: 'Volume distribution across expirations' },
+              { key: 'H_vol_k_n', label: 'Volume by Strike', desc: 'Volume distribution across strikes' },
+              { key: 'H_prem_term_n', label: 'Premium by Expiry', desc: 'Dollar premium distribution by term' },
+              { key: 'H_vegavol_n', label: 'Vega x Volume', desc: 'Vega-weighted volume by strike' },
+              { key: 'H_dgamma_n', label: 'Dollar Gamma', desc: 'Dollar gamma distribution by strike' },
+              { key: 'H_gvx_n', label: 'Gamma x Volume', desc: 'Gamma-volume cross by strike' },
+              { key: 'H_dflow_n', label: 'Delta Flow', desc: 'Volume by delta bucket' },
+              { key: 'H_spread_k_n', label: 'Spread by Strike', desc: 'Bid-ask spread distribution' },
+              { key: 'H_moneyness_n', label: 'Moneyness', desc: 'Volume by moneyness bucket' },
+              { key: 'H_charm_n', label: 'Charm by DTE', desc: 'Charm distribution by time bucket' },
+            ].map(({ key, label, desc }) => {
+              const val = metrics[key] ?? null;
+              const barW = val != null ? Math.max(5, val * 100) : 0;
+              return (
+                <div key={key} className="flex flex-col gap-1 p-2.5 rounded-md bg-bg-primary/50">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-mono text-text-secondary">{label}</span>
+                    <span className="text-xs font-mono font-bold text-text-primary">{fmt4(val)}</span>
+                  </div>
+                  <div className="h-1.5 bg-bg-primary rounded-full overflow-hidden">
+                    <div
+                      className="h-full rounded-full bg-accent-purple/70 transition-all"
+                      style={{ width: `${barW}%` }}
+                    />
+                  </div>
+                  <span className="text-[8px] font-mono text-text-muted">{desc}</span>
+                </div>
+              );
+            })}
+          </div>
+          {/* Additional single-value metrics */}
+          <div className="grid grid-cols-4 gap-3 px-4 pb-4">
+            {[
+              { key: 'dgamma_conc5', label: 'Gamma Conc. Top 5', format: fmtPct },
+              { key: 'pcr_vol', label: 'PCR Volume', format: fmtRatio },
+              { key: '_n_records', label: 'Chain Records', format: (v: number | null | undefined) => v != null ? String(v) : '—' },
+            ].map(({ key, label, format }) => (
+              <div key={key} className="flex flex-col gap-0.5 p-2 rounded-md bg-bg-primary/50">
+                <span className="text-[8px] font-mono text-text-muted uppercase tracking-wider">{label}</span>
+                <span className="text-xs font-mono font-bold text-text-primary">{format(metrics[key])}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Section 2.6: Entropy History Chart */}
       {history.length >= 1 && (
         <div className="panel flex flex-col">
           <div className="panel-header">
@@ -686,11 +753,13 @@ export default function EntropyTab() {
               <span className="text-[10px] font-mono text-text-muted">({history.length} day{history.length !== 1 ? 's' : ''})</span>
             </div>
           </div>
-          <div ref={warmupContainerRef} className="flex-1 min-h-[280px]">
-            <canvas ref={warmupCanvasRef} className="w-full h-full" />
-          </div>
+          {history.length >= 2 && (
+            <div ref={warmupContainerRef} className="h-[280px] relative">
+              <canvas ref={warmupCanvasRef} className="absolute inset-0 w-full h-full" />
+            </div>
+          )}
           {/* Raw metrics table */}
-          <div className="overflow-x-auto border-t border-border/10">
+          <div className={`overflow-x-auto ${history.length >= 2 ? 'border-t border-border/10' : ''}`}>
             <table className="w-full text-[10px] font-mono">
               <thead>
                 <tr className="border-b border-border/20">
@@ -700,7 +769,7 @@ export default function EntropyTab() {
                 </tr>
               </thead>
               <tbody>
-                {[...history].reverse().slice(0, 15).map((row) => (
+                {[...history].reverse().slice(0, 30).map((row) => (
                   <tr key={row.date} className="border-b border-border/5 hover:bg-bg-primary/30">
                     <td className="px-2 py-1 text-text-muted">{row.date}</td>
                     <td className="px-2 py-1 text-text-primary">${row.spot?.toFixed(2) ?? '—'}</td>
