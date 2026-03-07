@@ -46,6 +46,18 @@ interface EquityPoint {
   positions_value: number;
 }
 
+interface HistoryRow {
+  date: string;
+  spot: number;
+  comp_volume: number | null;
+  comp_greek: number | null;
+  composite: number | null;
+  iv_mean: number | null;
+  put_skew: number | null;
+  pcr_dollar: number | null;
+  [key: string]: number | string | null | undefined;
+}
+
 interface EntropyData {
   status: 'no_db' | 'warmup' | 'active';
   warmup: { current: number; required: number };
@@ -126,20 +138,30 @@ function todayET(): string {
 
 export default function EntropyTab() {
   const [data, setData] = useState<EntropyData | null>(null);
+  const [history, setHistory] = useState<HistoryRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [runResult, setRunResult] = useState<{ status: string; message: string } | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const warmupCanvasRef = useRef<HTMLCanvasElement>(null);
+  const warmupContainerRef = useRef<HTMLDivElement>(null);
   const autoRunAttempted = useRef<string>('');
 
   const fetchData = useCallback(async () => {
     try {
-      const res = await fetch('/api/entropy?view=dashboard');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json();
+      const [dashRes, histRes] = await Promise.all([
+        fetch('/api/entropy?view=dashboard'),
+        fetch('/api/entropy?view=history&days=60'),
+      ]);
+      if (!dashRes.ok) throw new Error(`HTTP ${dashRes.status}`);
+      const json = await dashRes.json();
       setData(json);
+      if (histRes.ok) {
+        const histJson = await histRes.json();
+        setHistory(histJson.history || []);
+      }
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch');
@@ -301,6 +323,142 @@ export default function EntropyTab() {
     );
   }, [data?.equity]);
 
+  // ─── Warmup / History Chart ──────────────────────────────
+  useEffect(() => {
+    if (!history.length || !warmupCanvasRef.current || !warmupContainerRef.current) return;
+
+    const canvas = warmupCanvasRef.current;
+    const container = warmupContainerRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const rect = container.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    canvas.style.width = `${rect.width}px`;
+    canvas.style.height = `${rect.height}px`;
+    ctx.scale(dpr, dpr);
+
+    const w = rect.width;
+    const h = rect.height;
+    const pad = { top: 24, right: 55, bottom: 32, left: 55 };
+    const cw = w - pad.left - pad.right;
+    const ch = h - pad.top - pad.bottom;
+
+    ctx.fillStyle = '#12121a';
+    ctx.fillRect(0, 0, w, h);
+
+    const series: { key: string; color: string; label: string }[] = [
+      { key: 'composite', color: '#b388ff', label: 'Composite' },
+      { key: 'comp_volume', color: '#00d4ff', label: 'Volume' },
+      { key: 'comp_greek', color: '#00e676', label: 'Greek' },
+    ];
+
+    // Collect all values for y-axis range
+    let allVals: number[] = [];
+    for (const s of series) {
+      for (const row of history) {
+        const v = row[s.key];
+        if (v != null && typeof v === 'number') allVals.push(v);
+      }
+    }
+    if (allVals.length === 0) return;
+
+    const minV = Math.min(...allVals) * 0.98;
+    const maxV = Math.max(...allVals) * 1.02;
+    const range = maxV - minV || 0.01;
+
+    const toX = (i: number) => pad.left + (history.length === 1 ? cw / 2 : (i / (history.length - 1)) * cw);
+    const toY = (v: number) => pad.top + ch - ((v - minV) / range) * ch;
+
+    // Grid lines
+    ctx.strokeStyle = '#1a1a2520';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.top + (ch / 4) * i;
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y);
+      ctx.lineTo(w - pad.right, y);
+      ctx.stroke();
+    }
+
+    // Y axis labels
+    ctx.fillStyle = '#555570';
+    ctx.font = '9px "JetBrains Mono"';
+    ctx.textAlign = 'right';
+    for (let i = 0; i <= 4; i++) {
+      const val = maxV - (range / 4) * i;
+      ctx.fillText(val.toFixed(3), pad.left - 5, pad.top + (ch / 4) * i + 3);
+    }
+
+    // X axis dates
+    ctx.textAlign = 'center';
+    if (history.length === 1) {
+      const d = new Date(history[0].date);
+      ctx.fillText(`${d.getMonth() + 1}/${d.getDate()}`, toX(0), h - pad.bottom + 14);
+    } else {
+      const labelCount = Math.min(6, history.length);
+      for (let i = 0; i < labelCount; i++) {
+        const idx = Math.floor((i / (labelCount - 1)) * (history.length - 1));
+        const d = new Date(history[idx].date);
+        ctx.fillText(`${d.getMonth() + 1}/${d.getDate()}`, toX(idx), h - pad.bottom + 14);
+      }
+    }
+
+    // Draw each series
+    for (const s of series) {
+      const points: { x: number; y: number }[] = [];
+      for (let i = 0; i < history.length; i++) {
+        const v = history[i][s.key];
+        if (v != null && typeof v === 'number') {
+          points.push({ x: toX(i), y: toY(v) });
+        }
+      }
+      if (points.length === 0) continue;
+
+      if (points.length === 1) {
+        // Single point: draw a dot
+        ctx.beginPath();
+        ctx.arc(points[0].x, points[0].y, 4, 0, Math.PI * 2);
+        ctx.fillStyle = s.color;
+        ctx.fill();
+        ctx.strokeStyle = s.color;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      } else {
+        // Line
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        for (let i = 1; i < points.length; i++) {
+          ctx.lineTo(points[i].x, points[i].y);
+        }
+        ctx.strokeStyle = s.color;
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        // Dots at each data point
+        for (const pt of points) {
+          ctx.beginPath();
+          ctx.arc(pt.x, pt.y, 2.5, 0, Math.PI * 2);
+          ctx.fillStyle = s.color;
+          ctx.fill();
+        }
+      }
+    }
+
+    // Legend
+    ctx.font = '9px "JetBrains Mono"';
+    ctx.textAlign = 'left';
+    let lx = pad.left + 4;
+    for (const s of series) {
+      ctx.fillStyle = s.color;
+      ctx.fillRect(lx, pad.top - 14, 10, 3);
+      ctx.fillText(s.label, lx + 14, pad.top - 10);
+      lx += ctx.measureText(s.label).width + 28;
+    }
+  }, [history]);
+
   // ─── September check ────────────────────────────────────
   const isSeptember = new Date().getMonth() === 8;
 
@@ -356,48 +514,48 @@ export default function EntropyTab() {
     );
   }
 
-  if (data.status === 'warmup') {
-    const warmupPct = Math.round((data.warmup.current / data.warmup.required) * 100);
-    return (
-      <div className="p-8">
-        <div className="panel p-6 flex flex-col items-center gap-4">
-          <Brain className="w-8 h-8 text-accent-amber animate-pulse" />
-          <p className="text-sm font-mono text-text-secondary">
-            Warming up: {data.warmup.current}/{data.warmup.required} days
-          </p>
-          <div className="w-full max-w-md h-2 bg-bg-primary rounded-full overflow-hidden">
-            <div
-              className="h-full bg-accent-amber rounded-full transition-all"
-              style={{ width: `${warmupPct}%` }}
-            />
-          </div>
-          <p className="text-xs font-mono text-text-muted">
-            The engine needs {data.warmup.required} days of data to compute stable medians. It auto-runs daily during market hours.
-          </p>
-          <button
-            onClick={runEngine}
-            disabled={running || data.date === todayET()}
-            className="px-4 py-2 rounded-md bg-accent-amber/20 border border-accent-amber/30 text-accent-amber text-xs font-mono hover:bg-accent-amber/30 transition-all disabled:opacity-50 flex items-center gap-2"
-          >
-            {running ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-            {running ? 'Running...' : data.date === todayET() ? 'Already ran today' : 'Run Now'}
-          </button>
-          {runResult && (
-            <p className={`text-xs font-mono ${runResult.status === 'error' ? 'text-accent-red' : 'text-accent-green'}`}>
-              {runResult.message}
-            </p>
-          )}
-        </div>
-      </div>
-    );
-  }
+  // Warmup state now falls through to the active dashboard below,
+  // with a warmup banner at the top instead of blocking the view.
 
-  // ─── Active dashboard ───────────────────────────────────
+  // ─── Active dashboard (also used during warmup) ─────────
 
   const { metrics, medians, signals, openPositions, recentTrades, equity, stats } = data;
+  const isWarmup = data.status === 'warmup';
 
   return (
     <div className="flex flex-col gap-4 p-4">
+      {/* Warmup banner */}
+      {isWarmup && (
+        <div className="panel p-4 flex items-center gap-4">
+          <Brain className="w-6 h-6 text-accent-amber shrink-0 animate-pulse" />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-sm font-mono text-text-primary font-semibold">Warming Up</span>
+              <span className="text-xs font-mono text-text-muted">
+                {data.warmup.current}/{data.warmup.required} days
+              </span>
+            </div>
+            <div className="w-full h-1.5 bg-bg-primary rounded-full overflow-hidden mb-1">
+              <div
+                className="h-full bg-accent-amber rounded-full transition-all"
+                style={{ width: `${Math.round((data.warmup.current / data.warmup.required) * 100)}%` }}
+              />
+            </div>
+            <p className="text-[10px] font-mono text-text-muted">
+              Signals require {data.warmup.required} days for stable medians. Backfill is not possible — option chains are point-in-time snapshots. Below is the data collected so far.
+            </p>
+          </div>
+          <button
+            onClick={runEngine}
+            disabled={running || data.date === todayET()}
+            className="px-3 py-1.5 rounded-md bg-accent-amber/20 border border-accent-amber/30 text-accent-amber text-xs font-mono hover:bg-accent-amber/30 transition-all disabled:opacity-50 flex items-center gap-1.5 shrink-0"
+          >
+            {running ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+            {running ? 'Running...' : data.date === todayET() ? 'Ran today' : 'Run Now'}
+          </button>
+        </div>
+      )}
+
       {/* September skip warning */}
       {isSeptember && (
         <div className="flex items-center gap-2 px-4 py-2.5 rounded-md bg-accent-amber/10 border border-accent-amber/20">
@@ -517,6 +675,48 @@ export default function EntropyTab() {
           })}
         </div>
       </div>
+
+      {/* Section 2.5: Entropy History Chart (especially useful during warmup) */}
+      {history.length >= 1 && (
+        <div className="panel flex flex-col">
+          <div className="panel-header">
+            <div className="flex items-center gap-1.5">
+              <TrendingUp className="w-3.5 h-3.5 text-accent-purple" />
+              <span className="panel-title">Entropy History</span>
+              <span className="text-[10px] font-mono text-text-muted">({history.length} day{history.length !== 1 ? 's' : ''})</span>
+            </div>
+          </div>
+          <div ref={warmupContainerRef} className="flex-1 min-h-[280px]">
+            <canvas ref={warmupCanvasRef} className="w-full h-full" />
+          </div>
+          {/* Raw metrics table */}
+          <div className="overflow-x-auto border-t border-border/10">
+            <table className="w-full text-[10px] font-mono">
+              <thead>
+                <tr className="border-b border-border/20">
+                  {['Date', 'SPY', 'Composite', 'Vol Ent', 'Greek Ent', 'IV Mean', 'Put Skew', 'PCR $'].map(h => (
+                    <th key={h} className="px-2 py-1.5 text-left text-text-muted font-normal uppercase tracking-wider">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {[...history].reverse().slice(0, 15).map((row) => (
+                  <tr key={row.date} className="border-b border-border/5 hover:bg-bg-primary/30">
+                    <td className="px-2 py-1 text-text-muted">{row.date}</td>
+                    <td className="px-2 py-1 text-text-primary">${row.spot?.toFixed(2) ?? '—'}</td>
+                    <td className="px-2 py-1 text-accent-purple">{fmt4(row.composite)}</td>
+                    <td className="px-2 py-1 text-accent-cyan">{fmt4(row.comp_volume)}</td>
+                    <td className="px-2 py-1 text-accent-green">{fmt4(row.comp_greek)}</td>
+                    <td className="px-2 py-1 text-text-secondary">{row.iv_mean != null ? fmtPct(row.iv_mean) : '—'}</td>
+                    <td className="px-2 py-1 text-text-secondary">{row.put_skew != null ? `${(row.put_skew * 100).toFixed(1)}pp` : '—'}</td>
+                    <td className="px-2 py-1 text-text-secondary">{fmtRatio(row.pcr_dollar)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* Section 3: Signal Status */}
       <div className="panel">
