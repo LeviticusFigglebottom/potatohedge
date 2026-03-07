@@ -6,18 +6,86 @@ export const dynamic = 'force-dynamic';
 
 function resolveDbPath(): string {
   if (process.env.ENGINE_DB_PATH) return process.env.ENGINE_DB_PATH;
-  // Check cwd/data first (local dev), then /tmp (serverless)
-  const cwdPath = path.join(process.cwd(), 'data', 'entropy_engine.db');
-  if (fs.existsSync(cwdPath)) return cwdPath;
-  return path.join('/tmp', 'entropy-data', 'entropy_engine.db');
+  // Try cwd/data first (local dev), fall back to /tmp (serverless)
+  const cwdData = path.join(process.cwd(), 'data');
+  try {
+    if (!fs.existsSync(cwdData)) fs.mkdirSync(cwdData, { recursive: true });
+    const testFile = path.join(cwdData, '.write-test');
+    fs.writeFileSync(testFile, '');
+    fs.unlinkSync(testFile);
+    return path.join(cwdData, 'entropy_engine.db');
+  } catch {
+    const tmpDir = path.join('/tmp', 'entropy-data');
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+    return path.join(tmpDir, 'entropy_engine.db');
+  }
 }
 
-function getDb() {
+function initSchema(db: ReturnType<typeof getDb>) {
+  if (!db) return;
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS entropy_history (
+      date TEXT PRIMARY KEY,
+      spot REAL,
+      metrics_json TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS positions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      strategy TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      trade_type TEXT,
+      qty INTEGER,
+      entry_price REAL,
+      entry_cost REAL,
+      entry_date TEXT,
+      strike REAL,
+      expiry TEXT,
+      is_credit INTEGER,
+      is_open INTEGER DEFAULT 1,
+      close_date TEXT,
+      close_reason TEXT,
+      close_pnl REAL,
+      fill_corrected INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS trades_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      date TEXT,
+      strategy TEXT,
+      action TEXT,
+      symbol TEXT,
+      qty INTEGER,
+      price REAL,
+      details TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS equity_curve (
+      date TEXT PRIMARY KEY,
+      portfolio_value REAL,
+      cash REAL,
+      positions_value REAL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS signals_log (
+      date TEXT,
+      strategy TEXT,
+      fired INTEGER,
+      strength REAL,
+      trade_type TEXT,
+      rationale TEXT,
+      executed INTEGER DEFAULT 0,
+      PRIMARY KEY (date, strategy)
+    );
+  `);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function getDb(): any {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const Database = require('better-sqlite3');
   const dbPath = resolveDbPath();
-  if (!fs.existsSync(dbPath)) return null;
-  return new Database(dbPath, { readonly: true });
+  // Create writable DB (not readonly) so we can restore from Redis
+  return new Database(dbPath);
 }
 
 export async function GET(request: NextRequest) {
@@ -25,16 +93,23 @@ export async function GET(request: NextRequest) {
   const days = parseInt(request.nextUrl.searchParams.get('days') || '60', 10);
   const status = request.nextUrl.searchParams.get('status') || 'all';
 
-  const db = getDb();
-  if (!db) {
+  let db;
+  try {
+    db = getDb();
+  } catch {
     return NextResponse.json({
       status: 'no_db',
-      message: 'Entropy engine database not found. Run entropy_engine.py to initialize.',
+      message: 'Entropy engine database not found.',
       warmup: { current: 0, required: 30 },
     });
   }
 
   try {
+    // Initialize schema and restore from Redis on cold starts
+    initSchema(db);
+    const { restoreFromRedis } = await import('@/lib/entropy/persistence');
+    await restoreFromRedis(db);
+
     if (view === 'dashboard') {
       // Latest entropy metrics
       const latest = db.prepare(
@@ -46,6 +121,14 @@ export async function GET(request: NextRequest) {
       // History count for warmup status
       const countRow = db.prepare('SELECT COUNT(*) as cnt FROM entropy_history').get() as { cnt: number };
       const historyCount = countRow.cnt;
+
+      if (historyCount === 0) {
+        return NextResponse.json({
+          status: 'no_db',
+          message: 'Entropy engine has not been initialized yet.',
+          warmup: { current: 0, required: 30 },
+        });
+      }
 
       // Open positions
       const openPositions = db.prepare(
@@ -176,6 +259,6 @@ export async function GET(request: NextRequest) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     return NextResponse.json({ error: message }, { status: 500 });
   } finally {
-    db.close();
+    if (db) db.close();
   }
 }

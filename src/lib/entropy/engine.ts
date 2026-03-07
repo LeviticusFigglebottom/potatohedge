@@ -24,6 +24,7 @@ import {
   getBalances,
   closePosition as tradierClosePosition,
 } from '@/lib/providers/tradierPaper';
+import { restoreFromRedis, persistToRedis } from '@/lib/entropy/persistence';
 
 // ═══════════════════════════════════════════════════════════════════
 //  CONFIG — matches T13 exactly
@@ -47,6 +48,16 @@ const INITIAL_CASH = 100_000;
 
 const TRADIER_BASE_URL = 'https://api.tradier.com/v1';
 const FETCH_TIMEOUT = 12_000;
+
+/**
+ * Get today's date string in Eastern Time (matching Python's date.today() when run at 3:50pm ET).
+ */
+function todayET(): string {
+  const now = new Date();
+  // Use Intl to get ET date reliably (handles DST)
+  const etDate = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  return `${etDate.getFullYear()}-${String(etDate.getMonth() + 1).padStart(2, '0')}-${String(etDate.getDate()).padStart(2, '0')}`;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 //  TYPES
@@ -1055,14 +1066,18 @@ async function closePositionDb(
 // ═══════════════════════════════════════════════════════════════════
 
 export async function runEntropyEngine(): Promise<RunResult> {
-  const today = new Date();
-  const todayStr = today.toISOString().slice(0, 10);
+  const todayStr = todayET();
+  // Determine month from ET date for September skip
+  const etMonth = parseInt(todayStr.split('-')[1], 10); // 1-indexed
 
   let db: BetterSqlite3Database | null = null;
 
   try {
     db = getDb();
     initDb(db);
+
+    // Restore data from Redis (handles serverless cold starts)
+    await restoreFromRedis(db);
 
     // Check if already ran today
     const existing = db
@@ -1078,10 +1093,10 @@ export async function runEntropyEngine(): Promise<RunResult> {
       };
     }
 
-    // September skip
-    if (today.getMonth() === 8) {
-      // JS months are 0-indexed; 8 = September
+    // September skip — still manage existing positions
+    if (etMonth === 9) {
       await managePositions(db, todayStr);
+      await persistToRedis(db);
       db.close();
       return {
         success: true,
@@ -1139,6 +1154,8 @@ export async function runEntropyEngine(): Promise<RunResult> {
     // 3. Load history
     const history = getHistory(db);
     if (history.length < WARMUP_DAYS) {
+      // Persist to Redis so data survives redeployments
+      await persistToRedis(db);
       db.close();
       return {
         success: true,
@@ -1306,6 +1323,9 @@ export async function runEntropyEngine(): Promise<RunResult> {
        VALUES (?, ?, ?, ?)`,
     ).run(todayStr, portfolioValue, portfolioValue, 0);
 
+    // Persist all data to Redis for cross-deployment survival
+    await persistToRedis(db);
+
     db.close();
 
     return {
@@ -1352,18 +1372,9 @@ export async function getEngineStatus(): Promise<Record<string, unknown>> {
     };
   }
 
-  // Check if tables exist
-  const tableCheck = db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='entropy_history'")
-    .get();
-  if (!tableCheck) {
-    db.close();
-    return {
-      status: 'no_db',
-      message: 'Entropy engine database not initialized.',
-      warmup: { current: 0, required: WARMUP_DAYS },
-    };
-  }
+  // Initialize schema and restore from Redis on cold starts
+  initDb(db);
+  await restoreFromRedis(db);
 
   try {
     // Latest entropy metrics
