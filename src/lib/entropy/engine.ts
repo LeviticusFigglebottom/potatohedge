@@ -59,6 +59,39 @@ function todayET(): string {
   return `${etDate.getFullYear()}-${String(etDate.getMonth() + 1).padStart(2, '0')}-${String(etDate.getDate()).padStart(2, '0')}`;
 }
 
+/** Check if a YYYY-MM-DD string is a US equity trading day. */
+function isTradingDay(dateStr: string): boolean {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const date = new Date(y, m - 1, d);
+  const dow = date.getDay();
+  if (dow === 0 || dow === 6) return false;
+
+  const mmdd = `${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  if (['01-01', '06-19', '07-04', '12-25'].includes(mmdd)) return false;
+
+  if (m === 1 && dow === 1 && d >= 15 && d <= 21) return false; // MLK
+  if (m === 2 && dow === 1 && d >= 15 && d <= 21) return false; // Presidents
+  if (m === 5 && dow === 1 && d >= 25) return false;            // Memorial
+  if (m === 9 && dow === 1 && d <= 7) return false;             // Labor
+  if (m === 11 && dow === 4 && d >= 22 && d <= 28) return false; // Thanksgiving
+
+  // Good Friday: 2 days before Easter
+  const a = y % 19, b = Math.floor(y / 100), c = y % 100;
+  const dd = Math.floor(b / 4), e = b % 4;
+  const f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - dd - g + 15) % 30;
+  const i = Math.floor(c / 4), k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const mm = Math.floor((a + 11 * h + 22 * l) / 451);
+  const eMonth = Math.floor((h + l - 7 * mm + 114) / 31);
+  const eDay = ((h + l - 7 * mm + 114) % 31) + 1;
+  const gf = new Date(y, eMonth - 1, eDay);
+  gf.setDate(gf.getDate() - 2);
+  if (m === gf.getMonth() + 1 && d === gf.getDate()) return false;
+
+  return true;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  TYPES
 // ═══════════════════════════════════════════════════════════════════
@@ -1067,6 +1100,17 @@ async function closePositionDb(
 
 export async function runEntropyEngine(): Promise<RunResult> {
   const todayStr = todayET();
+
+  // Guard: don't record data on non-trading days (weekends + holidays)
+  if (!isTradingDay(todayStr)) {
+    return {
+      success: true,
+      date: todayStr,
+      status: 'already_ran', // reuse status to avoid adding new union member
+      message: `Not a trading day (${todayStr}), skipping`,
+    };
+  }
+
   // Determine month from ET date for September skip
   const etMonth = parseInt(todayStr.split('-')[1], 10); // 1-indexed
 
