@@ -262,3 +262,48 @@ export async function GET(request: NextRequest) {
     if (db) db.close();
   }
 }
+
+/**
+ * DELETE /api/entropy — Clear all entropy data (clean slate).
+ * Requires CRON_SECRET authorization.
+ */
+export async function DELETE(request: NextRequest) {
+  const authHeader = request.headers.get('authorization');
+  const cronSecret = process.env.CRON_SECRET;
+  if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  try {
+    const { clearAllRedisData } = await import('@/lib/entropy/persistence');
+    const keysDeleted = await clearAllRedisData();
+
+    // Also clear the local SQLite if it exists
+    let sqliteCleared = false;
+    try {
+      const db = getDb();
+      initSchema(db);
+      db.exec(`
+        DELETE FROM entropy_history;
+        DELETE FROM positions;
+        DELETE FROM trades_log;
+        DELETE FROM equity_curve;
+        DELETE FROM signals_log;
+      `);
+      db.close();
+      sqliteCleared = true;
+    } catch {
+      // SQLite may not exist yet, that's fine
+    }
+
+    return NextResponse.json({
+      success: true,
+      message: 'All entropy data cleared',
+      redisKeysDeleted: keysDeleted,
+      sqliteCleared,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}

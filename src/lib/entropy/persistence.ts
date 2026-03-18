@@ -210,6 +210,26 @@ export async function persistToRedis(db: BetterSqlite3Database): Promise<void> {
 }
 
 /**
+ * Clear all entropy data from Redis (clean slate).
+ * Returns the number of keys deleted.
+ */
+export async function clearAllRedisData(): Promise<number> {
+  const redis = await getRedis();
+  if (!redis) return 0;
+  const keys = ['entropy:history', 'entropy:positions', 'entropy:trades', 'entropy:equity', 'entropy:signals'];
+  let deleted = 0;
+  for (const key of keys) {
+    try {
+      await redis.del(key);
+      deleted++;
+    } catch {
+      // Key may not exist, that's fine
+    }
+  }
+  return deleted;
+}
+
+/**
  * Check if Redis has entropy data (for diagnostics).
  */
 export async function hasRedisData(): Promise<boolean> {
