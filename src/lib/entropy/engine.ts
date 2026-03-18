@@ -190,7 +190,7 @@ interface PositionRow {
 export interface RunResult {
   success: boolean;
   date: string;
-  status: 'already_ran' | 'september_skip' | 'warmup' | 'executed' | 'error';
+  status: 'already_ran' | 'september_skip' | 'warmup' | 'executed' | 'error' | 'skipped';
   message: string;
   metrics?: Record<string, number | null>;
   signalsFired?: string[];
@@ -1106,8 +1106,28 @@ export async function runEntropyEngine(): Promise<RunResult> {
     return {
       success: true,
       date: todayStr,
-      status: 'already_ran', // reuse status to avoid adding new union member
+      status: 'skipped',
       message: `Not a trading day (${todayStr}), skipping`,
+    };
+  }
+
+  // Guard: only run after market close (>= 3:55pm ET) to ensure EOD data consistency.
+  // All snapshots should reflect settled closing values, not partial intraday data.
+  const now = new Date();
+  const etTimeStr = now.toLocaleString('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    minute: 'numeric',
+    hour12: false,
+  });
+  const [etHour, etMin] = etTimeStr.split(':').map(Number);
+  const etMinutes = etHour * 60 + etMin; // minutes since midnight ET
+  if (etMinutes < 15 * 60 + 55) { // before 3:55pm ET
+    return {
+      success: true,
+      date: todayStr,
+      status: 'skipped',
+      message: `Market still open (${etHour}:${String(etMin).padStart(2, '0')} ET). Engine runs after 3:55pm ET for EOD data consistency.`,
     };
   }
 

@@ -109,20 +109,6 @@ const ACTION_COLORS: Record<string, string> = {
 
 // ─── Market Hours Helper ────────────────────────────────────
 
-function isMarketHours(): boolean {
-  const now = new Date();
-  // Convert to ET (approximate: UTC-5 or UTC-4 during DST)
-  const utcH = now.getUTCHours();
-  const utcM = now.getUTCMinutes();
-  const month = now.getUTCMonth();
-  // Rough DST: March-November
-  const isDST = month >= 2 && month <= 10;
-  const etH = utcH - (isDST ? 4 : 5);
-  const etMin = etH * 60 + utcM;
-  const day = now.getUTCDay();
-  // Mon-Fri, 9:30am - 4:00pm ET
-  return day >= 1 && day <= 5 && etMin >= 570 && etMin <= 960;
-}
 
 function todayET(): string {
   // Get today's date in ET
@@ -147,7 +133,7 @@ export default function EntropyTab() {
   const containerRef = useRef<HTMLDivElement>(null);
   const warmupCanvasRef = useRef<HTMLCanvasElement>(null);
   const warmupContainerRef = useRef<HTMLDivElement>(null);
-  const autoRunAttempted = useRef<string>('');
+
 
   const fetchData = useCallback(async () => {
     try {
@@ -187,30 +173,8 @@ export default function EntropyTab() {
     }
   }, [running, fetchData]);
 
-  // Auto-run: during market hours, if engine hasn't run today
-  useEffect(() => {
-    const checkAndRun = () => {
-      const today = todayET();
-      // Only auto-run once per day, and only during market hours
-      if (autoRunAttempted.current === today) return;
-      if (!isMarketHours()) return;
-
-      // Check if data already has today's date
-      if (data?.date === today) {
-        autoRunAttempted.current = today;
-        return;
-      }
-
-      autoRunAttempted.current = today;
-      runEngine();
-    };
-
-    // Check on mount
-    const timer = setTimeout(checkAndRun, 2000);
-    // Re-check every 5 minutes
-    const interval = setInterval(checkAndRun, 5 * 60_000);
-    return () => { clearTimeout(timer); clearInterval(interval); };
-  }, [data?.date, runEngine]);
+  // Engine runs autonomously via cron (GitHub Actions at ~4:05pm ET post-close).
+  // Manual runs are allowed but guarded — engine rejects if market is still open.
 
   useEffect(() => {
     fetchData();
@@ -505,7 +469,7 @@ export default function EntropyTab() {
             {running ? 'Initializing...' : 'Initialize Engine'}
           </button>
           {runResult && (
-            <p className={`text-xs font-mono ${runResult.status === 'error' ? 'text-accent-red' : 'text-accent-green'}`}>
+            <p className={`text-xs font-mono ${runResult.status === 'error' ? 'text-accent-red' : runResult.status === 'skipped' ? 'text-yellow-400' : 'text-accent-green'}`}>
               {runResult.message}
             </p>
           )}
@@ -596,7 +560,7 @@ export default function EntropyTab() {
             {running ? 'Running...' : 'Run'}
           </button>
           {runResult && !running && (
-            <span className={`text-[10px] font-mono ${runResult.status === 'error' ? 'text-accent-red' : 'text-accent-green'}`}>
+            <span className={`text-[10px] font-mono ${runResult.status === 'error' ? 'text-accent-red' : runResult.status === 'skipped' ? 'text-yellow-400' : 'text-accent-green'}`}>
               {runResult.message.slice(0, 40)}
             </span>
           )}
