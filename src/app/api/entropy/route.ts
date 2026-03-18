@@ -254,6 +254,71 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ equity: rows });
     }
 
+    if (view === 'diagnostics') {
+      const { hasRedisData } = await import('@/lib/entropy/persistence');
+      const redisConnected = await hasRedisData().then(() => true).catch(() => false);
+      const redisHasData = await hasRedisData().catch(() => false);
+
+      // History stats
+      const historyRows = db.prepare(
+        'SELECT date FROM entropy_history ORDER BY date DESC'
+      ).all() as { date: string }[];
+      const lastRunDate = historyRows[0]?.date || null;
+      const totalDays = historyRows.length;
+
+      // Check for gaps in history (missing trading days)
+      const gaps: string[] = [];
+      for (let i = 0; i < historyRows.length - 1 && i < 30; i++) {
+        const curr = new Date(historyRows[i].date);
+        const prev = new Date(historyRows[i + 1].date);
+        const diffDays = Math.round((curr.getTime() - prev.getTime()) / (1000 * 60 * 60 * 24));
+        // Allow 1 day (consecutive) or 3 days (over weekend); flag anything larger
+        if (diffDays > 3) {
+          gaps.push(`${historyRows[i + 1].date} → ${historyRows[i].date} (${diffDays} days)`);
+        }
+      }
+
+      // Recent run results (last 7 entries)
+      const recentRuns = db.prepare(
+        'SELECT date, spot, metrics_json FROM entropy_history ORDER BY date DESC LIMIT 7'
+      ).all() as { date: string; spot: number; metrics_json: string }[];
+      const runLog = recentRuns.map(r => {
+        const m = JSON.parse(r.metrics_json);
+        return {
+          date: r.date,
+          spot: r.spot,
+          composite: m.composite ?? null,
+          records: m._n_records ?? null,
+        };
+      });
+
+      // Next expected run: next weekday at ~4:05pm ET
+      const now = new Date();
+      const etNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+      const etHour = etNow.getHours();
+      let nextRun = new Date(etNow);
+      // If past 4pm today or already ran today, next run is tomorrow
+      if (etHour >= 16 || lastRunDate === now.toLocaleDateString('en-CA', { timeZone: 'America/New_York' })) {
+        nextRun.setDate(nextRun.getDate() + 1);
+      }
+      // Skip to Monday if weekend
+      while (nextRun.getDay() === 0 || nextRun.getDay() === 6) {
+        nextRun.setDate(nextRun.getDate() + 1);
+      }
+      const nextRunStr = `${nextRun.getFullYear()}-${String(nextRun.getMonth() + 1).padStart(2, '0')}-${String(nextRun.getDate()).padStart(2, '0')} ~4:05pm ET`;
+
+      return NextResponse.json({
+        redisConnected,
+        redisHasData,
+        totalDays,
+        warmupComplete: totalDays >= 30,
+        lastRunDate,
+        nextExpectedRun: nextRunStr,
+        gaps,
+        runLog,
+      });
+    }
+
     return NextResponse.json({ error: 'Unknown view' }, { status: 400 });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';

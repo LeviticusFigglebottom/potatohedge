@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Brain, Activity, Zap, TrendingUp, AlertTriangle, Clock, DollarSign, Play, Loader2, CheckCircle2 } from 'lucide-react';
+import { Brain, Activity, Zap, TrendingUp, AlertTriangle, Clock, DollarSign, Play, Loader2, CheckCircle2, Trash2, Settings, Wifi, WifiOff, Database, CalendarCheck } from 'lucide-react';
 import InfoTip from './vol/InfoTip';
 
 // ─── Types ──────────────────────────────────────────────────
@@ -129,11 +129,55 @@ export default function EntropyTab() {
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [runResult, setRunResult] = useState<{ status: string; message: string } | null>(null);
+  const [diagnostics, setDiagnostics] = useState<{
+    redisConnected: boolean;
+    redisHasData: boolean;
+    totalDays: number;
+    warmupComplete: boolean;
+    lastRunDate: string | null;
+    nextExpectedRun: string;
+    gaps: string[];
+    runLog: { date: string; spot: number; composite: number | null; records: number | null }[];
+  } | null>(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [purging, setPurging] = useState(false);
+  const [purgeConfirm, setPurgeConfirm] = useState(false);
+  const [purgeResult, setPurgeResult] = useState<string | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const warmupCanvasRef = useRef<HTMLCanvasElement>(null);
   const warmupContainerRef = useRef<HTMLDivElement>(null);
 
+  const fetchDiagnostics = useCallback(async () => {
+    try {
+      const res = await fetch('/api/entropy?view=diagnostics');
+      if (res.ok) setDiagnostics(await res.json());
+    } catch { /* silent */ }
+  }, []);
+
+  const purgeAllData = useCallback(async () => {
+    if (!purgeConfirm || purging) return;
+    setPurging(true);
+    setPurgeResult(null);
+    try {
+      const res = await fetch('/api/entropy', { method: 'DELETE' });
+      const json = await res.json();
+      if (json.success) {
+        setPurgeResult('All entropy data purged. Refresh to reinitialize.');
+        // Reset state
+        setData(null);
+        setHistory([]);
+        setDiagnostics(null);
+      } else {
+        setPurgeResult(`Purge failed: ${json.error || 'Unknown error'}`);
+      }
+    } catch (err) {
+      setPurgeResult(`Purge failed: ${err instanceof Error ? err.message : 'Network error'}`);
+    } finally {
+      setPurging(false);
+      setPurgeConfirm(false);
+    }
+  }, [purgeConfirm, purging]);
 
   const fetchData = useCallback(async () => {
     try {
@@ -178,9 +222,11 @@ export default function EntropyTab() {
 
   useEffect(() => {
     fetchData();
+    fetchDiagnostics();
     const interval = setInterval(fetchData, 60_000);
-    return () => clearInterval(interval);
-  }, [fetchData]);
+    const diagInterval = setInterval(fetchDiagnostics, 5 * 60_000);
+    return () => { clearInterval(interval); clearInterval(diagInterval); };
+  }, [fetchData, fetchDiagnostics]);
 
   // ─── Equity Chart ───────────────────────────────────────
   useEffect(() => {
@@ -473,6 +519,28 @@ export default function EntropyTab() {
               {runResult.message}
             </p>
           )}
+          {/* Diagnostics in uninitialized state */}
+          <div className="w-full max-w-md mt-2">
+            <button
+              onClick={() => { setShowDiagnostics(v => !v); if (!diagnostics) fetchDiagnostics(); }}
+              className="text-[10px] font-mono text-text-muted hover:text-text-secondary transition-all flex items-center gap-1"
+            >
+              <Settings className="w-3 h-3" />
+              {showDiagnostics ? 'Hide diagnostics' : 'Show diagnostics'}
+            </button>
+            {showDiagnostics && diagnostics && (
+              <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] font-mono">
+                <div className="flex items-center gap-1.5 p-2 rounded bg-bg-primary/50">
+                  {diagnostics.redisConnected ? <Wifi className="w-3 h-3 text-accent-green" /> : <WifiOff className="w-3 h-3 text-accent-red" />}
+                  <span className="text-text-muted">Redis: {diagnostics.redisConnected ? 'connected' : 'disconnected'}</span>
+                </div>
+                <div className="flex items-center gap-1.5 p-2 rounded bg-bg-primary/50">
+                  <CalendarCheck className="w-3 h-3 text-accent-cyan" />
+                  <span className="text-text-muted">Next: {diagnostics.nextExpectedRun}</span>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     );
@@ -937,6 +1005,171 @@ export default function EntropyTab() {
           </div>
         </div>
       )}
+
+      {/* Section 8: Engine Diagnostics & Administration */}
+      <div className="panel">
+        <div className="panel-header cursor-pointer" onClick={() => { setShowDiagnostics(v => !v); if (!diagnostics) fetchDiagnostics(); }}>
+          <div className="flex items-center gap-1.5">
+            <Settings className="w-3.5 h-3.5 text-text-muted" />
+            <span className="panel-title">Engine Health & Admin</span>
+          </div>
+          <span className="text-[10px] font-mono text-text-muted">{showDiagnostics ? '▲ collapse' : '▼ expand'}</span>
+        </div>
+
+        {showDiagnostics && (
+          <div className="p-4 flex flex-col gap-4">
+            {/* Connection & Cron Status */}
+            {diagnostics ? (
+              <div className="grid grid-cols-2 gap-3">
+                {/* Redis connection */}
+                <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
+                  {diagnostics.redisConnected ? (
+                    <Wifi className="w-4 h-4 text-accent-green shrink-0" />
+                  ) : (
+                    <WifiOff className="w-4 h-4 text-accent-red shrink-0" />
+                  )}
+                  <div>
+                    <span className="text-xs font-mono text-text-primary">Redis</span>
+                    <p className="text-[10px] font-mono text-text-muted">
+                      {diagnostics.redisConnected
+                        ? diagnostics.redisHasData ? 'Connected — data persisted' : 'Connected — no data yet'
+                        : 'Not connected — data will be lost on redeploy'}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Data collection */}
+                <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
+                  <Database className="w-4 h-4 text-accent-purple shrink-0" />
+                  <div>
+                    <span className="text-xs font-mono text-text-primary">{diagnostics.totalDays} days collected</span>
+                    <p className="text-[10px] font-mono text-text-muted">
+                      {diagnostics.warmupComplete
+                        ? 'Warmup complete — signals active'
+                        : `${30 - diagnostics.totalDays} more days until signals activate`}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Last run */}
+                <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
+                  <CheckCircle2 className={`w-4 h-4 shrink-0 ${diagnostics.lastRunDate ? 'text-accent-green' : 'text-accent-red'}`} />
+                  <div>
+                    <span className="text-xs font-mono text-text-primary">
+                      Last run: {diagnostics.lastRunDate || 'Never'}
+                    </span>
+                    <p className="text-[10px] font-mono text-text-muted">
+                      {diagnostics.lastRunDate
+                        ? `${Math.round((Date.now() - new Date(diagnostics.lastRunDate).getTime()) / (1000 * 60 * 60 * 24))} days ago`
+                        : 'Engine has not run yet'}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Next expected */}
+                <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
+                  <CalendarCheck className="w-4 h-4 text-accent-cyan shrink-0" />
+                  <div>
+                    <span className="text-xs font-mono text-text-primary">Next run</span>
+                    <p className="text-[10px] font-mono text-text-muted">{diagnostics.nextExpectedRun}</p>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="text-xs font-mono text-text-muted animate-pulse">Loading diagnostics...</div>
+            )}
+
+            {/* Gaps warning */}
+            {diagnostics?.gaps && diagnostics.gaps.length > 0 && (
+              <div className="p-3 rounded-md bg-accent-amber/10 border border-accent-amber/20">
+                <div className="flex items-center gap-1.5 mb-1">
+                  <AlertTriangle className="w-3.5 h-3.5 text-accent-amber" />
+                  <span className="text-xs font-mono text-accent-amber font-semibold">Gaps detected in history</span>
+                </div>
+                <div className="flex flex-col gap-0.5">
+                  {diagnostics.gaps.map((gap, i) => (
+                    <span key={i} className="text-[10px] font-mono text-accent-amber/80">{gap}</span>
+                  ))}
+                </div>
+                <p className="text-[10px] font-mono text-text-muted mt-1">
+                  Gaps may indicate the cron job failed on those days. Check GitHub Actions for errors.
+                </p>
+              </div>
+            )}
+
+            {/* Recent run log */}
+            {diagnostics?.runLog && diagnostics.runLog.length > 0 && (
+              <div>
+                <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">Recent runs</span>
+                <div className="mt-1 overflow-x-auto">
+                  <table className="w-full text-[10px] font-mono">
+                    <thead>
+                      <tr className="border-b border-border/20">
+                        {['Date', 'SPY', 'Composite', 'Chain Records'].map(h => (
+                          <th key={h} className="px-2 py-1 text-left text-text-muted font-normal">{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {diagnostics.runLog.map(r => (
+                        <tr key={r.date} className="border-b border-border/5">
+                          <td className="px-2 py-1 text-text-muted">{r.date}</td>
+                          <td className="px-2 py-1 text-text-primary">${r.spot.toFixed(2)}</td>
+                          <td className="px-2 py-1 text-accent-purple">{r.composite != null ? r.composite.toFixed(4) : '—'}</td>
+                          <td className="px-2 py-1 text-text-secondary">{r.records ?? '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* Danger zone: Purge */}
+            <div className="mt-2 p-3 rounded-md border border-accent-red/20 bg-accent-red/5">
+              <div className="flex items-center gap-1.5 mb-2">
+                <Trash2 className="w-3.5 h-3.5 text-accent-red" />
+                <span className="text-xs font-mono text-accent-red font-semibold">Danger Zone</span>
+              </div>
+              <p className="text-[10px] font-mono text-text-muted mb-3">
+                Permanently delete all entropy history, positions, trades, signals, and equity data.
+                The engine will restart from scratch with a 30-day warmup period.
+              </p>
+              {purgeResult && (
+                <p className={`text-[10px] font-mono mb-2 ${purgeResult.includes('failed') ? 'text-accent-red' : 'text-accent-green'}`}>
+                  {purgeResult}
+                </p>
+              )}
+              {!purgeConfirm ? (
+                <button
+                  onClick={() => setPurgeConfirm(true)}
+                  className="px-3 py-1.5 rounded-md bg-accent-red/10 border border-accent-red/30 text-accent-red text-[10px] font-mono hover:bg-accent-red/20 transition-all flex items-center gap-1.5"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  Purge All Entropy Data
+                </button>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={purgeAllData}
+                    disabled={purging}
+                    className="px-3 py-1.5 rounded-md bg-accent-red/30 border border-accent-red/50 text-accent-red text-[10px] font-mono font-bold hover:bg-accent-red/40 transition-all disabled:opacity-50 flex items-center gap-1.5"
+                  >
+                    {purging ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                    {purging ? 'Purging...' : 'Confirm — Delete Everything'}
+                  </button>
+                  <button
+                    onClick={() => setPurgeConfirm(false)}
+                    className="px-3 py-1.5 rounded-md bg-bg-tertiary border border-border/30 text-text-muted text-[10px] font-mono hover:text-text-secondary transition-all"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
