@@ -2,7 +2,7 @@
   "crons": [
     {
       "path": "/api/entropy/cron",
-      "schedule": "50 19,20 * * 1-5"
+      "schedule": "5 21 * * 1-5"
     }
   ]
 }

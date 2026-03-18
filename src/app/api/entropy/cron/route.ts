@@ -6,35 +6,27 @@ export const maxDuration = 60;
 /**
  * Vercel Cron endpoint for the entropy engine.
  *
- * Schedule: "50 19,20 * * 1-5" (UTC) — fires at both 19:50 and 20:50 UTC
- * to cover 3:50pm ET in both EDT (UTC-4, Mar-Nov) and EST (UTC-5, Nov-Mar).
+ * Schedule: "5 21 * * 1-5" (UTC) — 21:05 UTC daily Mon-Fri.
+ * This maps to ~4:05pm ET (EST) or ~5:05pm ET (EDT) — both are post-close.
+ * Using post-close data is intentional: volume is finalized, bid/ask reflect
+ * closing values, and the engine computes its own IV/greeks from mid prices.
+ *
+ * Also callable via GitHub Actions or manual trigger for reliability.
  *
  * Guards:
- * 1. Only runs if current ET hour is 15 (3pm) — skips the wrong UTC trigger
- * 2. Only runs on actual trading days (skips holidays)
- * 3. Engine itself deduplicates (won't run twice in same day)
+ * 1. Only runs on actual trading days (skips weekends + holidays)
+ * 2. Engine itself deduplicates (won't run twice in same day)
  */
 export async function GET(request: NextRequest) {
-  // Verify cron authorization
+  // Verify cron authorization (Vercel sends this header for cron jobs)
+  // Also accept GitHub Actions triggers with the same secret
   const authHeader = request.headers.get('authorization');
   const cronSecret = process.env.CRON_SECRET;
   if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  // Check if it's actually ~3:50pm ET right now (guard against wrong UTC slot)
   const now = new Date();
-  const etHour = parseInt(
-    now.toLocaleString('en-US', { timeZone: 'America/New_York', hour: 'numeric', hour12: false }),
-    10
-  );
-  if (etHour !== 15) {
-    return NextResponse.json({
-      success: true,
-      status: 'skipped',
-      message: `Not 3pm ET (currently ${etHour}:xx ET), skipping`,
-    });
-  }
 
   // Check if today is a trading day (not weekend/holiday)
   if (!isTradingDay(now)) {
