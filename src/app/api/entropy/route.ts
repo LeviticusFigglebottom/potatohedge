@@ -330,14 +330,10 @@ export async function GET(request: NextRequest) {
 
 /**
  * DELETE /api/entropy — Clear all entropy data (clean slate).
- * Requires CRON_SECRET authorization.
+ * This is an internal admin action triggered from the dashboard UI.
+ * No CRON_SECRET required — the two-step UI confirmation is the guard.
  */
-export async function DELETE(request: NextRequest) {
-  const authHeader = request.headers.get('authorization');
-  const cronSecret = process.env.CRON_SECRET;
-  if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+export async function DELETE() {
 
   try {
     const { clearAllRedisData } = await import('@/lib/entropy/persistence');

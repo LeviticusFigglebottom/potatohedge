@@ -143,6 +143,13 @@ export default function EntropyTab() {
   const [purging, setPurging] = useState(false);
   const [purgeConfirm, setPurgeConfirm] = useState(false);
   const [purgeResult, setPurgeResult] = useState<string | null>(null);
+  const [cronTestRunning, setCronTestRunning] = useState(false);
+  const [cronTestResult, setCronTestResult] = useState<{
+    summary: string;
+    allPassed: boolean;
+    checks: { name: string; status: 'pass' | 'fail' | 'warn'; detail: string; ms?: number }[];
+    timestamp: string;
+  } | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const warmupCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -178,6 +185,34 @@ export default function EntropyTab() {
       setPurgeConfirm(false);
     }
   }, [purgeConfirm, purging]);
+
+  const runCronTest = useCallback(async () => {
+    if (cronTestRunning) return;
+    setCronTestRunning(true);
+    setCronTestResult(null);
+    try {
+      const res = await fetch('/api/entropy/cron/test');
+      if (res.ok) {
+        setCronTestResult(await res.json());
+      } else {
+        setCronTestResult({
+          summary: `Test endpoint returned HTTP ${res.status}`,
+          allPassed: false,
+          checks: [],
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } catch (err) {
+      setCronTestResult({
+        summary: `Network error: ${err instanceof Error ? err.message : 'unknown'}`,
+        allPassed: false,
+        checks: [],
+        timestamp: new Date().toISOString(),
+      });
+    } finally {
+      setCronTestRunning(false);
+    }
+  }, [cronTestRunning]);
 
   const fetchData = useCallback(async () => {
     try {
@@ -1078,6 +1113,50 @@ export default function EntropyTab() {
             ) : (
               <div className="text-xs font-mono text-text-muted animate-pulse">Loading diagnostics...</div>
             )}
+
+            {/* Cron Dry-Run Test */}
+            <div className="p-3 rounded-md bg-bg-primary/50 border border-border/10">
+              <div className="flex items-center justify-between mb-2">
+                <div>
+                  <span className="text-xs font-mono text-text-primary font-semibold">Cron Pipeline Test</span>
+                  <p className="text-[10px] font-mono text-text-muted">
+                    Verifies every dependency the cron job needs — without running the engine.
+                  </p>
+                </div>
+                <button
+                  onClick={runCronTest}
+                  disabled={cronTestRunning}
+                  className="px-3 py-1.5 rounded-md bg-accent-cyan/10 border border-accent-cyan/30 text-accent-cyan text-[10px] font-mono hover:bg-accent-cyan/20 transition-all disabled:opacity-50 flex items-center gap-1.5 shrink-0"
+                >
+                  {cronTestRunning ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+                  {cronTestRunning ? 'Testing...' : 'Run Test'}
+                </button>
+              </div>
+              {cronTestResult && (
+                <div className="mt-2">
+                  <div className={`text-xs font-mono font-semibold mb-2 ${cronTestResult.allPassed ? 'text-accent-green' : 'text-accent-red'}`}>
+                    {cronTestResult.summary}
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    {cronTestResult.checks.map((check, i) => (
+                      <div key={i} className="flex items-center gap-2 text-[10px] font-mono">
+                        <span className={`shrink-0 ${check.status === 'pass' ? 'text-accent-green' : check.status === 'fail' ? 'text-accent-red' : 'text-accent-amber'}`}>
+                          {check.status === 'pass' ? '✓' : check.status === 'fail' ? '✗' : '⚠'}
+                        </span>
+                        <span className="text-text-secondary w-28 shrink-0">{check.name}</span>
+                        <span className="text-text-muted truncate">{check.detail}</span>
+                        {check.ms != null && (
+                          <span className="text-text-muted/50 shrink-0 ml-auto">{check.ms}ms</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                  <span className="text-[9px] font-mono text-text-muted/50 mt-1 block">
+                    Tested at {new Date(cronTestResult.timestamp).toLocaleTimeString()}
+                  </span>
+                </div>
+              )}
+            </div>
 
             {/* Gaps warning */}
             {diagnostics?.gaps && diagnostics.gaps.length > 0 && (
