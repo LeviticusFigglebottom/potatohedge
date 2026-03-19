@@ -22,6 +22,8 @@ import PaperTradingTab from '@/components/dashboard/PaperTradingTab';
 import TrackedTradesTab from '@/components/dashboard/TrackedTradesTab';
 import SignalTrackerTab from '@/components/dashboard/SignalTrackerTab';
 import DiagnosticsTab from '@/components/dashboard/DiagnosticsTab';
+import EntropyTab from '@/components/dashboard/EntropyTab';
+import AVWAPTab from '@/components/avwap/AVWAPTab';
 import PaperMonitor from '@/components/dashboard/PaperMonitor';
 import TrackerMonitor from '@/components/dashboard/TrackerMonitor';
 import CorrelationPanel from '@/components/dashboard/CorrelationPanel';
@@ -186,6 +188,8 @@ export default function DashboardPage() {
           {activeTab === 'tracker' && <TrackedTradesTab />}
           {activeTab === 'signals' && <SignalTrackerTab />}
           {activeTab === 'paper' && <PaperTradingTab />}
+          {activeTab === 'avwap' && <AVWAPTab />}
+          {activeTab === 'entropy' && <EntropyTab />}
           {activeTab === 'diagnostics' && <DiagnosticsTab />}
           {activeTab === 'chain' && <ChainTab />}
         </div>

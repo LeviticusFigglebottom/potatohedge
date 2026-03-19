@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 import { getQuotes, getExpirations, getOptionsChain } from '@/lib/providers/tradier';
-import { getOptionsSnapshotLite, polygonSnapshotToChains, getEquityHistory } from '@/lib/providers/polygon';
+import { getOptionsSnapshotLite, polygonSnapshotToChains } from '@/lib/providers/polygon';
+import { fetchEquityBars } from '@/lib/providers/equityBars';
 import { getMarketIndicators } from '@/lib/providers/fred';
 import type { Quote, OptionsChain } from '@/types/market';
 
@@ -33,7 +34,7 @@ import {
 } from '@/lib/math/analytics';
 import { generateRecommendations, type RecommendationInput } from '@/lib/math/recommendations';
 import { getUniverseSymbols, getTop500Symbols } from '@/lib/stockUniverse';
-import { fetchSwapData, type SwapData } from '@/lib/providers/dtcc';
+import type { SwapData } from '@/lib/providers/dtcc';
 import { fetchRegSHOThreshold, fetchShortInterest, type ShortInterestData } from '@/lib/providers/finra';
 
 export const maxDuration = 300;
@@ -64,9 +65,9 @@ export interface ScreenerResult {
 }
 
 // Polygon snapshot = 1 API call per stock (vs 4 Tradier calls).
-// Equity history = 1 Polygon call. Total: 2 Polygon calls/stock.
-// Polygon allows ~5 calls/sec. CONCURRENCY=4 with stagger keeps us under that.
-const CONCURRENCY = 4;
+// Equity history via Tradier (included). Total: 2 API calls/stock.
+// CONCURRENCY=2 to stay well under Vercel's 2048MB memory limit.
+const CONCURRENCY = 2;
 
 async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -166,11 +167,11 @@ async function analyzeStock(
     if (useTradier) {
       // Tradier path: identical to overview/recommendations route.
       // Sequential calls with 400ms delays to respect rate limits.
-      const [expirations, rawBars] = await Promise.all([
+      const [expirations, equityBars] = await Promise.all([
         getExpirations(ticker).catch(() => []),
-        getEquityHistory(ticker, 1, 'day', from, to).catch(() => []),
+        fetchEquityBars(ticker, 260).catch(() => []),
       ]);
-      historyBars = rawBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, t: b.t }));
+      historyBars = equityBars;
 
       const nearExps = expirations.slice(0, 3);
       chains = [];
@@ -184,8 +185,8 @@ async function analyzeStock(
     } else {
       // Polygon path: fast bulk scanning (1 API call for all options data).
       const snapshots = await getOptionsSnapshotLite(ticker).catch(() => []);
-      const rawBars = await getEquityHistory(ticker, 1, 'day', from, to).catch(() => []);
-      historyBars = rawBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, t: b.t }));
+      const equityBars = await fetchEquityBars(ticker, 260).catch(() => []);
+      historyBars = equityBars;
       chains = polygonSnapshotToChains(snapshots, ticker, spotPrice, 3);
     }
 
@@ -451,15 +452,16 @@ export async function GET(request: NextRequest) {
 
       // Pre-fetch shared data in parallel:
       // - Tradier batch quotes (~10 calls for all 380 stocks) with 8s cap
-      // - DTCC swaps, FINRA short data
-      // - VIX level from FRED (1 call, cached)
+      // - FINRA short data, VIX level from FRED
+      // NOTE: DTCC swap ZIP skipped — decompressing the cumulative equity swap
+      // report peaks at 200-400MB which OOM-kills on Vercel's 2048MB limit.
       const quotesWithTimeout = Promise.race([
         prefetchQuotes(symbols),
         sleep(8000).then(() => new Map<string, Quote>()),
       ]);
 
-      const [swapMap, regSHOSet, siMap, quoteMap, indicators] = await Promise.all([
-        fetchSwapData().then(r => r.data).catch(() => new Map<string, SwapData>()),
+      const swapMap = new Map<string, SwapData>();
+      const [regSHOSet, siMap, quoteMap, indicators] = await Promise.all([
         fetchRegSHOThreshold().catch(() => new Set<string>()),
         fetchShortInterest().catch(() => new Map<string, ShortInterestData>()),
         quotesWithTimeout,
@@ -470,7 +472,7 @@ export async function GET(request: NextRequest) {
 
       send({
         type: 'meta',
-        swapData: swapMap.size > 0,
+        swapData: false,
         regSHOCount: regSHOSet.size,
         shortInterestCount: siMap.size,
         quotesLoaded: quoteMap.size,
@@ -480,7 +482,7 @@ export async function GET(request: NextRequest) {
       let completed = 0;
 
       // Process stocks with staggered starts.
-      // Polygon: CONCURRENCY=4 with 300ms stagger (2 calls/stock, fast).
+      // Polygon: CONCURRENCY=2 with 300ms stagger (2 calls/stock).
       // Tradier: CONCURRENCY=1, sequential (4 calls/stock, rate-limited).
       for (let i = 0; i < symbols.length; i += concurrency) {
         const batch = symbols.slice(i, i + concurrency);

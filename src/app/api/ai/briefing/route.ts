@@ -16,7 +16,7 @@ import {
 } from '@/lib/math/analytics';
 import { generateRecommendations, type RecommendationInput, type TradeIdea } from '@/lib/math/recommendations';
 import type { EquityBar } from '@/lib/providers/equityBars';
-import { getMarketSwapSummary } from '@/lib/providers/dtcc';
+// DTCC swap ZIP skipped in this route — decompressing peaks at 200-400MB, OOM-kills on Vercel
 import { fetchRegSHOThreshold, fetchShortInterest, fetchShortSaleVolume, type ShortInterestData, type ShortVolumeData } from '@/lib/providers/finra';
 import { scanMarketFlow, type FlowResult } from '@/lib/providers/polygonFlow';
 
@@ -42,7 +42,7 @@ const INDICES = ['SPY', 'QQQ', 'IWM'];
 const SECTOR_ETFS = ['XLF', 'XLE', 'XLK', 'XLV', 'XLI', 'XLRE', 'XLU', 'XLC', 'XLB', 'XLP', 'XLY'];
 const MAG7 = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA'];
 const ALL_TICKERS = [...INDICES, ...SECTOR_ETFS, ...MAG7];
-const CONCURRENCY = 5;
+const CONCURRENCY = 3; // Reduced from 5 to stay under Vercel's 2048MB memory limit
 
 interface StockScan {
   symbol: string;
@@ -83,6 +83,14 @@ interface StockScan {
   nearestDTE: number;
   weeklyExp?: string;
   monthlyExp?: string;
+  // Volatility regime context
+  vrp: number; // IV - HV (Volatility Risk Premium in decimal)
+  hv10: number;
+  hv30: number;
+  hv60: number;
+  termStructureDirection: 'contango' | 'backwardation' | 'flat';
+  nearTermIV: number;
+  farTermIV: number;
   // Intraday price action
   open: number;
   high: number;
@@ -254,6 +262,29 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
     const profile = computeStockProfile(historyBars.map(b => ({ o: b.o, h: b.h, l: b.l, c: b.c })), spotPrice, hvCurrent);
     const correlationCtx = computeQuickCorrelationCtx(historyBars, hvCurrent);
 
+    // Additional HV windows for vol regime context
+    const hv10 = computeHistoricalVolatility(closes, 10);
+    const hv30 = computeHistoricalVolatility(closes, 30);
+    const hv60 = computeHistoricalVolatility(closes, 60);
+    const vrp = currentIV - hvCurrent; // Volatility Risk Premium
+
+    // Term structure direction from multiple chains
+    let nearTermIV = currentIV;
+    let farTermIV = currentIV;
+    let termStructureDirection: 'contango' | 'backwardation' | 'flat' = 'flat';
+    if (chains.length >= 2) {
+      const getChainATMIV = (chain: typeof chains[0]) => {
+        const atm = [...chain.calls, ...chain.puts]
+          .filter(o => Math.abs(o.strike - spotPrice) / spotPrice < atmTolerance && o.impliedVolatility > 0.01)
+          .sort((a, b) => Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice));
+        return atm.length > 0 ? atm.slice(0, 4).reduce((s, o) => s + o.impliedVolatility, 0) / Math.min(4, atm.length) : 0;
+      };
+      nearTermIV = getChainATMIV(chains[0]) || currentIV;
+      farTermIV = getChainATMIV(chains[chains.length - 1]) || currentIV;
+      const diff = farTermIV - nearTermIV;
+      termStructureDirection = diff > 0.005 ? 'contango' : diff < -0.005 ? 'backwardation' : 'flat';
+    }
+
     // Resolve expiration dates from the full list (not just the 3 we fetched chains for)
     // This ensures we can find a monthly expiration even if it's not in nearExps
     const weeklyExp = expirations.find(e => e.dte >= 5 && e.dte <= 10)?.date;
@@ -298,6 +329,9 @@ async function scanStock(ticker: string): Promise<StockScan | null> {
       nearestDTE: nearExps[0]?.dte || 0,
       weeklyExp,
       monthlyExp,
+      // Volatility regime
+      vrp, hv10, hv30, hv60,
+      termStructureDirection, nearTermIV, farTermIV,
       // Intraday price action
       open: quote.open,
       high: quote.high,
@@ -339,8 +373,11 @@ function buildBriefingPrompt(
     const range = s.high > 0 && s.low > 0 ? s.high - s.low : 0;
     const rangePos = range > 0 ? ((s.price - s.low) / range * 100).toFixed(0) : '—';
     const relVol = s.avgVolume > 0 ? (s.volume / s.avgVolume * 100).toFixed(0) : '—';
+    const vrpPp = s.vrp * 100;
+    const vrpLabel = vrpPp > 0 ? `+${vrpPp.toFixed(1)}pp (sellers' edge)` : `${vrpPp.toFixed(1)}pp (buyers' edge)`;
     const lines = [
       `${s.symbol}: $${s.price.toFixed(2)} (${s.changePct >= 0 ? '+' : ''}${s.changePct.toFixed(2)}%) | Bias: ${s.biasScore > 0 ? '+' : ''}${s.biasScore} ${s.bias} | Gamma: ${s.gammaRegime} | IV: ${s.volRegime} (rank ${s.ivRank}, ${(s.currentIV * 100).toFixed(0)}% IV vs ${(s.hvCurrent * 100).toFixed(0)}% HV) | PCR: ${s.volumePCR.toFixed(2)} | Skew: ${s.skewBias}`,
+      `  VRP: ${vrpLabel} | HV10: ${(s.hv10 * 100).toFixed(0)}% | HV20: ${(s.hvCurrent * 100).toFixed(0)}% | HV30: ${(s.hv30 * 100).toFixed(0)}% | HV60: ${(s.hv60 * 100).toFixed(0)}% | Term Structure: ${s.termStructureDirection} (near ${(s.nearTermIV * 100).toFixed(0)}% → far ${(s.farTermIV * 100).toFixed(0)}%)`,
       `  GEX: ${gexLabel} | DEX: ${dexLabel} | Vanna: ${s.vannaRegime} | Charm: ${s.charmRegime} | ATR: ${s.atrPercent.toFixed(1)}% | Daily 1σ: ${(s.dailySigma * 100).toFixed(2)}%`,
       `  Intraday: O=$${s.open.toFixed(2)} H=$${s.high.toFixed(2)} L=$${s.low.toFixed(2)} | Range: $${range.toFixed(2)} (${rangePos}% from low) | Vol: ${(s.volume / 1e6).toFixed(1)}M (${relVol}% of avg)`,
       `  Levels: γFlip=${s.gammaFlip ? '$' + s.gammaFlip.toFixed(0) : 'N/A'} CW=${s.callWall ? '$' + s.callWall.toFixed(0) : 'N/A'} PW=${s.putWall ? '$' + s.putWall.toFixed(0) : 'N/A'} MaxPain=$${s.maxPain.toFixed(0)}`,
@@ -392,6 +429,22 @@ ${sectors.map(fmtStock).join('\n\n')}
 
 ─── MAGNIFICENT 7 ───
 ${mag7.map(fmtStock).join('\n\n')}`;
+
+  // Volatility Regime Summary
+  const vrpStocks = stocks.filter(s => INDICES.includes(s.symbol));
+  if (vrpStocks.length > 0) {
+    prompt += `\n\n─── VOLATILITY REGIME SUMMARY ───`;
+    prompt += `\n(VRP = IV - HV20. Positive = sellers' edge. Negative = buyers' edge. Term structure: contango = normal, backwardation = event risk)`;
+    for (const s of vrpStocks) {
+      const vrpPp = s.vrp * 100;
+      const hvTrend = s.hv10 > s.hv60 * 1.1 ? 'EXPANDING' : s.hv10 < s.hv60 * 0.9 ? 'COMPRESSING' : 'stable';
+      prompt += `\n${s.symbol}: VRP ${vrpPp > 0 ? '+' : ''}${vrpPp.toFixed(1)}pp | IV Rank ${s.ivRank} | IV/HV ratio ${(s.currentIV / (s.hvCurrent || 0.01)).toFixed(2)} | HV trend: ${hvTrend} (10d: ${(s.hv10 * 100).toFixed(0)}% → 60d: ${(s.hv60 * 100).toFixed(0)}%) | Term: ${s.termStructureDirection}`;
+    }
+    const avgVRP = vrpStocks.reduce((s, v) => s + v.vrp, 0) / vrpStocks.length * 100;
+    const avgIVRank = Math.round(vrpStocks.reduce((s, v) => s + v.ivRank, 0) / vrpStocks.length);
+    prompt += `\nMarket avg VRP: ${avgVRP > 0 ? '+' : ''}${avgVRP.toFixed(1)}pp | Avg IV Rank: ${avgIVRank}`;
+    prompt += `\nRegime: ${avgVRP > 3 ? 'SELL PREMIUM — IV significantly overprices realized risk across indices' : avgVRP > 0 ? 'Mild seller\'s edge — IV modestly above HV' : avgVRP > -3 ? 'Neutral — IV near fair value' : 'BUY PREMIUM — IV underprices realized vol, options are cheap'}`;
+  }
 
   // Real-time options flow data
   if (flowData.flow.tickersScanned > 0) {
@@ -522,13 +575,19 @@ Then analyze:
 
 2. **GAMMA + VANNA + CHARM REGIME** — What's the gamma regime for SPY/QQQ/IWM? Crucially, analyze the VANNA and CHARM readings: which direction do they push dealer hedging? Do they confirm or contradict the gamma signal? If vanna and charm diverge, explain which dominates in the current vol regime (VIX level). Reference gamma flip levels and what happens if breached.
 
-3. **INDEX DIVERGENCES** — Are SPY, QQQ, IWM aligned or divergent? What does the split mean? Is this rotation or broad trend? Which index has the cleanest directional setup based on gamma+vanna+charm alignment?
+3. **VOLATILITY REGIME & RISK PREMIUM** — This is critical edge-finding analysis. For each index and notable single name:
+   - **VRP (Volatility Risk Premium)**: Is IV above or below realized vol? Positive VRP = options overpriced (sellers' edge). Negative VRP = options underpriced (buyers' edge). Reference the VRP numbers provided for each stock.
+   - **HV Term Structure**: Compare HV10 vs HV20 vs HV30 vs HV60. Rising short-term HV (HV10 > HV60) = vol expansion. Falling (HV10 < HV60) = vol compression. This tells you whether realized vol is accelerating or decelerating.
+   - **IV Term Structure**: Contango (far IV > near IV) is normal. Backwardation (near IV > far IV) signals imminent event risk — premium sellers should avoid near-term. Reference the term structure direction and near/far IV levels.
+   - **Net Assessment**: State clearly: "sell premium" vs "buy premium" vs "neutral" for each major name, and WHY based on VRP + term structure + IV rank. This directly informs the trade ideas section.
 
-4. **MAGNIFICENT 7 BREAKDOWN** — For each Mag7 stock with notable positioning, state the directional lean and which Greek(s) drive it. Flag any that diverge from their index. Count how many are long vs short — does narrow leadership make QQQ vulnerable?
+4. **INDEX DIVERGENCES** — Are SPY, QQQ, IWM aligned or divergent? What does the split mean? Is this rotation or broad trend? Which index has the cleanest directional setup based on gamma+vanna+charm alignment?
 
-${flowData.flow.tickersScanned > 0 ? '5. **OPTIONS FLOW ANALYSIS** — Analyze the real-time options premium flow. What does the net premium tell us? Which tickers have the most aggressive institutional positioning? Are sweeps/blocks confirming or diverging from dealer gamma positioning? Cross-reference flow direction with GEX regime for each ticker.\n\n' : ''}${swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0 ? '6. **SWAP MATURITIES** — Interpret swap maturities. Extreme clusters create forced dealer rebalancing. Cross-reference with flow alerts: are institutions positioning ahead of maturity unwinds?\n\n' : ''}${regSHOList.length > 0 || shortInterestData.length > 0 ? '7. **SHORT INTEREST / REG SHO** — Notable names with persistent FTDs or high days-to-cover. Cross-reference with options flow: are shorts being squeezed (bullish flow + high SI)?\n\n' : ''}8. **KEY LEVELS** — For SPY specifically: gamma flip, call wall, put wall, max pain. What happens at each level.
+5. **MAGNIFICENT 7 BREAKDOWN** — For each Mag7 stock with notable positioning, state the directional lean and which Greek(s) drive it. Flag any that diverge from their index. Count how many are long vs short — does narrow leadership make QQQ vulnerable?
 
-9. **OPTIONS TRADE IDEAS** — This is critical. Using all available data (dealer Greeks, flow, IV regime, key levels, intraday price action, algorithm trade ideas above), present **3-5 specific, actionable short-term options plays**. For EACH trade, provide ALL of these fields in a structured format:
+${flowData.flow.tickersScanned > 0 ? '6. **OPTIONS FLOW ANALYSIS** — Analyze the real-time options premium flow. What does the net premium tell us? Which tickers have the most aggressive institutional positioning? Are sweeps/blocks confirming or diverging from dealer gamma positioning? Cross-reference flow direction with GEX regime for each ticker.\n\n' : ''}${swapSummary.totalMaturitiesToday > 0 || swapSummary.totalMaturitiesWeek > 0 ? '7. **SWAP MATURITIES** — Interpret swap maturities. Extreme clusters create forced dealer rebalancing. Cross-reference with flow alerts: are institutions positioning ahead of maturity unwinds?\n\n' : ''}${regSHOList.length > 0 || shortInterestData.length > 0 ? '8. **SHORT INTEREST / REG SHO** — Notable names with persistent FTDs or high days-to-cover. Cross-reference with options flow: are shorts being squeezed (bullish flow + high SI)?\n\n' : ''}9. **KEY LEVELS** — For SPY specifically: gamma flip, call wall, put wall, max pain. What happens at each level.
+
+10. **OPTIONS TRADE IDEAS** — This is critical. Using all available data (dealer Greeks, flow, IV regime, VRP, key levels, intraday price action, algorithm trade ideas above), present **3-5 specific, actionable short-term options plays**. For EACH trade, provide ALL of these fields in a structured format:
 
 | Field | Required Detail |
 |-------|----------------|
@@ -552,7 +611,7 @@ ${flowData.flow.tickersScanned > 0 ? '5. **OPTIONS FLOW ANALYSIS** — Analyze t
 6. **Position value floor**: Each contract in the position must have a notional value of at least $100 (i.e., option mid price × 100 shares ≥ $100, so mid ≥ $1.00 per leg for single-leg trades, or net spread premium ≥ $0.50).
 7. **Expiration selection**: Credit strategies (iron condors, credit spreads) MUST use 30-45 DTE for meaningful premium — NEVER use weekly expirations for premium-selling strategies (near-expiry OTM options are worth pennies). Debit strategies can use 14-21 DTE. Only event plays (gamma flip straddle, expiration pin) should use weekly/0DTE. State the DTE clearly in your expiration field.
 
-Prioritize trades where multiple signals converge: gamma positioning + flow direction + key level proximity + IV regime. Prefer defined-risk strategies (spreads) over naked options. Reference the algorithm trade ideas data above — use their ATR-derived strikes as the foundation, then adjust based on key levels and flow data.
+Prioritize trades where multiple signals converge: gamma positioning + flow direction + key level proximity + IV regime + VRP. Use the VRP data to determine strategy type: positive VRP (IV > HV) favors credit strategies; negative VRP favors debit strategies. Use HV term structure to gauge vol momentum. Prefer defined-risk strategies (spreads) over naked options. Reference the algorithm trade ideas data above — use their ATR-derived strikes as the foundation, then adjust based on key levels and flow data.
 
 CRITICAL FORMAT REQUIREMENT: Start each trade idea with "TRADE N:" (e.g., "TRADE 1: SPY BULL PUT SPREAD") followed by the fields in either table or colon format. This exact prefix is required for the UI to parse and display your trade ideas. Example:
 
@@ -705,156 +764,189 @@ function parseAITradeIdeas(text: string): AITradeIdea[] {
   return ideas;
 }
 
-export async function POST() {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return NextResponse.json({ error: 'ANTHROPIC_API_KEY not configured' }, { status: 500 });
-  }
+export async function GET() {
+  const t0 = Date.now();
+  const phase = (msg: string) => console.log(`[ai/briefing] ${msg} (+${Date.now() - t0}ms)`);
 
   try {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json({ error: 'ANTHROPIC_API_KEY not configured. Add it to your environment variables.' }, { status: 500 });
+    }
+    phase('Starting briefing generation');
+
     // Helper: race a promise against a hard deadline
     const raceTimeout = <T>(p: Promise<T>, ms: number, fallback: T) =>
       Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 
-    const emptySwap = {
-      totalMaturitiesToday: 0, totalNotionalToday: 0,
-      totalMaturitiesWeek: 0, totalNotionalWeek: 0,
-      topMaturities: [] as { symbol: string; count: number; notional: number }[],
-      asOf: '',
-    };
-    const emptyFlow: FlowResult = {
-      flow: { netCallPremium: 0, netPutPremium: 0, netPremium: 0, totalCallVolume: 0, totalPutVolume: 0, putCallRatio: 0, sentiment: 'neutral', tickersScanned: 0, contractsAnalyzed: 0 },
-      alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
-    };
+    // ════════════════════════════════════════════════════════════
+    // PHASE 1: Scan stocks + fetch institutional data + build prompt
+    // Wrapped in async scope so institutional Maps/Sets/arrays become
+    // GC-eligible before the Claude API call starts (reduces peak memory)
+    // ════════════════════════════════════════════════════════════
+    const { results, prompt, vixPrice, tradeIdeas } = await (async () => {
+      const emptySwap = {
+        totalMaturitiesToday: 0, totalNotionalToday: 0,
+        totalMaturitiesWeek: 0, totalNotionalWeek: 0,
+        topMaturities: [] as { symbol: string; count: number; notional: number }[],
+        asOf: '',
+      };
+      const emptyFlow: FlowResult = {
+        flow: { netCallPremium: 0, netPutPremium: 0, netPremium: 0, totalCallVolume: 0, totalPutVolume: 0, putCallRatio: 0, sentiment: 'neutral', tickersScanned: 0, contractsAnalyzed: 0 },
+        alerts: [], perTickerFlow: [], isDeveloper: false, asOf: '',
+      };
 
-    // Start institutional data fetches IMMEDIATELY — they run in parallel
-    // with stock scanning (saves 5-10s vs running them sequentially after)
-    const institutionalPromise = Promise.all([
-      getQuote('VIX').catch(() => null),
-      raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 4000, emptySwap),
-      raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
-      raceTimeout(fetchShortInterest().catch(() => new Map<string, ShortInterestData>()), 5000, new Map<string, ShortInterestData>()),
-      raceTimeout(fetchShortSaleVolume().catch(() => new Map<string, ShortVolumeData>()), 5000, new Map<string, ShortVolumeData>()),
-      raceTimeout(scanMarketFlow().catch(() => emptyFlow), 8000, emptyFlow),
-    ]);
+      // Start institutional data fetches IMMEDIATELY — they run in parallel
+      // with stock scanning (saves 5-10s vs running them sequentially after)
+      // NOTE: DTCC swap ZIP skipped — decompressing the cumulative equity swap
+      // report peaks at 200-400MB which OOM-kills on Vercel's 2048MB limit.
+      const institutionalPromise = Promise.all([
+        getQuote('VIX').catch(() => null),
+        Promise.resolve(emptySwap),
+        raceTimeout(fetchRegSHOThreshold().catch(() => new Set<string>()), 4000, new Set<string>()),
+        raceTimeout(fetchShortInterest().catch(() => new Map<string, ShortInterestData>()), 5000, new Map<string, ShortInterestData>()),
+        raceTimeout(fetchShortSaleVolume().catch(() => new Map<string, ShortVolumeData>()), 5000, new Map<string, ShortVolumeData>()),
+        raceTimeout(scanMarketFlow().catch(() => emptyFlow), 8000, emptyFlow),
+      ]);
+      phase('Institutional data fetches started');
 
-    // Phase 1: Scan all stocks in parallel batches (runs concurrently with institutional data)
-    const results: StockScan[] = [];
-    for (let i = 0; i < ALL_TICKERS.length; i += CONCURRENCY) {
-      const batch = ALL_TICKERS.slice(i, i + CONCURRENCY);
-      const batchResults = await Promise.all(batch.map(t => scanStock(t)));
-      for (const r of batchResults) {
-        if (r) results.push(r);
+      // Scan all stocks in parallel batches (runs concurrently with institutional data)
+      const scanResults: StockScan[] = [];
+      for (let i = 0; i < ALL_TICKERS.length; i += CONCURRENCY) {
+        const batch = ALL_TICKERS.slice(i, i + CONCURRENCY);
+        const batchResults = await Promise.all(batch.map(t => scanStock(t)));
+        for (const r of batchResults) {
+          if (r) scanResults.push(r);
+        }
       }
-    }
+      phase(`Stock scanning done: ${scanResults.length}/${ALL_TICKERS.length} scanned`);
 
-    // Wait for institutional data (likely already done since stock scanning takes longer)
-    const [vixQuote, swapSummary, regSHOSet, shortInterestMap, shortVolumeMap, flowResult] = await institutionalPromise;
-    const vixPrice = vixQuote?.last ?? 0;
-    const vixChangePct = vixQuote?.changePct ?? 0;
-    const regSHOList = Array.from(regSHOSet).filter(s => /^[A-Z]+$/.test(s)).sort();
+      // Wait for institutional data (likely already done since stock scanning takes longer)
+      const [vixQuote, swapSummary, regSHOSet, shortInterestMap, shortVolumeMap, flowResult] = await institutionalPromise;
+      phase('Institutional data ready');
+      const vp = vixQuote?.last ?? 0;
+      const vpc = vixQuote?.changePct ?? 0;
+      const regSHOList = Array.from(regSHOSet).filter(s => /^[A-Z]+$/.test(s)).sort();
 
-    // Build short interest highlights (3-100 DTC, meaningful positions only — OTC data)
-    const shortInterestData: { symbol: string; daysToCover: number; shortInterest: number }[] = [];
-    for (const [sym, data] of shortInterestMap) {
-      if (data.daysToCover >= 3 && data.daysToCover <= 100 && data.shortInterest >= 50000 && data.avgDailyVolume >= 1000) {
-        shortInterestData.push({ symbol: sym, daysToCover: data.daysToCover, shortInterest: data.shortInterest });
+      // Build short interest highlights (3-100 DTC, meaningful positions only — OTC data)
+      const shortInterestData: { symbol: string; daysToCover: number; shortInterest: number }[] = [];
+      for (const [sym, data] of shortInterestMap) {
+        if (data.daysToCover >= 3 && data.daysToCover <= 100 && data.shortInterest >= 50000 && data.avgDailyVolume >= 1000) {
+          shortInterestData.push({ symbol: sym, daysToCover: data.daysToCover, shortInterest: data.shortInterest });
+        }
       }
-    }
-    shortInterestData.sort((a, b) => b.daysToCover - a.daysToCover);
+      shortInterestData.sort((a, b) => b.daysToCover - a.daysToCover);
 
-    // Build short volume highlights (>40% short ratio with significant volume)
-    const shortVolumeData: { symbol: string; shortRatio: number; shortVolume: number; totalVolume: number }[] = [];
-    for (const [sym, data] of shortVolumeMap) {
-      if (data.shortRatio > 0.40 && data.totalVolume > 100000) {
-        shortVolumeData.push({ symbol: sym, shortRatio: data.shortRatio, shortVolume: data.shortVolume, totalVolume: data.totalVolume });
+      // Build short volume highlights (>40% short ratio with significant volume)
+      const shortVolumeData: { symbol: string; shortRatio: number; shortVolume: number; totalVolume: number }[] = [];
+      for (const [sym, data] of shortVolumeMap) {
+        if (data.shortRatio > 0.40 && data.totalVolume > 100000) {
+          shortVolumeData.push({ symbol: sym, shortRatio: data.shortRatio, shortVolume: data.shortVolume, totalVolume: data.totalVolume });
+        }
       }
-    }
-    shortVolumeData.sort((a, b) => b.shortRatio - a.shortRatio);
+      shortVolumeData.sort((a, b) => b.shortRatio - a.shortRatio);
+
+      // Build prompt
+      phase('Building Claude prompt');
+      const builtPrompt = buildBriefingPrompt(scanResults, vp, vpc, swapSummary, regSHOList, shortInterestData, shortVolumeData, flowResult);
+
+      // Build structured trade ideas for the UI (for paper trading buttons)
+      const ideas = scanResults
+        .flatMap(s => s.trades.map(t => ({
+          ticker: s.symbol,
+          spot: s.price,
+          bias: s.bias,
+          biasScore: s.biasScore,
+          strategy: t.strategy,
+          direction: t.direction,
+          confidence: t.confidence,
+          score: t.score,
+          strikes: t.strikes,
+          expiration: t.expiration,
+          targetExp: t.targetExp,
+          entry: t.entry,
+          risk: t.risk,
+          reasoning: t.reasoning,
+          tags: t.tags,
+          profitTargetPct: t.profitTargetPct,
+          stopLossPct: t.stopLossPct,
+          nearestExp: s.nearestExp,
+          nearestDTE: s.nearestDTE,
+          weeklyExp: s.weeklyExp,
+          monthlyExp: s.monthlyExp,
+          ivRank: s.ivRank,
+          currentIV: s.currentIV,
+          gammaFlip: s.gammaFlip,
+          callWall: s.callWall,
+          putWall: s.putWall,
+        })))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 15);
+
+      return { results: scanResults, prompt: builtPrompt, vixPrice: vp, tradeIdeas: ideas };
+    })();
+    // shortInterestMap, shortVolumeMap, regSHOSet, swapSummary, flowResult,
+    // shortInterestData, shortVolumeData, regSHOList are now GC-eligible
 
     if (results.length === 0) {
       return NextResponse.json({ error: 'Failed to scan any stocks' }, { status: 500 });
     }
 
-    // Phase 2: Build prompt and call Claude
-    const prompt = buildBriefingPrompt(results, vixPrice, vixChangePct, swapSummary, regSHOList, shortInterestData, shortVolumeData, flowResult);
+    phase(`Prompt built (${prompt.length} chars). Calling Claude API...`);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const body: Record<string, any> = {
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 8192,
-      messages: [{ role: 'user', content: prompt }],
-    };
+    // ════════════════════════════════════════════════════════════
+    // PHASE 2: Call Claude API
+    // Wrapped so request body, response buffers, and allContent array
+    // are released after extracting the final text
+    // ════════════════════════════════════════════════════════════
+    const text = await (async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const body: Record<string, any> = {
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 8192,
+        messages: [{ role: 'user', content: prompt }],
+      };
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let allContent: any[] = [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let allContent: any[] = [];
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(100000),
-      });
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(100000),
+        });
 
-      if (!response.ok) {
-        const err = await response.text().catch(() => 'Unknown error');
-        throw new Error(`Claude API: ${response.status} — ${err}`);
+        if (!response.ok) {
+          const err = await response.text().catch(() => 'Unknown error');
+          throw new Error(`Claude API: ${response.status} — ${err}`);
+        }
+
+        const result = await response.json();
+        allContent = [...allContent, ...(result.content || [])];
+
+        if (result.stop_reason !== 'pause_turn') break;
+        body.messages = [
+          { role: 'user', content: prompt },
+          { role: 'assistant', content: allContent },
+        ];
       }
 
-      const result = await response.json();
-      allContent = [...allContent, ...(result.content || [])];
+      return allContent
+        .filter((b: { type: string }) => b.type === 'text')
+        .map((b: { text: string }) => b.text)
+        .join('\n') || 'No response generated.';
+    })();
+    // body, allContent, response buffers now GC-eligible
 
-      if (result.stop_reason !== 'pause_turn') break;
-      body.messages = [
-        { role: 'user', content: prompt },
-        { role: 'assistant', content: allContent },
-      ];
-    }
-
-    const text = allContent
-      .filter((b: { type: string }) => b.type === 'text')
-      .map((b: { text: string }) => b.text)
-      .join('\n') || 'No response generated.';
-
-    // Build structured trade ideas for the UI (for paper trading buttons)
-    const tradeIdeas = results
-      .flatMap(s => s.trades.map(t => ({
-        ticker: s.symbol,
-        spot: s.price,
-        bias: s.bias,
-        biasScore: s.biasScore,
-        strategy: t.strategy,
-        direction: t.direction,
-        confidence: t.confidence,
-        score: t.score,
-        strikes: t.strikes,
-        expiration: t.expiration,
-        targetExp: t.targetExp,
-        entry: t.entry,
-        risk: t.risk,
-        reasoning: t.reasoning,
-        tags: t.tags,
-        profitTargetPct: t.profitTargetPct,
-        stopLossPct: t.stopLossPct,
-        nearestExp: s.nearestExp,
-        nearestDTE: s.nearestDTE,
-        weeklyExp: s.weeklyExp,
-        monthlyExp: s.monthlyExp,
-        ivRank: s.ivRank,
-        currentIV: s.currentIV,
-        gammaFlip: s.gammaFlip,
-        callWall: s.callWall,
-        putWall: s.putWall,
-      })))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 15);
-
-    // Parse Claude's AI-generated trade ideas from the narrative
+    // ════════════════════════════════════════════════════════════
+    // PHASE 3: Build response
+    // ════════════════════════════════════════════════════════════
     const parsedAIIdeas = parseAITradeIdeas(text);
     console.log(`[ai/briefing] Parsed ${parsedAIIdeas.length} AI trade ideas from narrative (${text.length} chars). Tickers: ${parsedAIIdeas.map(i => i.ticker).join(', ') || 'none'}`);
 
@@ -888,7 +980,11 @@ export async function POST() {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error ?? 'Unknown error');
-    console.error('[ai/briefing] Error:', message);
+    phase(`FAILED: ${message}`);
     return NextResponse.json({ error: message }, { status: 500 });
   }
+}
+
+export async function POST() {
+  return GET();
 }

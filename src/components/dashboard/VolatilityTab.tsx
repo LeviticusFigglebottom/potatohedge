@@ -1,12 +1,19 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import { Thermometer, Brain, TrendingUp, TrendingDown, Shield } from 'lucide-react';
 
+// New modular vol components
+import InfoTip from './vol/InfoTip';
+import VRPChart, { type Timeframe, TF_DAYS } from './vol/VRPChart';
+import VolSurface from './vol/VolSurface';
+import VolCone from './vol/VolCone';
+import { IVGauge, IVStats, TermStructureChart, SkewChart } from './vol/VolPanels';
+
 // ─── VIX Panel (chart + context + ranges) ─────────────────
 
-function VIXPanel() {
+function VIXPanel({ timeframe }: { timeframe: Timeframe }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const { snapshot } = useDashboardStore();
@@ -36,9 +43,9 @@ function VIXPanel() {
     ctx.fillStyle = '#12121a';
     ctx.fillRect(0, 0, w, h);
 
-    // VIX values are already in decimal (divided by 100 in snapshot route)
-    // Convert back to VIX points for charting
-    const data = vixSeries;
+    // Filter VIX data by shared timeframe
+    const maxPts = TF_DAYS[timeframe];
+    const data = vixSeries.slice(-maxPts);
     const vixValues = data.map(d => d.vix * 100);
     const sortedVix = [...vixValues].sort((a, b) => a - b);
     const vp2 = sortedVix[Math.floor(sortedVix.length * 0.02)] ?? sortedVix[0];
@@ -51,28 +58,23 @@ function VIXPanel() {
     const toX = (t: number) => pad.left + ((t - minTime) / (maxTime - minTime)) * cw;
     const toY = (v: number) => pad.top + ch - ((v - minV) / (maxV - minV)) * ch;
 
-    // Zone fills — key VIX levels
-    // Complacency zone (< 13)
+    // Zone fills
     if (minV < 13 && 13 < maxV) {
-      const y13 = toY(13);
       ctx.fillStyle = '#00e67606';
-      ctx.fillRect(pad.left, y13, cw, pad.top + ch - y13);
+      ctx.fillRect(pad.left, toY(13), cw, pad.top + ch - toY(13));
     }
-    // Moderate zone (18-25)
     if (minV < 25 && 18 < maxV) {
       const y18 = toY(Math.max(18, minV));
       const y25 = toY(Math.min(25, maxV));
       ctx.fillStyle = '#ffaa0006';
       ctx.fillRect(pad.left, y25, cw, y18 - y25);
     }
-    // Elevated zone (> 25)
     if (maxV > 25) {
-      const y25 = toY(25);
       ctx.fillStyle = '#ff3d5706';
-      ctx.fillRect(pad.left, pad.top, cw, y25 - pad.top);
+      ctx.fillRect(pad.left, pad.top, cw, toY(25) - pad.top);
     }
 
-    // Zone boundary lines
+    // Zone boundaries
     const thresholds = [13, 18, 25, 35];
     const threshColors = ['#00e676', '#ffaa00', '#ff3d57', '#ff1744'];
     const threshLabels = ['Complacent', 'Normal', 'Elevated', 'Fear'];
@@ -116,7 +118,7 @@ function VIXPanel() {
     ctx.fillStyle = gradient;
     ctx.fill();
 
-    // VIX line — color changes based on level
+    // VIX line
     for (let i = 1; i < data.length; i++) {
       ctx.beginPath();
       ctx.moveTo(toX(data[i - 1].time), toY(vixValues[i - 1]));
@@ -133,12 +135,8 @@ function VIXPanel() {
       let started = false;
       for (let i = 19; i < vixValues.length; i++) {
         const ma = vixValues.slice(i - 19, i + 1).reduce((s, v) => s + v, 0) / 20;
-        if (!started) {
-          ctx.moveTo(toX(data[i].time), toY(ma));
-          started = true;
-        } else {
-          ctx.lineTo(toX(data[i].time), toY(ma));
-        }
+        if (!started) { ctx.moveTo(toX(data[i].time), toY(ma)); started = true; }
+        else { ctx.lineTo(toX(data[i].time), toY(ma)); }
       }
       ctx.strokeStyle = '#b388ff60';
       ctx.lineWidth = 1;
@@ -155,14 +153,13 @@ function VIXPanel() {
       ctx.arc(lastX, lastY, 4, 0, 2 * Math.PI);
       ctx.fillStyle = vix.price > 25 ? '#ff3d57' : vix.price > 18 ? '#ffaa00' : '#00e676';
       ctx.fill();
-      // Label
       ctx.fillStyle = vix.price > 25 ? '#ff3d57' : vix.price > 18 ? '#ffaa00' : '#00e676';
       ctx.font = '10px "JetBrains Mono"';
       ctx.textAlign = 'left';
       ctx.fillText(vix.price.toFixed(1), w - pad.right + 4, lastY + 4);
     }
 
-    // Y axis labels
+    // Y axis
     ctx.fillStyle = '#555570';
     ctx.font = '9px "JetBrains Mono"';
     ctx.textAlign = 'right';
@@ -171,7 +168,7 @@ function VIXPanel() {
       ctx.fillText(val.toFixed(0), pad.left - 5, pad.top + (ch / 4) * i + 3);
     }
 
-    // X axis dates
+    // X axis
     ctx.textAlign = 'center';
     const labelCount = Math.min(6, data.length);
     for (let i = 0; i < labelCount; i++) {
@@ -193,13 +190,14 @@ function VIXPanel() {
     ctx.setLineDash([]);
     ctx.fillStyle = '#8888a0';
     ctx.fillText('20d MA', pad.left + 44, pad.top + 10);
-
-  }, [snapshot, vix, vixSeries]);
+  }, [snapshot, vix, vixSeries, timeframe]);
 
   if (!vix) return null;
 
-  // Compute historical stats from the series
-  const vixValues = vixSeries?.map(d => d.vix * 100) || [];
+  // Use timeframe-filtered data for stats too
+  const maxStatPts = TF_DAYS[timeframe];
+  const filteredVixSeries = vixSeries?.slice(-maxStatPts);
+  const vixValues = filteredVixSeries?.map(d => d.vix * 100) || [];
   const high52w = vixValues.length > 0 ? Math.max(...vixValues) : 0;
   const low52w = vixValues.length > 0 ? Math.min(...vixValues) : 0;
   const avg = vixValues.length > 0 ? vixValues.reduce((s, v) => s + v, 0) / vixValues.length : 0;
@@ -210,12 +208,10 @@ function VIXPanel() {
     ? vixValues.slice(-20).reduce((s, v) => s + v, 0) / 20
     : 0;
 
-  // Regime label & color
   const regimeLabel = vix.price > 35 ? 'Extreme Fear' : vix.price > 25 ? 'Elevated Fear' : vix.price > 18 ? 'Moderate' : vix.price > 13 ? 'Low Volatility' : 'Complacency';
   const regimeColor = vix.price > 25 ? 'text-red-400' : vix.price > 18 ? 'text-amber-400' : 'text-green-400';
   const regimeBg = vix.price > 25 ? 'bg-red-500/10 text-red-400' : vix.price > 18 ? 'bg-amber-500/10 text-amber-400' : 'bg-green-500/10 text-green-400';
 
-  // IV vs VIX spread
   const iv = snapshot?.iv;
   const ivPct = iv ? iv.currentIV * 100 : 0;
   const spread = ivPct > 0 ? ivPct - vix.price : 0;
@@ -226,11 +222,14 @@ function VIXPanel() {
         <div className="flex items-center gap-2">
           <Thermometer className="w-3.5 h-3.5 text-accent-purple" />
           <span className="panel-title">CBOE Volatility Index (VIX)</span>
+          <InfoTip text="The VIX measures the market's 30-day expected volatility derived from S&P 500 options. It's the benchmark 'fear gauge.' Low VIX (<15) = complacency, options are cheap across the market. High VIX (>25) = fear, options are expensive. Mean-reverting: extreme spikes tend to fade within weeks. Compare your stock's IV to VIX to gauge relative richness." />
         </div>
-        <span className={`text-[10px] font-mono px-2 py-0.5 rounded ${regimeBg}`}>{regimeLabel}</span>
+        <div className="flex items-center gap-2">
+          <span className="text-[9px] font-mono text-text-muted">{timeframe}</span>
+          <span className={`text-[10px] font-mono px-2 py-0.5 rounded ${regimeBg}`}>{regimeLabel}</span>
+        </div>
       </div>
 
-      {/* Top stats row */}
       <div className="grid grid-cols-4 md:grid-cols-8 gap-2 px-4 pt-3 pb-2">
         <div>
           <div className="text-[9px] font-mono text-text-muted">Current</div>
@@ -258,11 +257,11 @@ function VIXPanel() {
           <div className="text-sm font-mono font-semibold text-text-muted">{avg > 0 ? avg.toFixed(1) : '—'}</div>
         </div>
         <div>
-          <div className="text-[9px] font-mono text-text-muted">52w High</div>
+          <div className="text-[9px] font-mono text-text-muted">{timeframe} High</div>
           <div className="text-sm font-mono font-semibold text-red-400/60">{high52w > 0 ? high52w.toFixed(1) : '—'}</div>
         </div>
         <div>
-          <div className="text-[9px] font-mono text-text-muted">52w Low</div>
+          <div className="text-[9px] font-mono text-text-muted">{timeframe} Low</div>
           <div className="text-sm font-mono font-semibold text-green-400/60">{low52w > 0 ? low52w.toFixed(1) : '—'}</div>
         </div>
         {ivPct > 0 && (
@@ -275,7 +274,6 @@ function VIXPanel() {
         )}
       </div>
 
-      {/* Chart */}
       {vixSeries && vixSeries.length >= 5 ? (
         <div ref={containerRef} className="min-h-[220px] px-0">
           <canvas ref={canvasRef} className="w-full h-full" />
@@ -286,591 +284,28 @@ function VIXPanel() {
         </div>
       )}
 
-      {/* Context interpretation */}
       <div className="px-4 py-3 border-t border-border/20 text-xs font-mono text-text-secondary leading-relaxed space-y-1.5">
         <p>
           <strong className={regimeColor}>{regimeLabel}:</strong>{' '}
           {vix.price > 35
-            ? 'Markets pricing extreme uncertainty. Options premiums are highly elevated across the board. Hedging costs are at extremes — selling premium can be lucrative but carries significant tail risk. Historically, VIX spikes above 35 tend to mean-revert within weeks.'
+            ? 'Markets pricing extreme uncertainty. Options premiums are highly elevated across the board. Historically, VIX spikes above 35 tend to mean-revert within weeks.'
             : vix.price > 25
-            ? 'Elevated market fear. Options premiums are rich — selling strategies (iron condors, credit spreads) have a statistical edge but wider stops are needed. Expect intraday swings of 1-3%. Markets in this regime often see sharp reversals.'
+            ? 'Elevated market fear. Options premiums are rich — selling strategies (iron condors, credit spreads) have a statistical edge but wider stops are needed.'
             : vix.price > 18
-            ? 'Normal volatility environment. Options pricing is fair relative to historical realized moves. Both buying and selling strategies can work; use IV rank of the specific stock to determine directional edge.'
+            ? 'Normal volatility environment. Options pricing is fair relative to historical realized moves.'
             : vix.price > 13
-            ? 'Low volatility — calm markets. Options are cheap, making long premium strategies (straddles, debit spreads) more attractive. Be cautious selling premium at these levels as sudden vol spikes can overwhelm small credits.'
-            : 'Extreme complacency — VIX at historical lows. Markets pricing near-zero risk. This is often a contrarian warning. Long volatility positions (VIX calls, straddles) are historically cheap here.'}
+            ? 'Low volatility — calm markets. Options are cheap, making long premium strategies (straddles, debit spreads) more attractive.'
+            : 'Extreme complacency — VIX at historical lows. Long volatility positions (VIX calls, straddles) are historically cheap here.'}
         </p>
         {ma20 > 0 && (
           <p className="text-text-muted/60">
             {vix.price > ma20 * 1.1
-              ? `VIX is ${((vix.price / ma20 - 1) * 100).toFixed(0)}% above its 20-day average (${ma20.toFixed(1)}) — rising vol regime, recent fear spike.`
+              ? `VIX is ${((vix.price / ma20 - 1) * 100).toFixed(0)}% above its 20-day average (${ma20.toFixed(1)}) — rising vol regime.`
               : vix.price < ma20 * 0.9
-              ? `VIX is ${((1 - vix.price / ma20) * 100).toFixed(0)}% below its 20-day average (${ma20.toFixed(1)}) — vol compression, potential for expansion.`
+              ? `VIX is ${((1 - vix.price / ma20) * 100).toFixed(0)}% below its 20-day average (${ma20.toFixed(1)}) — vol compression.`
               : `VIX is near its 20-day average (${ma20.toFixed(1)}) — stable volatility regime.`}
           </p>
         )}
-        {ivPct > 0 && Math.abs(spread) > 5 && (
-          <p className="text-text-muted/60">
-            {spread > 10
-              ? `This stock's IV (${ivPct.toFixed(0)}%) is ${spread.toFixed(0)}pp above VIX — significantly more volatile than the broad market. Likely reflects stock-specific risk (earnings, news, etc.).`
-              : spread > 5
-              ? `Stock IV at a ${spread.toFixed(0)}pp premium to VIX — modestly more volatile than market, typical for high-beta names.`
-              : `Stock IV (${ivPct.toFixed(0)}%) is ${Math.abs(spread).toFixed(0)}pp below VIX — unusually calm for this market environment. May be underpricing risk.`}
-          </p>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ─── IV Rank Gauge ─────────────────────────────────────────
-
-function IVGauge() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const { snapshot } = useDashboardStore();
-  const iv = snapshot?.iv;
-
-  useEffect(() => {
-    if (!canvasRef.current || !iv) return;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    const size = 180;
-    canvas.width = size * dpr;
-    canvas.height = (size * 0.65) * dpr;
-    canvas.style.width = `${size}px`;
-    canvas.style.height = `${size * 0.65}px`;
-    ctx.scale(dpr, dpr);
-
-    const cx = size / 2, cy = size * 0.55;
-    const r = size * 0.38;
-    const startAngle = Math.PI;
-
-    // Background arc
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, startAngle, 2 * Math.PI);
-    ctx.lineWidth = 14;
-    ctx.strokeStyle = '#1a1a25';
-    ctx.lineCap = 'round';
-    ctx.stroke();
-
-    // Gradient arc for value
-    const valueAngle = startAngle + (iv.ivRank / 100) * Math.PI;
-    const gradient = ctx.createLinearGradient(0, cy, size, cy);
-    gradient.addColorStop(0, '#00e676');
-    gradient.addColorStop(0.5, '#ffaa00');
-    gradient.addColorStop(1, '#ff3d57');
-
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, startAngle, valueAngle);
-    ctx.lineWidth = 14;
-    ctx.strokeStyle = gradient;
-    ctx.lineCap = 'round';
-    ctx.stroke();
-
-    // Needle
-    const needleAngle = startAngle + (iv.ivRank / 100) * Math.PI;
-    ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.lineTo(cx + Math.cos(needleAngle) * (r - 20), cy + Math.sin(needleAngle) * (r - 20));
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = '#e8e8ef';
-    ctx.stroke();
-
-    // Center dot
-    ctx.beginPath();
-    ctx.arc(cx, cy, 4, 0, 2 * Math.PI);
-    ctx.fillStyle = '#e8e8ef';
-    ctx.fill();
-
-    // Labels
-    ctx.fillStyle = '#555570';
-    ctx.font = '9px "JetBrains Mono"';
-    ctx.textAlign = 'center';
-    ctx.fillText('0', cx - r - 2, cy + 14);
-    ctx.fillText('100', cx + r + 2, cy + 14);
-    ctx.fillText('50', cx, cy - r + 6);
-
-  }, [snapshot, iv]);
-
-  if (!iv) return null;
-
-  const rankColor = iv.ivRank > 70 ? 'text-accent-red' : iv.ivRank < 30 ? 'text-accent-green' : 'text-accent-amber';
-
-  return (
-    <div className="panel p-4 flex flex-col items-center">
-      <span className="panel-title mb-2">IV Rank</span>
-      <canvas ref={canvasRef} />
-      <div className={`text-3xl font-mono font-bold mt-1 ${rankColor}`}>{iv.ivRank}</div>
-      <div className="text-xs font-mono text-text-muted mt-1">
-        Percentile: {iv.ivPercentile}%
-      </div>
-    </div>
-  );
-}
-
-// ─── IV Stats ──────────────────────────────────────────────
-
-function IVStats() {
-  const { snapshot } = useDashboardStore();
-  const iv = snapshot?.iv;
-  const hv = snapshot?.historicalVol;
-  if (!iv) return null;
-
-  const stats = [
-    { label: 'Current IV', value: `${(iv.currentIV * 100).toFixed(1)}%`, color: 'text-text-primary' },
-    { label: '30d MA', value: `${(iv.iv30dMA * 100).toFixed(1)}%`, color: iv.currentIV > iv.iv30dMA ? 'text-accent-red' : 'text-accent-green' },
-    { label: '52w High', value: `${(iv.iv52wHigh * 100).toFixed(1)}%`, color: 'text-accent-red' },
-    { label: '52w Low', value: `${(iv.iv52wLow * 100).toFixed(1)}%`, color: 'text-accent-green' },
-    { label: 'HV 20d', value: hv ? `${(hv.hv20 * 100).toFixed(1)}%` : '—', color: 'text-text-secondary' },
-    { label: 'HV 60d', value: hv ? `${(hv.hv60 * 100).toFixed(1)}%` : '—', color: 'text-text-secondary' },
-    { label: 'IV/HV Ratio', value: iv.ivHvRatio.toFixed(2), color: iv.ivHvRatio > 1.3 ? 'text-accent-red' : iv.ivHvRatio < 0.8 ? 'text-accent-green' : 'text-text-primary' },
-  ];
-
-  return (
-    <div className="panel">
-      <div className="panel-header"><span className="panel-title">IV Statistics</span></div>
-      <div className="divide-y divide-border/30">
-        {stats.map((s) => (
-          <div key={s.label} className="px-4 py-2 flex justify-between items-center">
-            <span className="text-xs font-mono text-text-muted">{s.label}</span>
-            <span className={`text-sm font-mono font-medium ${s.color}`}>{s.value}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ─── IV vs VIX History Chart ──────────────────────────────
-
-function IVvsVIXChart() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const { snapshot } = useDashboardStore();
-
-  useEffect(() => {
-    if (!canvasRef.current || !containerRef.current) return;
-    const ivSeries = snapshot?.ivTimeSeries;
-    const vixSeries = snapshot?.vixTimeSeries;
-    if (!ivSeries?.length) return;
-
-    const canvas = canvasRef.current;
-    const container = containerRef.current;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    const rect = container.getBoundingClientRect();
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-    canvas.style.width = `${rect.width}px`;
-    canvas.style.height = `${rect.height}px`;
-    ctx.scale(dpr, dpr);
-
-    const w = rect.width, h = rect.height;
-    const pad = { top: 25, right: 60, bottom: 35, left: 55 };
-    const cw = w - pad.left - pad.right;
-    const ch = h - pad.top - pad.bottom;
-
-    ctx.fillStyle = '#12121a';
-    ctx.fillRect(0, 0, w, h);
-
-    const data = ivSeries;
-    if (data.length < 5) return;
-
-    const minTime = data[0].time;
-    const maxTime = data[data.length - 1].time;
-
-    // Collect all values for Y scale — use percentile-based scaling
-    // to prevent outlier spikes from compressing normal data
-    const allVals = data.flatMap(d => [d.hv20, d.ivProxy]);
-    if (vixSeries?.length) {
-      for (const v of vixSeries) {
-        if (v.time >= minTime && v.time <= maxTime) allVals.push(v.vix);
-      }
-    }
-    if (snapshot?.iv?.currentIV) allVals.push(snapshot.iv.currentIV);
-
-    const sorted = [...allVals].sort((a, b) => a - b);
-    const p2 = sorted[Math.floor(sorted.length * 0.02)] ?? 0;
-    const p98 = sorted[Math.floor(sorted.length * 0.98)] ?? sorted[sorted.length - 1];
-    const minV = p2 * 0.85;
-    const maxV = p98 * 1.15;
-
-    const toX = (t: number) => pad.left + ((t - minTime) / (maxTime - minTime)) * cw;
-    const toY = (v: number) => {
-      const clamped = Math.max(minV, Math.min(maxV, v));
-      return pad.top + ch - ((clamped - minV) / (maxV - minV)) * ch;
-    };
-
-    // Grid lines
-    ctx.strokeStyle = '#1a1a2515';
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 5; i++) {
-      const y = pad.top + (ch / 5) * i;
-      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(w - pad.right, y); ctx.stroke();
-    }
-
-    // HV20 area fill
-    ctx.beginPath();
-    ctx.moveTo(toX(data[0].time), toY(data[0].hv20));
-    for (let i = 1; i < data.length; i++) {
-      ctx.lineTo(toX(data[i].time), toY(data[i].hv20));
-    }
-    ctx.lineTo(toX(data[data.length - 1].time), pad.top + ch);
-    ctx.lineTo(toX(data[0].time), pad.top + ch);
-    ctx.closePath();
-    ctx.fillStyle = '#00d4ff08';
-    ctx.fill();
-
-    // HV20 line
-    ctx.beginPath();
-    ctx.moveTo(toX(data[0].time), toY(data[0].hv20));
-    for (let i = 1; i < data.length; i++) {
-      ctx.lineTo(toX(data[i].time), toY(data[i].hv20));
-    }
-    ctx.strokeStyle = '#00d4ff';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-
-    // IV Proxy line
-    ctx.beginPath();
-    ctx.moveTo(toX(data[0].time), toY(data[0].ivProxy));
-    for (let i = 1; i < data.length; i++) {
-      ctx.lineTo(toX(data[i].time), toY(data[i].ivProxy));
-    }
-    ctx.strokeStyle = '#b388ff';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-
-    // VIX history line (if available)
-    if (vixSeries?.length) {
-      const vixInRange = vixSeries.filter(v => v.time >= minTime && v.time <= maxTime);
-      if (vixInRange.length >= 2) {
-        ctx.beginPath();
-        ctx.moveTo(toX(vixInRange[0].time), toY(vixInRange[0].vix));
-        for (let i = 1; i < vixInRange.length; i++) {
-          ctx.lineTo(toX(vixInRange[i].time), toY(vixInRange[i].vix));
-        }
-        ctx.strokeStyle = '#ff3d57';
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([4, 3]);
-        ctx.stroke();
-        ctx.setLineDash([]);
-      }
-    }
-
-    // Current IV horizontal line
-    if (snapshot?.iv?.currentIV) {
-      const cy = toY(snapshot.iv.currentIV);
-      ctx.strokeStyle = '#ffaa0060';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 4]);
-      ctx.beginPath(); ctx.moveTo(pad.left, cy); ctx.lineTo(w - pad.right, cy); ctx.stroke();
-      ctx.setLineDash([]);
-
-      ctx.fillStyle = '#ffaa00';
-      ctx.font = '9px "JetBrains Mono"';
-      ctx.textAlign = 'left';
-      ctx.fillText(`IV ${(snapshot.iv.currentIV * 100).toFixed(0)}%`, w - pad.right + 4, cy + 3);
-    }
-
-    // Y axis labels
-    ctx.fillStyle = '#555570';
-    ctx.font = '9px "JetBrains Mono"';
-    ctx.textAlign = 'right';
-    for (let i = 0; i <= 5; i++) {
-      const val = minV + ((maxV - minV) / 5) * (5 - i);
-      ctx.fillText(`${(val * 100).toFixed(0)}%`, pad.left - 5, pad.top + (ch / 5) * i + 3);
-    }
-
-    // X axis labels
-    ctx.textAlign = 'center';
-    const labelCount = Math.min(6, data.length);
-    for (let i = 0; i < labelCount; i++) {
-      const idx = Math.floor((i / (labelCount - 1)) * (data.length - 1));
-      const d = new Date(data[idx].time * 1000);
-      ctx.fillText(`${d.getMonth() + 1}/${d.getDate()}`, toX(data[idx].time), h - pad.bottom + 14);
-    }
-
-    // Legend
-    const legendY = 12;
-    ctx.font = '9px "JetBrains Mono"';
-    ctx.textAlign = 'left';
-    let lx = pad.left;
-    ctx.fillStyle = '#00d4ff';
-    ctx.fillRect(lx, legendY - 4, 12, 2);
-    ctx.fillText('HV 20d', lx + 16, legendY);
-    lx += 80;
-    ctx.fillStyle = '#b388ff';
-    ctx.fillRect(lx, legendY - 4, 12, 2);
-    ctx.fillText('IV Proxy', lx + 16, legendY);
-    lx += 85;
-    ctx.fillStyle = '#ffaa00';
-    ctx.fillRect(lx, legendY - 4, 12, 2);
-    ctx.fillText('Current IV', lx + 16, legendY);
-    if (vixSeries?.length) {
-      lx += 95;
-      ctx.fillStyle = '#ff3d57';
-      ctx.setLineDash([3, 2]);
-      ctx.strokeStyle = '#ff3d57';
-      ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(lx, legendY - 3); ctx.lineTo(lx + 12, legendY - 3); ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.fillText('VIX', lx + 16, legendY);
-    }
-
-  }, [snapshot]);
-
-  if (!snapshot?.ivTimeSeries?.length) {
-    return (
-      <div className="panel p-8 flex items-center justify-center">
-        <span className="text-sm font-mono text-text-muted">IV history requires snapshot data</span>
-      </div>
-    );
-  }
-
-  return (
-    <div className="panel flex flex-col">
-      <div className="panel-header">
-        <span className="panel-title">IV / HV / VIX History</span>
-        <span className="badge badge-purple">{snapshot.ivTimeSeries.length}d</span>
-      </div>
-      <div ref={containerRef} className="flex-1 min-h-[280px]">
-        <canvas ref={canvasRef} className="w-full h-full" />
-      </div>
-    </div>
-  );
-}
-
-// ─── Term Structure Chart ──────────────────────────────────
-
-function TermStructureChart() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const { snapshot } = useDashboardStore();
-
-  useEffect(() => {
-    if (!canvasRef.current || !containerRef.current || !snapshot?.termStructure?.length) return;
-    const canvas = canvasRef.current;
-    const container = containerRef.current;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    const rect = container.getBoundingClientRect();
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-    canvas.style.width = `${rect.width}px`;
-    canvas.style.height = `${rect.height}px`;
-    ctx.scale(dpr, dpr);
-
-    const w = rect.width, h = rect.height;
-    const pad = { top: 20, right: 50, bottom: 35, left: 50 };
-    const cw = w - pad.left - pad.right;
-    const ch = h - pad.top - pad.bottom;
-
-    ctx.fillStyle = '#12121a';
-    ctx.fillRect(0, 0, w, h);
-
-    const data = snapshot.termStructure.filter(d => d.dte > 0 && d.dte <= 180 && d.atmIV > 0);
-    if (data.length < 2) return;
-
-    const minDTE = 0;
-    const maxDTE = Math.max(...data.map(d => d.dte));
-    const vixDecimal = snapshot.vix ? snapshot.vix.price / 100 : 0;
-    const ivValues = data.map(d => d.atmIV);
-    if (vixDecimal > 0) ivValues.push(vixDecimal);
-    const minIV = Math.min(...ivValues) * 0.9;
-    const maxIV = Math.max(...ivValues) * 1.1;
-
-    const toX = (dte: number) => pad.left + ((dte - minDTE) / (maxDTE - minDTE)) * cw;
-    const toY = (iv: number) => pad.top + ch - ((iv - minIV) / (maxIV - minIV)) * ch;
-
-    // Grid
-    ctx.strokeStyle = '#1a1a2515';
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 4; i++) {
-      const y = pad.top + (ch / 4) * i;
-      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(w - pad.right, y); ctx.stroke();
-    }
-
-    // VIX horizontal reference line
-    if (vixDecimal > 0 && vixDecimal >= minIV && vixDecimal <= maxIV) {
-      const vy = toY(vixDecimal);
-      ctx.strokeStyle = '#ff3d5740';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 4]);
-      ctx.beginPath(); ctx.moveTo(pad.left, vy); ctx.lineTo(w - pad.right, vy); ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.fillStyle = '#ff3d57';
-      ctx.font = '8px "JetBrains Mono"';
-      ctx.textAlign = 'left';
-      ctx.fillText(`VIX ${snapshot.vix!.price.toFixed(0)}`, w - pad.right + 4, vy + 3);
-    }
-
-    // Line
-    ctx.beginPath();
-    ctx.moveTo(toX(data[0].dte), toY(data[0].atmIV));
-    for (let i = 1; i < data.length; i++) {
-      ctx.lineTo(toX(data[i].dte), toY(data[i].atmIV));
-    }
-    ctx.strokeStyle = '#b388ff';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-
-    // Fill under
-    ctx.lineTo(toX(data[data.length - 1].dte), pad.top + ch);
-    ctx.lineTo(toX(data[0].dte), pad.top + ch);
-    ctx.closePath();
-    ctx.fillStyle = '#b388ff10';
-    ctx.fill();
-
-    // Points
-    data.forEach(d => {
-      ctx.beginPath();
-      ctx.arc(toX(d.dte), toY(d.atmIV), 3, 0, 2 * Math.PI);
-      ctx.fillStyle = '#b388ff';
-      ctx.fill();
-    });
-
-    // Labels
-    ctx.fillStyle = '#555570';
-    ctx.font = '9px "JetBrains Mono"';
-    data.forEach(d => {
-      ctx.textAlign = 'center';
-      ctx.fillText(`${d.dte}d`, toX(d.dte), h - pad.bottom + 14);
-    });
-
-    // Y axis
-    for (let i = 0; i <= 4; i++) {
-      const iv = minIV + ((maxIV - minIV) / 4) * (4 - i);
-      ctx.textAlign = 'right';
-      ctx.fillText(`${(iv * 100).toFixed(0)}%`, pad.left - 5, pad.top + (ch / 4) * i + 3);
-    }
-
-  }, [snapshot]);
-
-  const ts = snapshot?.termStructure?.filter(d => d.dte > 0 && d.dte <= 180) ?? [];
-  const isBackwardation = ts.length >= 2 && ts[0].atmIV > ts[ts.length - 1].atmIV;
-
-  return (
-    <div className="panel flex flex-col">
-      <div className="panel-header">
-        <span className="panel-title">IV Term Structure</span>
-        {ts.length >= 2 && (
-          <span className={`badge ${isBackwardation ? 'badge-red' : 'badge-green'}`}>
-            {isBackwardation ? 'Backwardation' : 'Contango'}
-          </span>
-        )}
-      </div>
-      <div ref={containerRef} className="flex-1 min-h-[200px]">
-        <canvas ref={canvasRef} className="w-full h-full" />
-      </div>
-      {isBackwardation && (
-        <div className="px-4 py-2 border-t border-border text-xs text-text-secondary font-mono">
-          Near-term IV exceeds far-term — market pricing imminent risk (earnings, event, etc.)
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─── Skew Chart ────────────────────────────────────────────
-
-function SkewChart() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const { snapshot } = useDashboardStore();
-
-  useEffect(() => {
-    if (!canvasRef.current || !containerRef.current || !snapshot?.skewSurface?.length) return;
-    const canvas = canvasRef.current;
-    const container = containerRef.current;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    const rect = container.getBoundingClientRect();
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-    canvas.style.width = `${rect.width}px`;
-    canvas.style.height = `${rect.height}px`;
-    ctx.scale(dpr, dpr);
-
-    const w = rect.width, h = rect.height;
-    const pad = { top: 20, right: 20, bottom: 35, left: 50 };
-    const cw = w - pad.left - pad.right;
-    const ch = h - pad.top - pad.bottom;
-
-    ctx.fillStyle = '#12121a';
-    ctx.fillRect(0, 0, w, h);
-
-    const spot = snapshot.spotPrice;
-    const exps = snapshot.skewSurface.slice(0, 3);
-    if (exps.length === 0) return;
-
-    const allPoints = exps.flatMap(e => e.points);
-    const minIV = Math.min(...allPoints.map(p => p.iv)) * 0.9;
-    const maxIV = Math.max(...allPoints.map(p => p.iv)) * 1.1;
-
-    const focusMin = spot * 0.9, focusMax = spot * 1.1;
-    const toX = (strike: number) => pad.left + ((strike - focusMin) / (focusMax - focusMin)) * cw;
-    const toY = (iv: number) => pad.top + ch - ((iv - minIV) / (maxIV - minIV)) * ch;
-
-    const colors = ['#00d4ff', '#b388ff', '#ffaa00'];
-
-    exps.forEach((exp, ei) => {
-      const pts = exp.points.filter(p => p.strike >= focusMin && p.strike <= focusMax);
-      if (pts.length < 2) return;
-
-      ctx.beginPath();
-      ctx.moveTo(toX(pts[0].strike), toY(pts[0].iv));
-      for (let i = 1; i < pts.length; i++) {
-        ctx.lineTo(toX(pts[i].strike), toY(pts[i].iv));
-      }
-      ctx.strokeStyle = colors[ei] || '#8888a0';
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-    });
-
-    const sx = toX(spot);
-    ctx.strokeStyle = '#e8e8ef20';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([3, 3]);
-    ctx.beginPath(); ctx.moveTo(sx, pad.top); ctx.lineTo(sx, h - pad.bottom); ctx.stroke();
-    ctx.setLineDash([]);
-
-    ctx.fillStyle = '#8888a0';
-    ctx.font = '9px "JetBrains Mono"';
-    ctx.textAlign = 'center';
-    ctx.fillText('ATM', sx, h - pad.bottom + 12);
-
-    ctx.textAlign = 'right';
-    for (let i = 0; i <= 4; i++) {
-      const iv = minIV + ((maxIV - minIV) / 4) * (4 - i);
-      ctx.fillText(`${(iv * 100).toFixed(0)}%`, pad.left - 5, pad.top + (ch / 4) * i + 3);
-    }
-
-    exps.forEach((exp, ei) => {
-      ctx.fillStyle = colors[ei];
-      ctx.font = '9px "JetBrains Mono"';
-      ctx.textAlign = 'left';
-      ctx.fillText(`${exp.dte}d`, w - pad.right - 40, pad.top + 14 + ei * 14);
-    });
-
-  }, [snapshot]);
-
-  return (
-    <div className="panel flex flex-col">
-      <div className="panel-header">
-        <span className="panel-title">Volatility Skew</span>
-      </div>
-      <div ref={containerRef} className="flex-1 min-h-[200px]">
-        <canvas ref={canvasRef} className="w-full h-full" />
       </div>
     </div>
   );
@@ -887,7 +322,6 @@ function SKEWPanel() {
   const color = skew.current > 150 ? 'text-red-400' : skew.current > 140 ? 'text-amber-400' : skew.current > 125 ? 'text-text-primary' : 'text-green-400';
   const bg = skew.current > 150 ? 'bg-red-500/10 text-red-400' : skew.current > 140 ? 'bg-amber-500/10 text-amber-400' : skew.current > 125 ? 'bg-bg-tertiary text-text-muted' : 'bg-green-500/10 text-green-400';
 
-  // SKEW gauge — visual bar showing where current value falls in typical 100-170 range
   const gaugeMin = 100, gaugeMax = 170;
   const gaugePct = Math.max(0, Math.min(100, ((skew.current - gaugeMin) / (gaugeMax - gaugeMin)) * 100));
 
@@ -897,11 +331,11 @@ function SKEWPanel() {
         <div className="flex items-center gap-2">
           <Shield className="w-3.5 h-3.5 text-accent-amber" />
           <span className="panel-title">CBOE SKEW Index</span>
+          <InfoTip text="The CBOE SKEW Index measures the perceived tail risk of the S&P 500, derived from OTM option prices. High SKEW (>145) = institutional demand for crash protection, even if VIX is low. SKEW-VIX divergence (high SKEW + low VIX) is historically the most dangerous setup — smart money hedging while the surface appears calm. Low SKEW (<120) = OTM puts are cheap for hedging." />
         </div>
         <span className={`text-[10px] font-mono px-2 py-0.5 rounded ${bg}`}>{level} Tail Risk</span>
       </div>
 
-      {/* Stats row */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-2 px-4 pt-3 pb-2">
         <div>
           <div className="text-[9px] font-mono text-text-muted">Current</div>
@@ -924,50 +358,39 @@ function SKEWPanel() {
         </div>
       </div>
 
-      {/* Visual gauge bar */}
       <div className="px-4 py-2">
         <div className="relative h-3 bg-bg-tertiary rounded-full overflow-hidden">
-          {/* Zone colors */}
           <div className="absolute inset-0 flex">
-            <div className="h-full bg-green-500/15" style={{ width: '35.7%' }} /> {/* 100-125 */}
-            <div className="h-full bg-amber-500/10" style={{ width: '21.4%' }} /> {/* 125-140 */}
-            <div className="h-full bg-amber-500/15" style={{ width: '14.3%' }} /> {/* 140-150 */}
-            <div className="h-full bg-red-500/15" style={{ width: '28.6%' }} />   {/* 150-170 */}
+            <div className="h-full bg-green-500/15" style={{ width: '35.7%' }} />
+            <div className="h-full bg-amber-500/10" style={{ width: '21.4%' }} />
+            <div className="h-full bg-amber-500/15" style={{ width: '14.3%' }} />
+            <div className="h-full bg-red-500/15" style={{ width: '28.6%' }} />
           </div>
-          {/* Current position indicator */}
-          <div
-            className="absolute top-0 h-full w-1 bg-white/80 rounded-full"
-            style={{ left: `${gaugePct}%` }}
-          />
+          <div className="absolute top-0 h-full w-1 bg-white/80 rounded-full" style={{ left: `${gaugePct}%` }} />
         </div>
         <div className="flex justify-between text-[8px] font-mono text-text-muted/50 mt-0.5">
-          <span>100 (Low)</span>
-          <span>125</span>
-          <span>140</span>
-          <span>150</span>
-          <span>170 (Extreme)</span>
+          <span>100 (Low)</span><span>125</span><span>140</span><span>150</span><span>170 (Extreme)</span>
         </div>
       </div>
 
-      {/* Context */}
       <div className="px-4 py-3 border-t border-border/20 text-xs font-mono text-text-secondary leading-relaxed space-y-1.5">
         <p>
           <strong className={color}>{level}:</strong>{' '}
           {skew.current > 150
-            ? 'SKEW above 150 — extreme tail-risk pricing. Market makers are charging large premiums for OTM puts vs calls, indicating institutional hedging against crash risk even if VIX appears calm. Historically, extreme SKEW precedes vol spikes within 2-6 weeks.'
+            ? 'SKEW above 150 — extreme tail-risk pricing. Market makers charging large premiums for OTM puts. Historically, extreme SKEW precedes vol spikes within 2-6 weeks.'
             : skew.current > 140
-            ? 'SKEW elevated — increased tail-risk premium. OTM puts are priced richer than calls, indicating demand for downside protection. Consider long put spreads or portfolio hedges.'
+            ? 'SKEW elevated — increased tail-risk premium. OTM puts are priced richer than calls. Consider long put spreads or portfolio hedges.'
             : skew.current > 125
-            ? 'SKEW in normal range (125-140) — balanced tail-risk pricing. No unusual demand for crash protection.'
-            : 'SKEW unusually low — minimal tail-risk pricing. OTM puts are relatively cheap — historically attractive entry for long-dated downside hedges.'}
+            ? 'SKEW in normal range — balanced tail-risk pricing. No unusual demand for crash protection.'
+            : 'SKEW unusually low — OTM puts are relatively cheap. Historically attractive entry for long-dated downside hedges.'}
         </p>
         {snapshot?.vix && (
           <p className="text-text-muted/60">
             {skew.current > 145 && snapshot.vix.price < 18
-              ? `Divergence alert: SKEW (${skew.current.toFixed(0)}) signals tail-risk fear while VIX (${snapshot.vix.price.toFixed(1)}) shows complacency. Smart money may be quietly hedging — this is historically the most dangerous setup.`
+              ? `⚠ Divergence: SKEW (${skew.current.toFixed(0)}) signals tail-risk fear while VIX (${snapshot.vix.price.toFixed(1)}) shows complacency. Smart money may be quietly hedging — historically dangerous.`
               : skew.current < 125 && snapshot.vix.price > 25
-              ? `Unusual: VIX elevated (${snapshot.vix.price.toFixed(1)}) but SKEW low (${skew.current.toFixed(0)}). Market fears are broad-based (not tail-specific). This pattern often resolves with mean reversion in VIX.`
-              : `VIX at ${snapshot.vix.price.toFixed(1)} with SKEW at ${skew.current.toFixed(0)} — ${skew.current > 140 && snapshot.vix.price > 20 ? 'both elevated, confirming risk-off sentiment' : 'aligned within normal parameters'}.`}
+              ? `VIX elevated (${snapshot.vix.price.toFixed(1)}) but SKEW low (${skew.current.toFixed(0)}). Broad-based fear, not tail-specific. Often resolves with VIX mean reversion.`
+              : `VIX at ${snapshot.vix.price.toFixed(1)} with SKEW at ${skew.current.toFixed(0)} — ${skew.current > 140 && snapshot.vix.price > 20 ? 'both elevated, confirming risk-off' : 'aligned within normal parameters'}.`}
           </p>
         )}
       </div>
@@ -1000,6 +423,7 @@ function IVInterpretation() {
 
 export default function VolatilityTab() {
   const { snapshot, loading } = useDashboardStore();
+  const [volTimeframe, setVolTimeframe] = useState<Timeframe>('6M');
 
   if (loading.snapshot && !snapshot) {
     return (
@@ -1007,7 +431,7 @@ export default function VolatilityTab() {
         <div className="panel p-8 flex items-center justify-center">
           <div className="flex items-center gap-3 text-text-muted font-mono">
             <div className="w-5 h-5 border-2 border-accent-purple/30 border-t-accent-purple rounded-full animate-spin" />
-            Loading Polygon options snapshot & computing IV analytics...
+            Loading options snapshot & computing volatility analytics...
           </div>
         </div>
       </div>
@@ -1016,33 +440,42 @@ export default function VolatilityTab() {
 
   return (
     <div className="space-y-4 animate-fade-in">
-      {/* VIX Panel — full-width with chart, stats, and context */}
-      <VIXPanel />
-
-      {/* SKEW Panel — tail risk indicator from FRED */}
-      <SKEWPanel />
-
-      {/* Top row: gauge + stats + term structure */}
+      {/* Section 1: Overview — IV Gauge + Stats side by side */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <IVGauge />
-        <IVStats />
-        <TermStructureChart />
+        <div className="md:col-span-2">
+          <IVStats />
+        </div>
       </div>
 
-      {/* IV vs VIX History */}
-      <IVvsVIXChart />
+      {/* Section 2: Volatility Risk Premium — the primary edge-finding chart */}
+      <VRPChart timeframe={volTimeframe} onTimeframeChange={setVolTimeframe} />
 
-      {/* Interpretation */}
+      {/* Section 3: Volatility Surface + Vol Cone */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <VolSurface />
+        <VolCone />
+      </div>
+
+      {/* Section 4: Term Structure + Skew */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <TermStructureChart />
+        <SkewChart />
+      </div>
+
+      {/* Section 5: Volatility Context */}
       <IVInterpretation />
 
-      {/* Skew */}
-      <SkewChart />
+      {/* Section 6: Market Vol Indices */}
+      <VIXPanel timeframe={volTimeframe} />
+      <SKEWPanel />
 
-      {/* Snapshot info */}
+      {/* Footer */}
       {snapshot && (
         <div className="text-xs font-mono text-text-muted text-center py-2">
           Polygon snapshot: {snapshot.snapshotCount} contracts analyzed
           {snapshot.vix && ` | VIX: ${snapshot.vix.price.toFixed(2)}`}
+          {snapshot.volCone && ` | Vol Cone: ${snapshot.volCone.length} windows`}
         </div>
       )}
     </div>

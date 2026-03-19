@@ -36,8 +36,11 @@ export async function GET(_req: NextRequest) {
     };
 
     // ── All data sources in parallel ──
+    // NOTE: DTCC swap ZIP skipped — decompressing the cumulative equity swap
+    // report peaks at 200-400MB which OOM-kills on Vercel's 2048MB limit.
+    // The early size guard in extractFirstFileFromZip will also reject large files.
     const [swapSummary, regSHOResult, siResult, svResult, indicators, flowResult] = await Promise.all([
-      raceTimeout(getMarketSwapSummary().catch(() => emptySwap), 6000, emptySwap),
+      Promise.resolve(emptySwap),
       raceTimeout(fetchRegSHOWithDate().catch(() => emptyRegSHO), 5000, emptyRegSHO),
       raceTimeout(fetchShortInterestWithDate().catch(() => emptySI), 6000, emptySI),
       raceTimeout(fetchShortSaleVolumeWithDate().catch(() => emptySV), 6000, emptySV),
@@ -45,103 +48,120 @@ export async function GET(_req: NextRequest) {
       raceTimeout(scanMarketFlow().catch(() => emptyFlow), 10000, emptyFlow),
     ]);
 
-    // ── Process short data ──
-    const regSHOList = Array.from(regSHOResult.tickers).filter(s => /^[A-Z]+$/.test(s)).sort();
+    // ── Process short data (each section isolated so one bad source can't crash all) ──
+    let regSHOList: string[] = [];
+    try {
+      const tickers = regSHOResult?.tickers;
+      if (tickers && typeof tickers[Symbol.iterator] === 'function') {
+        regSHOList = Array.from(tickers).filter((s: string) => /^[A-Z]+$/.test(s)).sort();
+      }
+    } catch (e) { console.warn('[institutional] RegSHO processing error:', e); }
 
     const siScreener: { symbol: string; daysToCover: number; shortInterest: number; avgDailyVolume: number }[] = [];
-    for (const [sym, data] of siResult.data) {
-      if (data.daysToCover >= 3 && data.daysToCover <= 100 && data.shortInterest >= 50000 && data.avgDailyVolume >= 1000) {
-        siScreener.push({ symbol: sym, daysToCover: data.daysToCover, shortInterest: data.shortInterest, avgDailyVolume: data.avgDailyVolume });
+    try {
+      const siData = siResult?.data;
+      if (siData && typeof siData[Symbol.iterator] === 'function') {
+        for (const [sym, data] of siData) {
+          if (data?.daysToCover >= 3 && data.daysToCover <= 100 && data.shortInterest >= 50000 && data.avgDailyVolume >= 1000) {
+            siScreener.push({ symbol: sym, daysToCover: data.daysToCover, shortInterest: data.shortInterest, avgDailyVolume: data.avgDailyVolume });
+          }
+        }
+        siScreener.sort((a, b) => b.daysToCover - a.daysToCover);
       }
-    }
-    siScreener.sort((a, b) => b.daysToCover - a.daysToCover);
+    } catch (e) { console.warn('[institutional] SI processing error:', e); }
 
     const svScreener: { symbol: string; shortVolume: number; totalVolume: number; shortRatio: number }[] = [];
-    for (const [sym, data] of svResult.data) {
-      if (data.shortRatio > 0.40 && data.totalVolume > 100000) {
-        svScreener.push({ symbol: sym, shortVolume: data.shortVolume, totalVolume: data.totalVolume, shortRatio: data.shortRatio });
+    try {
+      const svData = svResult?.data;
+      if (svData && typeof svData[Symbol.iterator] === 'function') {
+        for (const [sym, data] of svData) {
+          if (data?.shortRatio > 0.40 && data.totalVolume > 100000) {
+            svScreener.push({ symbol: sym, shortVolume: data.shortVolume, totalVolume: data.totalVolume, shortRatio: data.shortRatio });
+          }
+        }
+        svScreener.sort((a, b) => b.shortRatio - a.shortRatio);
       }
-    }
-    svScreener.sort((a, b) => b.shortRatio - a.shortRatio);
+    } catch (e) { console.warn('[institutional] SV processing error:', e); }
 
-    const swapAvailable = swapSummary.asOf !== '' || swapSummary.totalMaturitiesToday > 0;
+    const swapAvailable = (swapSummary?.asOf ?? '') !== '' || (swapSummary?.totalMaturitiesToday ?? 0) > 0;
 
     // ── Sources ──
     const sources: string[] = [];
-    if (flowResult.asOf) sources.push(flowResult.isDeveloper ? 'Polygon Flow (Developer)' : 'Polygon Flow');
+    if (flowResult?.asOf) sources.push(flowResult.isDeveloper ? 'Polygon Flow (Developer)' : 'Polygon Flow');
     sources.push('Polygon SI/SV', 'FINRA Reg SHO', 'DTCC Swaps');
-    if (isFREDAvailable() && (indicators.vix || indicators.skew)) sources.push('FRED');
+    if (isFREDAvailable() && (indicators?.vix || indicators?.skew)) sources.push('FRED');
 
     // ── Fire-and-forget: persist daily flow snapshot ──
-    if (flowResult.asOf) {
-      const today = new Date().toISOString().slice(0, 10);
-      const flowRecord: HistoryRecord = {
-        date: today,
-        timestamp: Date.now(),
-        netPremium: flowResult.flow.netPremium,
-        netCallPremium: flowResult.flow.netCallPremium,
-        netPutPremium: flowResult.flow.netPutPremium,
-        totalCallVolume: flowResult.flow.totalCallVolume,
-        totalPutVolume: flowResult.flow.totalPutVolume,
-        putCallRatio: flowResult.flow.putCallRatio,
-        sentiment: flowResult.flow.sentiment,
-        contractsAnalyzed: flowResult.flow.contractsAnalyzed,
-        tickersScanned: flowResult.flow.tickersScanned,
-        sweepCount: flowResult.alerts.filter(a => a.tradeType === 'sweep').length,
-        blockCount: flowResult.alerts.filter(a => a.tradeType === 'block').length,
-        topAlertPremium: flowResult.alerts[0]?.premium ?? 0,
-        vixPrice: indicators.vix?.current ?? undefined,
-        skewValue: indicators.skew?.current ?? undefined,
-        perTicker: flowResult.perTickerFlow.slice(0, 10).map(tf => ({
-          ticker: tf.ticker,
-          netPremium: tf.netPremium,
-          callPremium: tf.callPremium,
-          putPremium: tf.putPremium,
-        })),
-      };
-      saveDaily('optix:flow:market', flowRecord).catch(() => {});
-
-      // Per-ticker flow
-      for (const tf of flowResult.perTickerFlow.slice(0, 10)) {
-        const tickerRecord: HistoryRecord = {
+    try {
+      if (flowResult?.asOf) {
+        const today = new Date().toISOString().slice(0, 10);
+        const flowRecord: HistoryRecord = {
           date: today,
           timestamp: Date.now(),
-          netPremium: tf.netPremium,
-          callPremium: tf.callPremium,
-          putPremium: tf.putPremium,
-          callVolume: tf.callVolume,
-          putVolume: tf.putVolume,
+          netPremium: flowResult.flow.netPremium,
+          netCallPremium: flowResult.flow.netCallPremium,
+          netPutPremium: flowResult.flow.netPutPremium,
+          totalCallVolume: flowResult.flow.totalCallVolume,
+          totalPutVolume: flowResult.flow.totalPutVolume,
+          putCallRatio: flowResult.flow.putCallRatio,
+          sentiment: flowResult.flow.sentiment,
+          contractsAnalyzed: flowResult.flow.contractsAnalyzed,
+          tickersScanned: flowResult.flow.tickersScanned,
+          sweepCount: flowResult.alerts.filter(a => a.tradeType === 'sweep').length,
+          blockCount: flowResult.alerts.filter(a => a.tradeType === 'block').length,
+          topAlertPremium: flowResult.alerts[0]?.premium ?? 0,
+          vixPrice: indicators?.vix?.current ?? undefined,
+          skewValue: indicators?.skew?.current ?? undefined,
+          perTicker: flowResult.perTickerFlow.slice(0, 10).map(tf => ({
+            ticker: tf.ticker,
+            netPremium: tf.netPremium,
+            callPremium: tf.callPremium,
+            putPremium: tf.putPremium,
+          })),
         };
-        saveDaily(`optix:flow:${tf.ticker}`, tickerRecord).catch(() => {});
+        saveDaily('optix:flow:market', flowRecord).catch(() => {});
+
+        for (const tf of flowResult.perTickerFlow.slice(0, 10)) {
+          const tickerRecord: HistoryRecord = {
+            date: today,
+            timestamp: Date.now(),
+            netPremium: tf.netPremium,
+            callPremium: tf.callPremium,
+            putPremium: tf.putPremium,
+            callVolume: tf.callVolume,
+            putVolume: tf.putVolume,
+          };
+          saveDaily(`optix:flow:${tf.ticker}`, tickerRecord).catch(() => {});
+        }
       }
-    }
+    } catch (e) { console.warn('[institutional] Persistence error (non-fatal):', e); }
 
     return NextResponse.json({
       timestamp: Date.now(),
       sources,
 
       // Market Sentiment
-      vix: indicators.vix,
-      skew: indicators.skew,
+      vix: indicators?.vix ?? null,
+      skew: indicators?.skew ?? null,
 
       // Options Flow (DIY from Polygon)
-      marketFlow: flowResult.flow,
-      flowAlerts: flowResult.alerts.slice(0, 30),
-      perTickerFlow: flowResult.perTickerFlow,
-      flowDeveloper: flowResult.isDeveloper,
+      marketFlow: flowResult?.flow ?? null,
+      flowAlerts: (flowResult?.alerts ?? []).slice(0, 30),
+      perTickerFlow: flowResult?.perTickerFlow ?? [],
+      flowDeveloper: flowResult?.isDeveloper ?? false,
 
       // Short Pressure
       siScreener: siScreener.slice(0, 20),
-      siAsOf: siResult.asOf,
+      siAsOf: siResult?.asOf ?? '',
       svScreener: svScreener.slice(0, 20),
-      svAsOf: svResult.asOf,
+      svAsOf: svResult?.asOf ?? '',
 
       // Reg SHO
       regSHOList: regSHOList.slice(0, 50),
-      regSHOAsOf: regSHOResult.asOf,
+      regSHOAsOf: regSHOResult?.asOf ?? '',
 
       // DTCC Swaps
-      swapSummary: { ...swapSummary, available: swapAvailable },
+      swapSummary: { ...(swapSummary ?? emptySwap), available: swapAvailable },
     });
   } catch (error) {
     console.error('[institutional] Error:', error);

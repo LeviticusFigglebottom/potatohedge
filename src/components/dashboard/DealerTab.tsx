@@ -3,6 +3,8 @@
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import { formatNumber, formatCurrency } from '@/lib/utils/format';
 import GEXChart from '@/components/charts/GEXChart';
+import GammaHeatmap from '@/components/charts/GammaHeatmap';
+import ExpirationBreakdown from '@/components/charts/ExpirationBreakdown';
 import { Shield, ArrowUp, ArrowDown, Minus, AlertTriangle, Zap, BarChart3, ChevronRight } from 'lucide-react';
 
 function KeyLevelsTable() {
@@ -178,8 +180,18 @@ export default function DealerTab() {
         <KeyLevelsTable />
       </div>
 
-      {/* Interpretation */}
-      <DealerInterpretation />
+      {/* 4-Panel Exposure Surface — GEX / DEX / Vanna / Charm */}
+      <GammaHeatmap />
+
+      {/* Expiration breakdown + Interpretation side by side */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="lg:col-span-1">
+          <ExpirationBreakdown />
+        </div>
+        <div className="lg:col-span-2">
+          <DealerInterpretation />
+        </div>
+      </div>
 
       {/* Per-expiration breakdown */}
       <PerExpirationTable />

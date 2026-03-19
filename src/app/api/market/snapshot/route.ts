@@ -119,7 +119,9 @@ export async function GET(request: NextRequest) {
 
     // ── Historical Volatility from Polygon equity bars ──
     const closes = historyBars.map(b => b.c).reverse(); // newest first
+    const hv10 = computeHistoricalVolatility(closes, 10);
     const hv20 = computeHistoricalVolatility(closes, 20);
+    const hv30 = computeHistoricalVolatility(closes, 30);
     const hv60 = computeHistoricalVolatility(closes, 60);
 
     // ── IV Rank/Percentile ──
@@ -234,25 +236,37 @@ export async function GET(request: NextRequest) {
 
     skewSurface.sort((a, b) => a.dte - b.dte);
 
-    // ── Historical IV/HV time series for Analytics tab ──
-    // Walk forward through chronological bars computing rolling HV20 and IV proxy
-    const ivTimeSeries: { time: number; hv20: number; ivProxy: number; ivRank: number }[] = [];
+    // ── Historical IV/HV time series for Volatility tab ──
+    // Walk forward through chronological bars computing rolling HV at multiple windows
+    // plus IV proxy, IV rank, and VRP (Volatility Risk Premium)
+    const ivTimeSeries: { time: number; hv10: number; hv20: number; hv30: number; hv60: number; ivProxy: number; ivRank: number }[] = [];
     const barChronological = [...historyBars].sort((a, b) => a.t - b.t);
     const closesChron = barChronological.map(b => b.c);
-    if (closesChron.length > 25) {
-      for (let i = 21; i < closesChron.length; i++) {
-        const window = closesChron.slice(i - 20, i + 1);
-        const returns: number[] = [];
-        for (let j = 1; j < window.length; j++) {
-          if (window[j - 1] > 0 && window[j] > 0) {
-            returns.push(Math.log(window[j] / window[j - 1]));
-          }
+
+    // Helper: compute HV for a given window ending at index i
+    function rollingHV(closes: number[], endIdx: number, window: number): number {
+      if (endIdx < window) return 0;
+      const slice = closes.slice(endIdx - window, endIdx + 1);
+      const returns: number[] = [];
+      for (let j = 1; j < slice.length; j++) {
+        if (slice[j - 1] > 0 && slice[j] > 0) {
+          returns.push(Math.log(slice[j] / slice[j - 1]));
         }
-        if (returns.length < 2) continue;
-        const mean = returns.reduce((s, r) => s + r, 0) / returns.length;
-        const variance = returns.reduce((s, r) => s + (r - mean) ** 2, 0) / (returns.length - 1);
-        const localHV = Math.sqrt(variance * 252);
-        const localIVProxy = localHV * 1.15;
+      }
+      if (returns.length < 2) return 0;
+      const mean = returns.reduce((s, r) => s + r, 0) / returns.length;
+      const variance = returns.reduce((s, r) => s + (r - mean) ** 2, 0) / (returns.length - 1);
+      return Math.sqrt(variance * 252);
+    }
+
+    if (closesChron.length > 65) {
+      // Start at index 60 to ensure all HV windows have enough data
+      for (let i = 60; i < closesChron.length; i++) {
+        const localHV10 = rollingHV(closesChron, i, 10);
+        const localHV20 = rollingHV(closesChron, i, 20);
+        const localHV30 = rollingHV(closesChron, i, 30);
+        const localHV60 = rollingHV(closesChron, i, 60);
+        const localIVProxy = localHV20 * 1.15;
 
         // IV rank at this point: compare to all prior IV proxies
         const priorIVs = ivTimeSeries.map(p => p.ivProxy);
@@ -267,11 +281,41 @@ export async function GET(request: NextRequest) {
 
         ivTimeSeries.push({
           time: Math.floor(barChronological[i].t / 1000),
-          hv20: localHV,
+          hv10: localHV10,
+          hv20: localHV20,
+          hv30: localHV30,
+          hv60: localHV60,
           ivProxy: localIVProxy,
           ivRank: rank,
         });
       }
+    }
+
+    // ── Volatility Cone (Euan Sinclair) ──
+    // For each HV window, compute percentile distribution from all historical readings.
+    // Shows where current IV sits relative to the full distribution of realized vol.
+    const volCone: { window: number; current: number; p5: number; p25: number; median: number; p75: number; p95: number }[] = [];
+    const hvWindows = [10, 20, 30, 60, 90] as const;
+    for (const win of hvWindows) {
+      // Collect all historical HV readings at this window
+      const allHVs: number[] = [];
+      for (let i = win; i < closesChron.length; i++) {
+        const hv = rollingHV(closesChron, i, win);
+        if (hv > 0) allHVs.push(hv);
+      }
+      if (allHVs.length < 10) continue;
+      allHVs.sort((a, b) => a - b);
+      const pct = (p: number) => allHVs[Math.floor(p * (allHVs.length - 1))];
+      const currentHV = allHVs[allHVs.length - 1]; // most recent
+      volCone.push({
+        window: win,
+        current: currentHV,
+        p5: pct(0.05),
+        p25: pct(0.25),
+        median: pct(0.50),
+        p75: pct(0.75),
+        p95: pct(0.95),
+      });
     }
 
     // ── VIX context ──
@@ -298,8 +342,9 @@ export async function GET(request: NextRequest) {
       iv: ivContext,
       termStructure,
       skewSurface: skewSurface.slice(0, 8),
-      historicalVol: { hv20, hv60 },
+      historicalVol: { hv10, hv20, hv30, hv60 },
       ivTimeSeries: ivTimeSeries.slice(-252),
+      volCone,
       vix: vixData,
       vixTimeSeries: vixTimeSeries.slice(-252),
       skew: fredIndicators.skew,

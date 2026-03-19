@@ -1,0 +1,1312 @@
+'use client';
+
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { Brain, Activity, Zap, TrendingUp, AlertTriangle, Clock, DollarSign, Play, Loader2, CheckCircle2, Trash2, Settings, Wifi, WifiOff, Database, CalendarCheck } from 'lucide-react';
+import InfoTip from './vol/InfoTip';
+
+// ─── Types ──────────────────────────────────────────────────
+
+interface SignalItem {
+  strategy: string;
+  fired: number;
+  strength: number;
+  trade_type: string;
+  rationale: string;
+  executed: number;
+}
+
+interface OpenPosition {
+  id: number;
+  strategy: string;
+  symbol: string;
+  trade_type: string;
+  qty: number;
+  entry_price: number;
+  entry_cost: number;
+  entry_date: string;
+  strike: number;
+  expiry: string;
+  is_credit: number;
+}
+
+interface RecentTrade {
+  date: string;
+  strategy: string;
+  action: string;
+  symbol: string;
+  qty: number;
+  price: number;
+  details: string;
+}
+
+interface EquityPoint {
+  date: string;
+  portfolio_value: number;
+  cash: number;
+  positions_value: number;
+}
+
+interface HistoryRow {
+  date: string;
+  spot: number;
+  comp_volume: number | null;
+  comp_greek: number | null;
+  composite: number | null;
+  iv_mean: number | null;
+  put_skew: number | null;
+  pcr_dollar: number | null;
+  [key: string]: number | string | null | undefined;
+}
+
+interface EntropyData {
+  status: 'no_db' | 'warmup' | 'active';
+  warmup: { current: number; required: number };
+  date: string | null;
+  spot: number | null;
+  metrics: Record<string, number | null> | null;
+  medians: Record<string, number | null>;
+  signals: { date: string; items: SignalItem[] };
+  openPositions: OpenPosition[];
+  recentTrades: RecentTrade[];
+  equity: EquityPoint[];
+  stats: { totalTrades: number; wins: number; winRate: number; totalPnl: number; openCount: number };
+}
+
+// ─── Helpers ────────────────────────────────────────────────
+
+const fmt4 = (v: number | null | undefined) => v != null ? v.toFixed(4) : '—';
+const fmtPct = (v: number | null | undefined) => v != null ? `${(v * 100).toFixed(1)}%` : '—';
+const fmtRatio = (v: number | null | undefined) => v != null ? v.toFixed(3) : '—';
+const fmtDollar = (v: number) => v >= 0 ? `$${v.toFixed(2)}` : `-$${Math.abs(v).toFixed(2)}`;
+
+function daysUntil(expiry: string): number {
+  const now = new Date();
+  const exp = new Date(expiry);
+  return Math.max(0, Math.ceil((exp.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)));
+}
+
+const GAUGE_INFO: Record<string, string> = {
+  comp_volume: 'Volume-weighted entropy composite. Measures disorder in option volume distribution across strikes and expirations. Lower values indicate concentrated (directional) flow — a potential signal.',
+  comp_greek: 'Greek-weighted entropy composite. Captures disorder in delta/gamma exposure across the chain. Low values suggest the market is pricing a specific move.',
+  composite: 'Master composite combining volume and greek entropy with auxiliary metrics. The primary signal driver — values below the 21-day median indicate exploitable structure.',
+};
+
+const STRATEGY_LABELS: Record<string, string> = {
+  S_LowVolEnt: 'Low Volume Entropy',
+  S_VolCollapse: 'Volatility Collapse',
+  S_LowEntLowIV: 'Low Entropy + Low IV',
+  S_LowGreekEnt: 'Low Greek Entropy',
+  S_SkewFlow: 'Skew Flow',
+  S_PCRContrarian: 'PCR Contrarian',
+};
+
+const ACTION_COLORS: Record<string, string> = {
+  OPEN: 'text-accent-cyan',
+  CLOSE_TP: 'text-accent-green',
+  CLOSE_SL: 'text-accent-red',
+  CLOSE_DTE: 'text-accent-amber',
+};
+
+// ─── Market Hours Helper ────────────────────────────────────
+
+
+function todayET(): string {
+  // Get today's date in ET
+  const now = new Date();
+  const month = now.getUTCMonth();
+  const isDST = month >= 2 && month <= 10;
+  const offset = isDST ? 4 : 5;
+  const et = new Date(now.getTime() - offset * 60 * 60 * 1000);
+  return et.toISOString().slice(0, 10);
+}
+
+// ─── Component ──────────────────────────────────────────────
+
+export default function EntropyTab() {
+  const [data, setData] = useState<EntropyData | null>(null);
+  const [history, setHistory] = useState<HistoryRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+  const [runResult, setRunResult] = useState<{ status: string; message: string } | null>(null);
+  const [diagnostics, setDiagnostics] = useState<{
+    redisConnected: boolean;
+    redisHasData: boolean;
+    totalDays: number;
+    warmupComplete: boolean;
+    lastRunDate: string | null;
+    nextExpectedRun: string;
+    gaps: string[];
+    runLog: { date: string; spot: number; composite: number | null; records: number | null }[];
+  } | null>(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [purging, setPurging] = useState(false);
+  const [purgeConfirm, setPurgeConfirm] = useState(false);
+  const [purgeResult, setPurgeResult] = useState<string | null>(null);
+  const [cronTestRunning, setCronTestRunning] = useState(false);
+  const [cronTestResult, setCronTestResult] = useState<{
+    summary: string;
+    allPassed: boolean;
+    checks: { name: string; status: 'pass' | 'fail' | 'warn'; detail: string; ms?: number }[];
+    timestamp: string;
+  } | null>(null);
+  const [triggerAvailable, setTriggerAvailable] = useState<boolean | null>(null);
+  const [triggering, setTriggering] = useState(false);
+  const [triggerResult, setTriggerResult] = useState<{ success: boolean; message?: string; error?: string; help?: string; detail?: string; debug?: Record<string, string> } | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const warmupCanvasRef = useRef<HTMLCanvasElement>(null);
+  const warmupContainerRef = useRef<HTMLDivElement>(null);
+
+  const fetchDiagnostics = useCallback(async () => {
+    try {
+      const [diagRes, trigRes] = await Promise.all([
+        fetch('/api/entropy?view=diagnostics'),
+        fetch('/api/entropy/cron/trigger'),
+      ]);
+      if (diagRes.ok) setDiagnostics(await diagRes.json());
+      if (trigRes.ok) {
+        const t = await trigRes.json();
+        setTriggerAvailable(t.available);
+      }
+    } catch { /* silent */ }
+  }, []);
+
+  const purgeAllData = useCallback(async () => {
+    if (!purgeConfirm || purging) return;
+    setPurging(true);
+    setPurgeResult(null);
+    try {
+      const res = await fetch('/api/entropy', { method: 'DELETE' });
+      const json = await res.json();
+      if (json.success) {
+        setPurgeResult('All entropy data purged. Refresh to reinitialize.');
+        // Reset state
+        setData(null);
+        setHistory([]);
+        setDiagnostics(null);
+      } else {
+        setPurgeResult(`Purge failed: ${json.error || 'Unknown error'}`);
+      }
+    } catch (err) {
+      setPurgeResult(`Purge failed: ${err instanceof Error ? err.message : 'Network error'}`);
+    } finally {
+      setPurging(false);
+      setPurgeConfirm(false);
+    }
+  }, [purgeConfirm, purging]);
+
+  const runCronTest = useCallback(async () => {
+    if (cronTestRunning) return;
+    setCronTestRunning(true);
+    setCronTestResult(null);
+    try {
+      const res = await fetch('/api/entropy/cron/test');
+      if (res.ok) {
+        setCronTestResult(await res.json());
+      } else {
+        setCronTestResult({
+          summary: `Test endpoint returned HTTP ${res.status}`,
+          allPassed: false,
+          checks: [],
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } catch (err) {
+      setCronTestResult({
+        summary: `Network error: ${err instanceof Error ? err.message : 'unknown'}`,
+        allPassed: false,
+        checks: [],
+        timestamp: new Date().toISOString(),
+      });
+    } finally {
+      setCronTestRunning(false);
+    }
+  }, [cronTestRunning]);
+
+  const triggerCron = useCallback(async () => {
+    if (triggering) return;
+    setTriggering(true);
+    setTriggerResult(null);
+    try {
+      const res = await fetch('/api/entropy/cron/trigger', { method: 'POST' });
+      const json = await res.json();
+      setTriggerResult(json);
+    } catch (err) {
+      setTriggerResult({ success: false, error: err instanceof Error ? err.message : 'Network error' });
+    } finally {
+      setTriggering(false);
+    }
+  }, [triggering]);
+
+  const fetchData = useCallback(async () => {
+    try {
+      const [dashRes, histRes] = await Promise.all([
+        fetch('/api/entropy?view=dashboard'),
+        fetch('/api/entropy?view=history&days=60'),
+      ]);
+      if (!dashRes.ok) throw new Error(`HTTP ${dashRes.status}`);
+      const json = await dashRes.json();
+      setData(json);
+      if (histRes.ok) {
+        const histJson = await histRes.json();
+        setHistory(histJson.history || []);
+      }
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const runEngine = useCallback(async () => {
+    if (running) return;
+    setRunning(true);
+    setRunResult(null);
+    try {
+      const res = await fetch('/api/entropy/run', { method: 'POST' });
+      const json = await res.json();
+      setRunResult({ status: json.status, message: json.message });
+      // Refresh dashboard data after run
+      await fetchData();
+    } catch (err) {
+      setRunResult({ status: 'error', message: err instanceof Error ? err.message : 'Run failed' });
+    } finally {
+      setRunning(false);
+    }
+  }, [running, fetchData]);
+
+  // Engine runs autonomously via cron (GitHub Actions at ~4:05pm ET post-close).
+  // Manual runs are allowed but guarded — engine rejects if market is still open.
+
+  useEffect(() => {
+    fetchData();
+    fetchDiagnostics();
+    const interval = setInterval(fetchData, 60_000);
+    const diagInterval = setInterval(fetchDiagnostics, 5 * 60_000);
+    return () => { clearInterval(interval); clearInterval(diagInterval); };
+  }, [fetchData, fetchDiagnostics]);
+
+  // ─── Equity Chart ───────────────────────────────────────
+  useEffect(() => {
+    if (!data?.equity?.length || !canvasRef.current || !containerRef.current) return;
+
+    const canvas = canvasRef.current;
+    const container = containerRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const rect = container.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    canvas.style.width = `${rect.width}px`;
+    canvas.style.height = `${rect.height}px`;
+    ctx.scale(dpr, dpr);
+
+    const w = rect.width;
+    const h = rect.height;
+    const pad = { top: 20, right: 50, bottom: 30, left: 60 };
+    const cw = w - pad.left - pad.right;
+    const ch = h - pad.top - pad.bottom;
+
+    ctx.fillStyle = '#12121a';
+    ctx.fillRect(0, 0, w, h);
+
+    const equity = data.equity;
+    if (equity.length < 2) return;
+
+    const values = equity.map(e => e.portfolio_value);
+    const minV = Math.min(...values) * 0.995;
+    const maxV = Math.max(...values) * 1.005;
+    const range = maxV - minV || 1;
+
+    const toX = (i: number) => pad.left + (i / (equity.length - 1)) * cw;
+    const toY = (v: number) => pad.top + ch - ((v - minV) / range) * ch;
+
+    // Grid lines
+    ctx.strokeStyle = '#1a1a2520';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.top + (ch / 4) * i;
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y);
+      ctx.lineTo(w - pad.right, y);
+      ctx.stroke();
+    }
+
+    // Area fill
+    ctx.beginPath();
+    ctx.moveTo(toX(0), toY(values[0]));
+    for (let i = 1; i < equity.length; i++) {
+      ctx.lineTo(toX(i), toY(values[i]));
+    }
+    ctx.lineTo(toX(equity.length - 1), pad.top + ch);
+    ctx.lineTo(toX(0), pad.top + ch);
+    ctx.closePath();
+    const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + ch);
+    grad.addColorStop(0, '#00d4ff18');
+    grad.addColorStop(1, '#00d4ff02');
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    ctx.moveTo(toX(0), toY(values[0]));
+    for (let i = 1; i < equity.length; i++) {
+      ctx.lineTo(toX(i), toY(values[i]));
+    }
+    ctx.strokeStyle = '#00d4ff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Y axis labels
+    ctx.fillStyle = '#555570';
+    ctx.font = '9px "JetBrains Mono"';
+    ctx.textAlign = 'right';
+    for (let i = 0; i <= 4; i++) {
+      const val = maxV - (range / 4) * i;
+      ctx.fillText(`$${val.toFixed(0)}`, pad.left - 5, pad.top + (ch / 4) * i + 3);
+    }
+
+    // X axis dates
+    ctx.textAlign = 'center';
+    const labelCount = Math.min(6, equity.length);
+    for (let i = 0; i < labelCount; i++) {
+      const idx = Math.floor((i / (labelCount - 1)) * (equity.length - 1));
+      const d = new Date(equity[idx].date);
+      ctx.fillText(`${d.getMonth() + 1}/${d.getDate()}`, toX(idx), h - pad.bottom + 14);
+    }
+
+    // Current value badge
+    const lastVal = values[values.length - 1];
+    const firstVal = values[0];
+    const pnlPct = ((lastVal - firstVal) / firstVal) * 100;
+    ctx.font = 'bold 10px "JetBrains Mono"';
+    ctx.textAlign = 'right';
+    ctx.fillStyle = pnlPct >= 0 ? '#00e676' : '#ff3d57';
+    ctx.fillText(
+      `$${lastVal.toFixed(0)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`,
+      w - pad.right - 4,
+      pad.top + 12,
+    );
+  }, [data?.equity]);
+
+  // ─── Warmup / History Chart ──────────────────────────────
+  useEffect(() => {
+    if (!history.length || !warmupCanvasRef.current || !warmupContainerRef.current) return;
+
+    const canvas = warmupCanvasRef.current;
+    const container = warmupContainerRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const rect = container.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    canvas.style.width = `${rect.width}px`;
+    canvas.style.height = `${rect.height}px`;
+    ctx.scale(dpr, dpr);
+
+    const w = rect.width;
+    const h = rect.height;
+    const pad = { top: 24, right: 55, bottom: 32, left: 55 };
+    const cw = w - pad.left - pad.right;
+    const ch = h - pad.top - pad.bottom;
+
+    ctx.fillStyle = '#12121a';
+    ctx.fillRect(0, 0, w, h);
+
+    const series: { key: string; color: string; label: string }[] = [
+      { key: 'composite', color: '#b388ff', label: 'Composite' },
+      { key: 'comp_volume', color: '#00d4ff', label: 'Volume' },
+      { key: 'comp_greek', color: '#00e676', label: 'Greek' },
+    ];
+
+    // Collect all values for y-axis range
+    let allVals: number[] = [];
+    for (const s of series) {
+      for (const row of history) {
+        const v = row[s.key];
+        if (v != null && typeof v === 'number') allVals.push(v);
+      }
+    }
+    if (allVals.length === 0) return;
+
+    const minV = Math.min(...allVals) * 0.98;
+    const maxV = Math.max(...allVals) * 1.02;
+    const range = maxV - minV || 0.01;
+
+    const toX = (i: number) => pad.left + (history.length === 1 ? cw / 2 : (i / (history.length - 1)) * cw);
+    const toY = (v: number) => pad.top + ch - ((v - minV) / range) * ch;
+
+    // Grid lines
+    ctx.strokeStyle = '#1a1a2520';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.top + (ch / 4) * i;
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y);
+      ctx.lineTo(w - pad.right, y);
+      ctx.stroke();
+    }
+
+    // Y axis labels
+    ctx.fillStyle = '#555570';
+    ctx.font = '9px "JetBrains Mono"';
+    ctx.textAlign = 'right';
+    for (let i = 0; i <= 4; i++) {
+      const val = maxV - (range / 4) * i;
+      ctx.fillText(val.toFixed(3), pad.left - 5, pad.top + (ch / 4) * i + 3);
+    }
+
+    // X axis dates
+    ctx.textAlign = 'center';
+    if (history.length === 1) {
+      const d = new Date(history[0].date);
+      ctx.fillText(`${d.getMonth() + 1}/${d.getDate()}`, toX(0), h - pad.bottom + 14);
+    } else {
+      const labelCount = Math.min(6, history.length);
+      for (let i = 0; i < labelCount; i++) {
+        const idx = Math.floor((i / (labelCount - 1)) * (history.length - 1));
+        const d = new Date(history[idx].date);
+        ctx.fillText(`${d.getMonth() + 1}/${d.getDate()}`, toX(idx), h - pad.bottom + 14);
+      }
+    }
+
+    // Draw each series
+    for (const s of series) {
+      const points: { x: number; y: number }[] = [];
+      for (let i = 0; i < history.length; i++) {
+        const v = history[i][s.key];
+        if (v != null && typeof v === 'number') {
+          points.push({ x: toX(i), y: toY(v) });
+        }
+      }
+      if (points.length === 0) continue;
+
+      if (points.length === 1) {
+        // Single point: draw a dot
+        ctx.beginPath();
+        ctx.arc(points[0].x, points[0].y, 4, 0, Math.PI * 2);
+        ctx.fillStyle = s.color;
+        ctx.fill();
+        ctx.strokeStyle = s.color;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      } else {
+        // Line
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        for (let i = 1; i < points.length; i++) {
+          ctx.lineTo(points[i].x, points[i].y);
+        }
+        ctx.strokeStyle = s.color;
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        // Dots at each data point
+        for (const pt of points) {
+          ctx.beginPath();
+          ctx.arc(pt.x, pt.y, 2.5, 0, Math.PI * 2);
+          ctx.fillStyle = s.color;
+          ctx.fill();
+        }
+      }
+    }
+
+    // Legend
+    ctx.font = '9px "JetBrains Mono"';
+    ctx.textAlign = 'left';
+    let lx = pad.left + 4;
+    for (const s of series) {
+      ctx.fillStyle = s.color;
+      ctx.fillRect(lx, pad.top - 14, 10, 3);
+      ctx.fillText(s.label, lx + 14, pad.top - 10);
+      lx += ctx.measureText(s.label).width + 28;
+    }
+  }, [history]);
+
+  // ─── September check ────────────────────────────────────
+  const isSeptember = new Date().getMonth() === 8;
+
+  // ─── Render ─────────────────────────────────────────────
+
+  if (loading && !data) {
+    return (
+      <div className="p-8 flex items-center justify-center">
+        <span className="text-sm font-mono text-text-muted animate-pulse">Loading entropy engine...</span>
+      </div>
+    );
+  }
+
+  if (error && !data) {
+    return (
+      <div className="p-8 flex items-center justify-center">
+        <span className="text-sm font-mono text-accent-red">Error: {error}</span>
+      </div>
+    );
+  }
+
+  if (!data) return null;
+
+  // ─── Status banners ─────────────────────────────────────
+
+  // ─── Shared diagnostics panel (used in both no_db and active states) ──
+  const renderDiagnosticsPanel = () => (
+    <div className="panel">
+      <div className="panel-header cursor-pointer" onClick={() => { setShowDiagnostics(v => !v); if (!diagnostics) fetchDiagnostics(); }}>
+        <div className="flex items-center gap-1.5">
+          <Settings className="w-3.5 h-3.5 text-text-muted" />
+          <span className="panel-title">Engine Health & Admin</span>
+        </div>
+        <span className="text-[10px] font-mono text-text-muted">{showDiagnostics ? '▲ collapse' : '▼ expand'}</span>
+      </div>
+
+      {showDiagnostics && (
+        <div className="p-4 flex flex-col gap-4">
+          {/* Connection & Cron Status */}
+          {diagnostics ? (
+            <div className="grid grid-cols-2 gap-3">
+              {/* Redis connection */}
+              <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
+                {diagnostics.redisConnected ? (
+                  <Wifi className="w-4 h-4 text-accent-green shrink-0" />
+                ) : (
+                  <WifiOff className="w-4 h-4 text-accent-red shrink-0" />
+                )}
+                <div>
+                  <span className="text-xs font-mono text-text-primary">Redis</span>
+                  <p className="text-[10px] font-mono text-text-muted">
+                    {diagnostics.redisConnected
+                      ? diagnostics.redisHasData ? 'Connected — data persisted' : 'Connected — no data yet'
+                      : 'Not connected — data will be lost on redeploy'}
+                  </p>
+                </div>
+              </div>
+
+              {/* Data collection */}
+              <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
+                <Database className="w-4 h-4 text-accent-purple shrink-0" />
+                <div>
+                  <span className="text-xs font-mono text-text-primary">{diagnostics.totalDays} days collected</span>
+                  <p className="text-[10px] font-mono text-text-muted">
+                    {diagnostics.warmupComplete
+                      ? 'Warmup complete — signals active'
+                      : diagnostics.totalDays > 0
+                        ? `${30 - diagnostics.totalDays} more days until signals activate`
+                        : 'Engine has not run yet'}
+                  </p>
+                </div>
+              </div>
+
+              {/* Last run */}
+              <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
+                <CheckCircle2 className={`w-4 h-4 shrink-0 ${diagnostics.lastRunDate ? 'text-accent-green' : 'text-accent-red'}`} />
+                <div>
+                  <span className="text-xs font-mono text-text-primary">
+                    Last run: {diagnostics.lastRunDate || 'Never'}
+                  </span>
+                  <p className="text-[10px] font-mono text-text-muted">
+                    {diagnostics.lastRunDate
+                      ? `${Math.round((Date.now() - new Date(diagnostics.lastRunDate).getTime()) / (1000 * 60 * 60 * 24))} days ago`
+                      : 'Engine has not run yet'}
+                  </p>
+                </div>
+              </div>
+
+              {/* Next expected */}
+              <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
+                <CalendarCheck className="w-4 h-4 text-accent-cyan shrink-0" />
+                <div>
+                  <span className="text-xs font-mono text-text-primary">Next run</span>
+                  <p className="text-[10px] font-mono text-text-muted">{diagnostics.nextExpectedRun}</p>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="text-xs font-mono text-text-muted animate-pulse">Loading diagnostics...</div>
+          )}
+
+          {/* Cron Dry-Run Test */}
+          <div className="p-3 rounded-md bg-bg-primary/50 border border-border/10">
+            <div className="flex items-center justify-between mb-2">
+              <div>
+                <span className="text-xs font-mono text-text-primary font-semibold">Cron Pipeline Test</span>
+                <p className="text-[10px] font-mono text-text-muted">
+                  Verifies every dependency the cron job needs — without running the engine.
+                </p>
+              </div>
+              <button
+                onClick={runCronTest}
+                disabled={cronTestRunning}
+                className="px-3 py-1.5 rounded-md bg-accent-cyan/10 border border-accent-cyan/30 text-accent-cyan text-[10px] font-mono hover:bg-accent-cyan/20 transition-all disabled:opacity-50 flex items-center gap-1.5 shrink-0"
+              >
+                {cronTestRunning ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+                {cronTestRunning ? 'Testing...' : 'Run Test'}
+              </button>
+            </div>
+            {cronTestResult && (
+              <div className="mt-2">
+                <div className={`text-xs font-mono font-semibold mb-2 ${cronTestResult.allPassed ? 'text-accent-green' : 'text-accent-red'}`}>
+                  {cronTestResult.summary}
+                </div>
+                <div className="flex flex-col gap-1">
+                  {cronTestResult.checks.map((check, i) => (
+                    <div key={i} className="flex items-center gap-2 text-[10px] font-mono">
+                      <span className={`shrink-0 ${check.status === 'pass' ? 'text-accent-green' : check.status === 'fail' ? 'text-accent-red' : 'text-accent-amber'}`}>
+                        {check.status === 'pass' ? '✓' : check.status === 'fail' ? '✗' : '⚠'}
+                      </span>
+                      <span className="text-text-secondary w-28 shrink-0">{check.name}</span>
+                      <span className="text-text-muted truncate">{check.detail}</span>
+                      {check.ms != null && (
+                        <span className="text-text-muted/50 shrink-0 ml-auto">{check.ms}ms</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <span className="text-[9px] font-mono text-text-muted/50 mt-1 block">
+                  Tested at {new Date(cronTestResult.timestamp).toLocaleTimeString()}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Trigger GitHub Actions */}
+          <div className="p-3 rounded-md bg-bg-primary/50 border border-border/10">
+            <div className="flex items-center justify-between mb-2">
+              <div>
+                <span className="text-xs font-mono text-text-primary font-semibold">Trigger Cron via GitHub Actions</span>
+                <p className="text-[10px] font-mono text-text-muted">
+                  Dispatches the real cron workflow end-to-end: GitHub Actions → /api/entropy/cron → engine run.
+                </p>
+              </div>
+              <button
+                onClick={triggerCron}
+                disabled={triggering || triggerAvailable === false}
+                title={triggerAvailable === false ? 'GITHUB_TOKEN not configured' : 'Dispatch workflow'}
+                className="px-3 py-1.5 rounded-md bg-accent-purple/10 border border-accent-purple/30 text-accent-purple text-[10px] font-mono hover:bg-accent-purple/20 transition-all disabled:opacity-50 flex items-center gap-1.5 shrink-0"
+              >
+                {triggering ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
+                {triggering ? 'Dispatching...' : 'Trigger Now'}
+              </button>
+            </div>
+            {triggerAvailable === false && (
+              <p className="text-[10px] font-mono text-accent-amber">
+                Requires GITHUB_TOKEN env var with <span className="text-text-secondary">actions:write</span> scope.
+                Add it in Vercel → Settings → Environment Variables.
+              </p>
+            )}
+            {triggerResult && (
+              <div className="mt-1">
+                <p className={`text-[10px] font-mono ${triggerResult.success ? 'text-accent-green' : 'text-accent-red'}`}>
+                  {triggerResult.success ? triggerResult.message : triggerResult.error}
+                </p>
+                {triggerResult.help && (
+                  <p className="text-[10px] font-mono text-text-muted mt-0.5">{triggerResult.help}</p>
+                )}
+                {triggerResult.detail && (
+                  <pre className="text-[9px] font-mono text-text-muted/70 mt-1 p-2 rounded bg-bg-primary/50 overflow-x-auto whitespace-pre-wrap">{triggerResult.detail}</pre>
+                )}
+                {triggerResult.debug && (
+                  <div className="text-[9px] font-mono text-text-muted/50 mt-1">
+                    {Object.entries(triggerResult.debug).map(([k, v]) => (
+                      <span key={k} className="mr-3">{k}: {v}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Gaps warning */}
+          {diagnostics?.gaps && diagnostics.gaps.length > 0 && (
+            <div className="p-3 rounded-md bg-accent-amber/10 border border-accent-amber/20">
+              <div className="flex items-center gap-1.5 mb-1">
+                <AlertTriangle className="w-3.5 h-3.5 text-accent-amber" />
+                <span className="text-xs font-mono text-accent-amber font-semibold">Gaps detected in history</span>
+              </div>
+              <div className="flex flex-col gap-0.5">
+                {diagnostics.gaps.map((gap, i) => (
+                  <span key={i} className="text-[10px] font-mono text-accent-amber/80">{gap}</span>
+                ))}
+              </div>
+              <p className="text-[10px] font-mono text-text-muted mt-1">
+                Gaps may indicate the cron job failed on those days. Check GitHub Actions for errors.
+              </p>
+            </div>
+          )}
+
+          {/* Recent run log */}
+          {diagnostics?.runLog && diagnostics.runLog.length > 0 && (
+            <div>
+              <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">Recent runs</span>
+              <div className="mt-1 overflow-x-auto">
+                <table className="w-full text-[10px] font-mono">
+                  <thead>
+                    <tr className="border-b border-border/20">
+                      {['Date', 'SPY', 'Composite', 'Chain Records'].map(h => (
+                        <th key={h} className="px-2 py-1 text-left text-text-muted font-normal">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {diagnostics.runLog.map(r => (
+                      <tr key={r.date} className="border-b border-border/5">
+                        <td className="px-2 py-1 text-text-muted">{r.date}</td>
+                        <td className="px-2 py-1 text-text-primary">${r.spot.toFixed(2)}</td>
+                        <td className="px-2 py-1 text-accent-purple">{r.composite != null ? r.composite.toFixed(4) : '—'}</td>
+                        <td className="px-2 py-1 text-text-secondary">{r.records ?? '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Danger zone: Purge */}
+          <div className="mt-2 p-3 rounded-md border border-accent-red/20 bg-accent-red/5">
+            <div className="flex items-center gap-1.5 mb-2">
+              <Trash2 className="w-3.5 h-3.5 text-accent-red" />
+              <span className="text-xs font-mono text-accent-red font-semibold">Danger Zone</span>
+            </div>
+            <p className="text-[10px] font-mono text-text-muted mb-3">
+              Permanently delete all entropy history, positions, trades, signals, and equity data.
+              The engine will restart from scratch with a 30-day warmup period.
+            </p>
+            {purgeResult && (
+              <p className={`text-[10px] font-mono mb-2 ${purgeResult.includes('failed') ? 'text-accent-red' : 'text-accent-green'}`}>
+                {purgeResult}
+              </p>
+            )}
+            {!purgeConfirm ? (
+              <button
+                onClick={() => setPurgeConfirm(true)}
+                className="px-3 py-1.5 rounded-md bg-accent-red/10 border border-accent-red/30 text-accent-red text-[10px] font-mono hover:bg-accent-red/20 transition-all flex items-center gap-1.5"
+              >
+                <Trash2 className="w-3 h-3" />
+                Purge All Entropy Data
+              </button>
+            ) : (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={purgeAllData}
+                  disabled={purging}
+                  className="px-3 py-1.5 rounded-md bg-accent-red/30 border border-accent-red/50 text-accent-red text-[10px] font-mono font-bold hover:bg-accent-red/40 transition-all disabled:opacity-50 flex items-center gap-1.5"
+                >
+                  {purging ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                  {purging ? 'Purging...' : 'Confirm — Delete Everything'}
+                </button>
+                <button
+                  onClick={() => setPurgeConfirm(false)}
+                  className="px-3 py-1.5 rounded-md bg-bg-tertiary border border-border/30 text-text-muted text-[10px] font-mono hover:text-text-secondary transition-all"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  if (data.status === 'no_db') {
+    return (
+      <div className="flex flex-col gap-4 p-4">
+        <div className="panel p-6 flex flex-col items-center gap-4 text-center">
+          <Brain className="w-8 h-8 text-text-muted" />
+          <p className="text-sm font-mono text-text-secondary">
+            Entropy engine has not been initialized yet.
+          </p>
+          <p className="text-xs font-mono text-text-muted max-w-md">
+            Click below to run the engine for the first time. It will fetch the SPY options chain,
+            compute Shannon entropy metrics, and begin building the 30-day warmup history.
+          </p>
+          <button
+            onClick={runEngine}
+            disabled={running}
+            className="px-4 py-2 rounded-md bg-accent-purple/20 border border-accent-purple/30 text-accent-purple text-sm font-mono hover:bg-accent-purple/30 transition-all disabled:opacity-50 flex items-center gap-2"
+          >
+            {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+            {running ? 'Initializing...' : 'Initialize Engine'}
+          </button>
+          {runResult && (
+            <p className={`text-xs font-mono ${runResult.status === 'error' ? 'text-accent-red' : runResult.status === 'skipped' ? 'text-yellow-400' : 'text-accent-green'}`}>
+              {runResult.message}
+            </p>
+          )}
+        </div>
+        {renderDiagnosticsPanel()}
+      </div>
+    );
+  }
+
+  // Warmup state now falls through to the active dashboard below,
+  // with a warmup banner at the top instead of blocking the view.
+
+  // ─── Active dashboard (also used during warmup) ─────────
+
+  const { metrics, medians, signals, openPositions, recentTrades, equity, stats } = data;
+  const isWarmup = data.status === 'warmup';
+
+  return (
+    <div className="flex flex-col gap-4 p-4">
+      {/* Warmup banner */}
+      {isWarmup && (
+        <div className="panel p-4 flex items-center gap-4">
+          <Brain className="w-6 h-6 text-accent-amber shrink-0 animate-pulse" />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-sm font-mono text-text-primary font-semibold">Warming Up</span>
+              <span className="text-xs font-mono text-text-muted">
+                {data.warmup.current}/{data.warmup.required} days
+              </span>
+            </div>
+            <div className="w-full h-1.5 bg-bg-primary rounded-full overflow-hidden mb-1">
+              <div
+                className="h-full bg-accent-amber rounded-full transition-all"
+                style={{ width: `${Math.round((data.warmup.current / data.warmup.required) * 100)}%` }}
+              />
+            </div>
+            <p className="text-[10px] font-mono text-text-muted">
+              Signals require {data.warmup.required} days for stable medians. Backfill is not possible — option chains are point-in-time snapshots. Below is the data collected so far.
+            </p>
+          </div>
+          <button
+            onClick={runEngine}
+            disabled={running || data.date === todayET()}
+            className="px-3 py-1.5 rounded-md bg-accent-amber/20 border border-accent-amber/30 text-accent-amber text-xs font-mono hover:bg-accent-amber/30 transition-all disabled:opacity-50 flex items-center gap-1.5 shrink-0"
+          >
+            {running ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+            {running ? 'Running...' : data.date === todayET() ? 'Ran today' : 'Run Now'}
+          </button>
+        </div>
+      )}
+
+      {/* September skip warning */}
+      {isSeptember && (
+        <div className="flex items-center gap-2 px-4 py-2.5 rounded-md bg-accent-amber/10 border border-accent-amber/20">
+          <AlertTriangle className="w-4 h-4 text-accent-amber shrink-0" />
+          <span className="text-xs font-mono text-accent-amber">
+            September — historically the worst month for equity markets. The entropy engine skips new entries this month.
+          </span>
+        </div>
+      )}
+
+      {/* Header row: date + spot + run controls */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <Brain className="w-5 h-5 text-accent-purple" />
+          <span className="text-sm font-mono text-text-primary font-semibold">Entropy Engine</span>
+          {data.date && (
+            <span className="text-xs font-mono text-text-muted">{data.date}</span>
+          )}
+          {data.date === todayET() && (
+            <span className="flex items-center gap-1 text-[10px] font-mono text-accent-green">
+              <CheckCircle2 className="w-3 h-3" /> Today
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-3">
+          {data.spot != null && (
+            <span className="text-xs font-mono text-text-secondary">
+              SPY <span className="text-text-primary">${data.spot.toFixed(2)}</span>
+            </span>
+          )}
+          <button
+            onClick={runEngine}
+            disabled={running || data.date === todayET()}
+            title={data.date === todayET() ? 'Already ran today' : 'Run entropy engine now'}
+            className="px-2.5 py-1 rounded-md bg-bg-tertiary border border-border/30 text-xs font-mono text-text-secondary hover:border-accent-purple/30 hover:text-accent-purple transition-all disabled:opacity-40 disabled:cursor-default flex items-center gap-1.5"
+          >
+            {running ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+            {running ? 'Running...' : 'Run'}
+          </button>
+          {runResult && !running && (
+            <span className={`text-[10px] font-mono ${runResult.status === 'error' ? 'text-accent-red' : runResult.status === 'skipped' ? 'text-yellow-400' : 'text-accent-green'}`}>
+              {runResult.message.slice(0, 40)}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Section 1: Entropy Gauges */}
+      <div className="panel">
+        <div className="panel-header">
+          <div className="flex items-center gap-1.5">
+            <Activity className="w-3.5 h-3.5 text-accent-cyan" />
+            <span className="panel-title">Entropy Composites</span>
+          </div>
+        </div>
+        <div className="grid grid-cols-3 gap-4 p-4">
+          {(['comp_volume', 'comp_greek', 'composite'] as const).map((key) => {
+            const current = metrics?.[key] ?? null;
+            const median = medians?.[key] ?? null;
+            const hasMedian = median != null;
+            const inSignal = hasMedian && current != null && current < median;
+            const pctOfMedian = current != null && hasMedian && median > 0
+              ? Math.min((current / median) * 100, 150)
+              : current != null ? 75 : 0;
+            const barColor = hasMedian
+              ? (inSignal ? 'bg-accent-green' : 'bg-accent-red')
+              : 'bg-accent-purple';
+            const textColor = hasMedian
+              ? (inSignal ? 'text-accent-green' : 'text-accent-red')
+              : 'text-accent-purple';
+
+            return (
+              <div key={key} className="flex flex-col gap-2 p-3 rounded-md bg-bg-primary/50">
+                <div className="flex items-center gap-1">
+                  <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">
+                    {key.replace('comp_', '').replace('composite', 'master')}
+                  </span>
+                  <InfoTip text={GAUGE_INFO[key]} />
+                </div>
+                <div className="flex items-baseline gap-2">
+                  <span className={`text-lg font-mono font-bold ${textColor}`}>
+                    {fmt4(current)}
+                  </span>
+                  <span className="text-[10px] font-mono text-text-muted">
+                    {hasMedian ? `med ${fmt4(median)}` : 'no median yet'}
+                  </span>
+                </div>
+                {/* Bar indicator */}
+                <div className="h-1.5 bg-bg-primary rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full transition-all ${barColor}`}
+                    style={{ width: `${Math.max(5, Math.min(100, pctOfMedian))}%` }}
+                  />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Section 2: Auxiliary Metrics */}
+      <div className="panel">
+        <div className="panel-header">
+          <div className="flex items-center gap-1.5">
+            <Zap className="w-3.5 h-3.5 text-accent-amber" />
+            <span className="panel-title">Auxiliary Metrics</span>
+          </div>
+        </div>
+        <div className="grid grid-cols-3 gap-4 p-4">
+          {[
+            { key: 'iv_mean', label: 'IV Mean', format: fmtPct, medFormat: fmtPct },
+            { key: 'put_skew', label: 'Put Skew', format: (v: number | null | undefined) => v != null ? `${(v * 100).toFixed(1)}pp` : '—', medFormat: (v: number | null | undefined) => v != null ? `${(v * 100).toFixed(1)}pp` : '—' },
+            { key: 'pcr_dollar', label: 'PCR Dollar', format: fmtRatio, medFormat: fmtRatio },
+          ].map(({ key, label, format, medFormat }) => {
+            const current = metrics?.[key] ?? null;
+            const median = medians?.[key] ?? null;
+            return (
+              <div key={key} className="flex flex-col gap-1 p-3 rounded-md bg-bg-primary/50">
+                <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">{label}</span>
+                <span className="text-sm font-mono font-bold text-text-primary">{format(current)}</span>
+                <span className="text-[10px] font-mono text-text-muted">med {medFormat(median)}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Section 2.5: Individual Entropy Metrics Breakdown */}
+      {metrics && (
+        <div className="panel">
+          <div className="panel-header">
+            <div className="flex items-center gap-1.5">
+              <Activity className="w-3.5 h-3.5 text-accent-purple" />
+              <span className="panel-title">Entropy Breakdown</span>
+            </div>
+            {data.date && (
+              <span className="text-[10px] font-mono text-text-muted">{data.date}</span>
+            )}
+          </div>
+          <div className="grid grid-cols-2 gap-3 p-4">
+            {[
+              { key: 'H_vol_term_n', label: 'Volume by Expiry', desc: 'Volume distribution across expirations' },
+              { key: 'H_vol_k_n', label: 'Volume by Strike', desc: 'Volume distribution across strikes' },
+              { key: 'H_prem_term_n', label: 'Premium by Expiry', desc: 'Dollar premium distribution by term' },
+              { key: 'H_vegavol_n', label: 'Vega x Volume', desc: 'Vega-weighted volume by strike' },
+              { key: 'H_dgamma_n', label: 'Dollar Gamma', desc: 'Dollar gamma distribution by strike' },
+              { key: 'H_gvx_n', label: 'Gamma x Volume', desc: 'Gamma-volume cross by strike' },
+              { key: 'H_dflow_n', label: 'Delta Flow', desc: 'Volume by delta bucket' },
+              { key: 'H_spread_k_n', label: 'Spread by Strike', desc: 'Bid-ask spread distribution' },
+              { key: 'H_moneyness_n', label: 'Moneyness', desc: 'Volume by moneyness bucket' },
+              { key: 'H_charm_n', label: 'Charm by DTE', desc: 'Charm distribution by time bucket' },
+            ].map(({ key, label, desc }) => {
+              const val = metrics[key] ?? null;
+              const barW = val != null ? Math.max(5, val * 100) : 0;
+              return (
+                <div key={key} className="flex flex-col gap-1 p-2.5 rounded-md bg-bg-primary/50">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-mono text-text-secondary">{label}</span>
+                    <span className="text-xs font-mono font-bold text-text-primary">{fmt4(val)}</span>
+                  </div>
+                  <div className="h-1.5 bg-bg-primary rounded-full overflow-hidden">
+                    <div
+                      className="h-full rounded-full bg-accent-purple/70 transition-all"
+                      style={{ width: `${barW}%` }}
+                    />
+                  </div>
+                  <span className="text-[8px] font-mono text-text-muted">{desc}</span>
+                </div>
+              );
+            })}
+          </div>
+          {/* Additional single-value metrics */}
+          <div className="grid grid-cols-4 gap-3 px-4 pb-4">
+            {[
+              { key: 'dgamma_conc5', label: 'Gamma Conc. Top 5', format: fmtPct },
+              { key: 'pcr_vol', label: 'PCR Volume', format: fmtRatio },
+              { key: '_n_records', label: 'Chain Records', format: (v: number | null | undefined) => v != null ? String(v) : '—' },
+            ].map(({ key, label, format }) => (
+              <div key={key} className="flex flex-col gap-0.5 p-2 rounded-md bg-bg-primary/50">
+                <span className="text-[8px] font-mono text-text-muted uppercase tracking-wider">{label}</span>
+                <span className="text-xs font-mono font-bold text-text-primary">{format(metrics[key])}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Section 2.6: Entropy History Chart */}
+      {history.length >= 1 && (
+        <div className="panel flex flex-col">
+          <div className="panel-header">
+            <div className="flex items-center gap-1.5">
+              <TrendingUp className="w-3.5 h-3.5 text-accent-purple" />
+              <span className="panel-title">Entropy History</span>
+              <span className="text-[10px] font-mono text-text-muted">({history.length} day{history.length !== 1 ? 's' : ''})</span>
+            </div>
+          </div>
+          {history.length >= 2 && (
+            <div ref={warmupContainerRef} className="h-[280px] relative">
+              <canvas ref={warmupCanvasRef} className="absolute inset-0 w-full h-full" />
+            </div>
+          )}
+          {/* Raw metrics table */}
+          <div className={`overflow-x-auto ${history.length >= 2 ? 'border-t border-border/10' : ''}`}>
+            <table className="w-full text-[10px] font-mono">
+              <thead>
+                <tr className="border-b border-border/20">
+                  {['Date', 'SPY', 'Composite', 'Vol Ent', 'Greek Ent', 'IV Mean', 'Put Skew', 'PCR $'].map(h => (
+                    <th key={h} className="px-2 py-1.5 text-left text-text-muted font-normal uppercase tracking-wider">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {[...history].reverse().slice(0, 30).map((row) => (
+                  <tr key={row.date} className="border-b border-border/5 hover:bg-bg-primary/30">
+                    <td className="px-2 py-1 text-text-muted">{row.date}</td>
+                    <td className="px-2 py-1 text-text-primary">${row.spot?.toFixed(2) ?? '—'}</td>
+                    <td className="px-2 py-1 text-accent-purple">{fmt4(row.composite)}</td>
+                    <td className="px-2 py-1 text-accent-cyan">{fmt4(row.comp_volume)}</td>
+                    <td className="px-2 py-1 text-accent-green">{fmt4(row.comp_greek)}</td>
+                    <td className="px-2 py-1 text-text-secondary">{row.iv_mean != null ? fmtPct(row.iv_mean) : '—'}</td>
+                    <td className="px-2 py-1 text-text-secondary">{row.put_skew != null ? `${(row.put_skew * 100).toFixed(1)}pp` : '—'}</td>
+                    <td className="px-2 py-1 text-text-secondary">{fmtRatio(row.pcr_dollar)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Section 3: Signal Status */}
+      <div className="panel">
+        <div className="panel-header">
+          <div className="flex items-center gap-1.5">
+            <Zap className="w-3.5 h-3.5 text-accent-green" />
+            <span className="panel-title">Signal Status</span>
+          </div>
+          {signals?.date && (
+            <span className="text-[10px] font-mono text-text-muted">{signals.date}</span>
+          )}
+        </div>
+        <div className="grid grid-cols-2 gap-3 p-4">
+          {(['S_LowVolEnt', 'S_VolCollapse', 'S_LowEntLowIV', 'S_LowGreekEnt', 'S_SkewFlow', 'S_PCRContrarian'] as const).map((strat) => {
+            const item = signals?.items?.find(s => s.strategy === strat);
+            const fired = item?.fired === 1;
+            const executed = item?.executed === 1;
+
+            return (
+              <div key={strat} className="flex items-center gap-3 p-2.5 rounded-md bg-bg-primary/50">
+                {/* Status dot */}
+                <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${fired ? 'bg-accent-green shadow-[0_0_6px_rgba(0,230,118,0.4)]' : 'bg-text-muted/20'}`} />
+
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono text-text-primary truncate">
+                      {STRATEGY_LABELS[strat] || strat}
+                    </span>
+                    {executed && (
+                      <span className="px-1.5 py-0.5 text-[8px] font-mono font-bold bg-accent-green/20 text-accent-green rounded uppercase tracking-wider">
+                        Executed
+                      </span>
+                    )}
+                  </div>
+                  {item && (
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className="text-[10px] font-mono text-accent-cyan">{item.trade_type}</span>
+                      {/* Strength bar */}
+                      <div className="flex-1 h-1 bg-bg-primary rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-accent-purple rounded-full"
+                          style={{ width: `${Math.max(5, Math.min(100, item.strength * 100))}%` }}
+                        />
+                      </div>
+                      <span className="text-[9px] font-mono text-text-muted">{(item.strength * 100).toFixed(0)}%</span>
+                    </div>
+                  )}
+                  {item?.rationale && (
+                    <p className="text-[9px] font-mono text-text-muted mt-0.5 truncate">{item.rationale}</p>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Section 4: Open Positions */}
+      {openPositions?.length > 0 && (
+        <div className="panel">
+          <div className="panel-header">
+            <div className="flex items-center gap-1.5">
+              <DollarSign className="w-3.5 h-3.5 text-accent-cyan" />
+              <span className="panel-title">Open Positions</span>
+              <span className="text-[10px] font-mono text-text-muted">({openPositions.length})</span>
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs font-mono">
+              <thead>
+                <tr className="border-b border-border/20">
+                  {['Strategy', 'Symbol', 'Type', 'Qty', 'Strike', 'Expiry', 'Entry Price', 'Entry Cost', 'DTE'].map(h => (
+                    <th key={h} className="px-3 py-2 text-left text-[10px] text-text-muted font-normal uppercase tracking-wider">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {openPositions.map((pos) => (
+                  <tr key={pos.id} className="border-b border-border/10 hover:bg-bg-primary/30">
+                    <td className="px-3 py-2 text-text-secondary">{pos.strategy}</td>
+                    <td className="px-3 py-2 text-text-primary">{pos.symbol}</td>
+                    <td className="px-3 py-2 text-text-secondary">{pos.trade_type}</td>
+                    <td className={`px-3 py-2 ${pos.qty > 0 ? 'text-accent-green' : 'text-accent-red'}`}>
+                      {pos.qty > 0 ? `+${pos.qty}` : pos.qty}
+                    </td>
+                    <td className="px-3 py-2 text-text-secondary">${pos.strike.toFixed(2)}</td>
+                    <td className="px-3 py-2 text-text-secondary">{pos.expiry}</td>
+                    <td className="px-3 py-2 text-text-secondary">${pos.entry_price.toFixed(2)}</td>
+                    <td className="px-3 py-2 text-text-secondary">{fmtDollar(pos.entry_cost)}</td>
+                    <td className="px-3 py-2 text-text-secondary">{daysUntil(pos.expiry)}d</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Section 5: Equity Curve */}
+      {equity?.length > 1 && (
+        <div className="panel flex flex-col">
+          <div className="panel-header">
+            <div className="flex items-center gap-1.5">
+              <TrendingUp className="w-3.5 h-3.5 text-accent-cyan" />
+              <span className="panel-title">Equity Curve</span>
+            </div>
+          </div>
+          <div ref={containerRef} className="flex-1 min-h-[250px]">
+            <canvas ref={canvasRef} className="w-full h-full" />
+          </div>
+        </div>
+      )}
+
+      {/* Section 6: Recent Trades */}
+      {recentTrades?.length > 0 && (
+        <div className="panel">
+          <div className="panel-header">
+            <div className="flex items-center gap-1.5">
+              <Clock className="w-3.5 h-3.5 text-accent-purple" />
+              <span className="panel-title">Recent Trades</span>
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs font-mono">
+              <thead>
+                <tr className="border-b border-border/20">
+                  {['Date', 'Strategy', 'Action', 'Symbol', 'Qty', 'P&L'].map(h => (
+                    <th key={h} className="px-3 py-2 text-left text-[10px] text-text-muted font-normal uppercase tracking-wider">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {recentTrades.map((trade, i) => (
+                  <tr key={i} className="border-b border-border/10 hover:bg-bg-primary/30">
+                    <td className="px-3 py-2 text-text-muted">{trade.date}</td>
+                    <td className="px-3 py-2 text-text-secondary">{trade.strategy}</td>
+                    <td className={`px-3 py-2 font-semibold ${ACTION_COLORS[trade.action] || 'text-text-secondary'}`}>
+                      {trade.action}
+                    </td>
+                    <td className="px-3 py-2 text-text-primary">{trade.symbol}</td>
+                    <td className="px-3 py-2 text-text-secondary">{trade.qty}</td>
+                    <td className="px-3 py-2 text-text-secondary">{trade.details}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Section 7: Stats Summary */}
+      {stats && (
+        <div className="panel">
+          <div className="panel-header">
+            <div className="flex items-center gap-1.5">
+              <TrendingUp className="w-3.5 h-3.5 text-accent-green" />
+              <span className="panel-title">Performance Summary</span>
+            </div>
+          </div>
+          <div className="grid grid-cols-4 gap-4 p-4">
+            <div className="flex flex-col gap-1 p-3 rounded-md bg-bg-primary/50">
+              <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">Total Trades</span>
+              <span className="text-lg font-mono font-bold text-text-primary">{stats.totalTrades}</span>
+            </div>
+            <div className="flex flex-col gap-1 p-3 rounded-md bg-bg-primary/50">
+              <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">Win Rate</span>
+              <span className={`text-lg font-mono font-bold ${stats.winRate >= 50 ? 'text-accent-green' : 'text-accent-red'}`}>
+                {stats.winRate.toFixed(1)}%
+              </span>
+            </div>
+            <div className="flex flex-col gap-1 p-3 rounded-md bg-bg-primary/50">
+              <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">Total P&L</span>
+              <span className={`text-lg font-mono font-bold ${stats.totalPnl >= 0 ? 'text-accent-green' : 'text-accent-red'}`}>
+                {fmtDollar(stats.totalPnl)}
+              </span>
+            </div>
+            <div className="flex flex-col gap-1 p-3 rounded-md bg-bg-primary/50">
+              <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">Open Positions</span>
+              <span className="text-lg font-mono font-bold text-accent-cyan">{stats.openCount}</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Section 8: Engine Diagnostics & Administration */}
+      {renderDiagnosticsPanel()}
+    </div>
+  );
+}

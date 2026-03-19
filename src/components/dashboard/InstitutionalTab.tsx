@@ -198,7 +198,11 @@ export default function InstitutionalTab() {
     setError(null);
     try {
       const res = await fetch('/api/market/institutional');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        let detail = '';
+        try { const body = await res.json(); detail = body?.error || ''; } catch { /* ignore */ }
+        throw new Error(detail ? `${detail}` : `HTTP ${res.status}`);
+      }
       const json = await res.json();
       setData(json);
 

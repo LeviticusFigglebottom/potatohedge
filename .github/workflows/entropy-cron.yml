@@ -1,0 +1,38 @@
+name: Entropy Engine Daily Cron
+
+on:
+  schedule:
+    # 21:05 UTC = 4:05pm EST (winter) / 5:05pm EDT (summer)
+    # Both are post-market-close, giving settled EOD data
+    - cron: '5 21 * * 1-5'
+  workflow_dispatch: {} # Allow manual trigger from GitHub UI
+
+jobs:
+  run-entropy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger entropy engine
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          DEPLOY_URL: ${{ secrets.DEPLOY_URL }}
+        run: |
+          # Default to production URL if DEPLOY_URL not set
+          URL="${DEPLOY_URL:-https://potatohedge.vercel.app}"
+
+          echo "Triggering entropy engine at ${URL}/api/entropy/cron"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer ${CRON_SECRET}" \
+            "${URL}/api/entropy/cron" \
+            --max-time 120)
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          echo "Status: ${HTTP_CODE}"
+          echo "Response: ${BODY}"
+
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::Entropy engine returned HTTP ${HTTP_CODE}"
+            exit 1
+          fi

@@ -85,9 +85,19 @@ async function extractFirstFileFromZip(buf: Uint8Array): Promise<string> {
 
   const compressionMethod = view.getUint16(8, true);
   const compressedSize = view.getUint32(18, true);
+  const uncompressedSize = view.getUint32(22, true);
   const filenameLength = view.getUint16(26, true);
   const extraLength = view.getUint16(28, true);
   const dataOffset = 30 + filenameLength + extraLength;
+
+  // Guard: reject files that would decompress to >50MB to prevent OOM on serverless
+  if (uncompressedSize > 50_000_000) {
+    throw new Error(`ZIP content too large (${(uncompressedSize / 1e6).toFixed(1)}MB), skipping to prevent OOM`);
+  }
+  // Also check compressed size — if >15MB, decompressed is likely huge
+  if (compressedSize > 15_000_000) {
+    throw new Error(`ZIP compressed data too large (${(compressedSize / 1e6).toFixed(1)}MB), skipping`);
+  }
 
   const compressedData = buf.subarray(dataOffset, dataOffset + compressedSize);
 
@@ -105,13 +115,22 @@ async function extractFirstFileFromZip(buf: Uint8Array): Promise<string> {
 
 /**
  * Parse swap CSV and aggregate by underlier ticker.
+ * Uses streaming line iteration to avoid doubling memory with split('\n').
  */
 function parseSwapCSV(csv: string, today: string, weekEnd: string): Map<string, SwapData> {
   const map = new Map<string, SwapData>();
-  const lines = csv.split('\n');
-  if (lines.length < 2) return map;
 
-  const header = lines[0].toLowerCase();
+  // Reject excessively large CSVs to prevent OOM on serverless (2GB limit)
+  if (csv.length > 80_000_000) {
+    console.warn(`[dtcc] CSV too large (${(csv.length / 1e6).toFixed(1)}MB), skipping to prevent OOM`);
+    return map;
+  }
+
+  // Read header line
+  let headerEnd = csv.indexOf('\n');
+  if (headerEnd === -1) return map;
+
+  const header = csv.substring(0, headerEnd).toLowerCase();
   const cols = header.split(',').map(c => c.trim().replace(/"/g, ''));
 
   const underlierIdx = cols.findIndex(c =>
@@ -129,9 +148,21 @@ function parseSwapCSV(csv: string, today: string, weekEnd: string): Map<string, 
 
   if (underlierIdx === -1 || expirationIdx === -1) return map;
 
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
+  // Iterate line-by-line without creating a massive array via split('\n')
+  let pos = headerEnd + 1;
+  while (pos < csv.length) {
+    let lineEnd = csv.indexOf('\n', pos);
+    if (lineEnd === -1) lineEnd = csv.length;
+
+    // Trim inline to avoid substring allocation for blank lines
+    let lineStart = pos;
+    let lineEndTrim = lineEnd;
+    while (lineStart < lineEndTrim && (csv.charCodeAt(lineStart) === 32 || csv.charCodeAt(lineStart) === 13)) lineStart++;
+    while (lineEndTrim > lineStart && (csv.charCodeAt(lineEndTrim - 1) === 32 || csv.charCodeAt(lineEndTrim - 1) === 13)) lineEndTrim--;
+    pos = lineEnd + 1;
+
+    if (lineStart >= lineEndTrim) continue;
+    const line = csv.substring(lineStart, lineEndTrim);
 
     const fields = line.split(',').map(f => f.trim().replace(/"/g, ''));
 
