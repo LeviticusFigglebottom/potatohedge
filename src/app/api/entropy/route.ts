@@ -105,9 +105,10 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    // Initialize schema and restore from Redis on cold starts
+    // Initialize schema, check for cross-instance purge, then restore from Redis
     initSchema(db);
-    const { restoreFromRedis } = await import('@/lib/entropy/persistence');
+    const { restoreFromRedis, checkPurgeFlag } = await import('@/lib/entropy/persistence');
+    await checkPurgeFlag(db);
     await restoreFromRedis(db);
 
     if (view === 'dashboard') {

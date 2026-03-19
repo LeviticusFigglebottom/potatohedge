@@ -74,34 +74,19 @@ export async function GET() {
     t('Redis (Upstash)').fail(`${err instanceof Error ? err.message : 'Connection failed'}`);
   }
 
-  // 5. SQLite writable
+  // 5. SQLite + Redis data integrity
+  // On Vercel, SQLite lives in ephemeral /tmp per-instance. The real data lives in Redis
+  // and gets restored to SQLite on each cold start. So we check Redis data directly.
   try {
-    // Resolve DB path same way the main route does
-    const path = await import('path');
-    const fs = await import('fs');
-    let dbPath = process.env.ENGINE_DB_PATH || '';
-    if (!dbPath) {
-      const cwdData = path.join(process.cwd(), 'data');
-      try {
-        if (!fs.existsSync(cwdData)) fs.mkdirSync(cwdData, { recursive: true });
-        dbPath = path.join(cwdData, 'entropy_engine.db');
-      } catch {
-        dbPath = path.join('/tmp', 'entropy-data', 'entropy_engine.db');
-      }
-    }
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const Database = require('better-sqlite3');
-    const db = new Database(dbPath);
-    const row = db.prepare('SELECT COUNT(*) as cnt FROM entropy_history').get() as { cnt: number };
-    db.close();
-    t('SQLite').pass(`Writable — ${row.cnt} history rows`);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Cannot open/write';
-    if (msg.includes('no such table')) {
-      t('SQLite').warn('DB exists but no tables yet — engine has not run');
+    const { hasRedisData } = await import('@/lib/entropy/persistence');
+    const hasData = await hasRedisData();
+    if (hasData) {
+      t('Data persistence').pass('Redis has entropy data — will restore to SQLite on cold start');
     } else {
-      t('SQLite').fail(msg);
+      t('Data persistence').warn('Redis is empty — engine has not run yet or was purged');
     }
+  } catch (err) {
+    t('Data persistence').fail(`${err instanceof Error ? err.message : 'Check failed'}`);
   }
 
   // 6. Is today a trading day?

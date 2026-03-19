@@ -211,6 +211,7 @@ export async function persistToRedis(db: BetterSqlite3Database): Promise<void> {
 
 /**
  * Clear all entropy data from Redis (clean slate).
+ * Sets a purge flag so all warm serverless instances know to clear local SQLite.
  * Returns the number of keys deleted.
  */
 export async function clearAllRedisData(): Promise<number> {
@@ -226,7 +227,34 @@ export async function clearAllRedisData(): Promise<number> {
       // Key may not exist, that's fine
     }
   }
+  // Set purge flag so warm instances clear their local SQLite on next request
+  await redis.set('entropy:purged', Date.now().toString());
   return deleted;
+}
+
+/**
+ * Check if a purge flag is set in Redis. If so, clear local SQLite and remove the flag.
+ * Must be called before restoreFromRedis on every request to handle cross-instance purges.
+ */
+export async function checkPurgeFlag(db: BetterSqlite3Database): Promise<boolean> {
+  const redis = await getRedis();
+  if (!redis) return false;
+  try {
+    const purged = await redis.get<string>('entropy:purged');
+    if (!purged) return false;
+    // Purge flag is set — clear local SQLite
+    db.exec(`
+      DELETE FROM entropy_history;
+      DELETE FROM positions;
+      DELETE FROM trades_log;
+      DELETE FROM equity_curve;
+      DELETE FROM signals_log;
+    `);
+    await redis.del('entropy:purged');
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
