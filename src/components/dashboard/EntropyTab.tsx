@@ -150,6 +150,9 @@ export default function EntropyTab() {
     checks: { name: string; status: 'pass' | 'fail' | 'warn'; detail: string; ms?: number }[];
     timestamp: string;
   } | null>(null);
+  const [triggerAvailable, setTriggerAvailable] = useState<boolean | null>(null);
+  const [triggering, setTriggering] = useState(false);
+  const [triggerResult, setTriggerResult] = useState<{ success: boolean; message?: string; error?: string; help?: string } | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const warmupCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -157,8 +160,15 @@ export default function EntropyTab() {
 
   const fetchDiagnostics = useCallback(async () => {
     try {
-      const res = await fetch('/api/entropy?view=diagnostics');
-      if (res.ok) setDiagnostics(await res.json());
+      const [diagRes, trigRes] = await Promise.all([
+        fetch('/api/entropy?view=diagnostics'),
+        fetch('/api/entropy/cron/trigger'),
+      ]);
+      if (diagRes.ok) setDiagnostics(await diagRes.json());
+      if (trigRes.ok) {
+        const t = await trigRes.json();
+        setTriggerAvailable(t.available);
+      }
     } catch { /* silent */ }
   }, []);
 
@@ -213,6 +223,21 @@ export default function EntropyTab() {
       setCronTestRunning(false);
     }
   }, [cronTestRunning]);
+
+  const triggerCron = useCallback(async () => {
+    if (triggering) return;
+    setTriggering(true);
+    setTriggerResult(null);
+    try {
+      const res = await fetch('/api/entropy/cron/trigger', { method: 'POST' });
+      const json = await res.json();
+      setTriggerResult(json);
+    } catch (err) {
+      setTriggerResult({ success: false, error: err instanceof Error ? err.message : 'Network error' });
+    } finally {
+      setTriggering(false);
+    }
+  }, [triggering]);
 
   const fetchData = useCallback(async () => {
     try {
@@ -529,9 +554,255 @@ export default function EntropyTab() {
 
   // ─── Status banners ─────────────────────────────────────
 
+  // ─── Shared diagnostics panel (used in both no_db and active states) ──
+  const renderDiagnosticsPanel = () => (
+    <div className="panel">
+      <div className="panel-header cursor-pointer" onClick={() => { setShowDiagnostics(v => !v); if (!diagnostics) fetchDiagnostics(); }}>
+        <div className="flex items-center gap-1.5">
+          <Settings className="w-3.5 h-3.5 text-text-muted" />
+          <span className="panel-title">Engine Health & Admin</span>
+        </div>
+        <span className="text-[10px] font-mono text-text-muted">{showDiagnostics ? '▲ collapse' : '▼ expand'}</span>
+      </div>
+
+      {showDiagnostics && (
+        <div className="p-4 flex flex-col gap-4">
+          {/* Connection & Cron Status */}
+          {diagnostics ? (
+            <div className="grid grid-cols-2 gap-3">
+              {/* Redis connection */}
+              <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
+                {diagnostics.redisConnected ? (
+                  <Wifi className="w-4 h-4 text-accent-green shrink-0" />
+                ) : (
+                  <WifiOff className="w-4 h-4 text-accent-red shrink-0" />
+                )}
+                <div>
+                  <span className="text-xs font-mono text-text-primary">Redis</span>
+                  <p className="text-[10px] font-mono text-text-muted">
+                    {diagnostics.redisConnected
+                      ? diagnostics.redisHasData ? 'Connected — data persisted' : 'Connected — no data yet'
+                      : 'Not connected — data will be lost on redeploy'}
+                  </p>
+                </div>
+              </div>
+
+              {/* Data collection */}
+              <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
+                <Database className="w-4 h-4 text-accent-purple shrink-0" />
+                <div>
+                  <span className="text-xs font-mono text-text-primary">{diagnostics.totalDays} days collected</span>
+                  <p className="text-[10px] font-mono text-text-muted">
+                    {diagnostics.warmupComplete
+                      ? 'Warmup complete — signals active'
+                      : diagnostics.totalDays > 0
+                        ? `${30 - diagnostics.totalDays} more days until signals activate`
+                        : 'Engine has not run yet'}
+                  </p>
+                </div>
+              </div>
+
+              {/* Last run */}
+              <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
+                <CheckCircle2 className={`w-4 h-4 shrink-0 ${diagnostics.lastRunDate ? 'text-accent-green' : 'text-accent-red'}`} />
+                <div>
+                  <span className="text-xs font-mono text-text-primary">
+                    Last run: {diagnostics.lastRunDate || 'Never'}
+                  </span>
+                  <p className="text-[10px] font-mono text-text-muted">
+                    {diagnostics.lastRunDate
+                      ? `${Math.round((Date.now() - new Date(diagnostics.lastRunDate).getTime()) / (1000 * 60 * 60 * 24))} days ago`
+                      : 'Engine has not run yet'}
+                  </p>
+                </div>
+              </div>
+
+              {/* Next expected */}
+              <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
+                <CalendarCheck className="w-4 h-4 text-accent-cyan shrink-0" />
+                <div>
+                  <span className="text-xs font-mono text-text-primary">Next run</span>
+                  <p className="text-[10px] font-mono text-text-muted">{diagnostics.nextExpectedRun}</p>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="text-xs font-mono text-text-muted animate-pulse">Loading diagnostics...</div>
+          )}
+
+          {/* Cron Dry-Run Test */}
+          <div className="p-3 rounded-md bg-bg-primary/50 border border-border/10">
+            <div className="flex items-center justify-between mb-2">
+              <div>
+                <span className="text-xs font-mono text-text-primary font-semibold">Cron Pipeline Test</span>
+                <p className="text-[10px] font-mono text-text-muted">
+                  Verifies every dependency the cron job needs — without running the engine.
+                </p>
+              </div>
+              <button
+                onClick={runCronTest}
+                disabled={cronTestRunning}
+                className="px-3 py-1.5 rounded-md bg-accent-cyan/10 border border-accent-cyan/30 text-accent-cyan text-[10px] font-mono hover:bg-accent-cyan/20 transition-all disabled:opacity-50 flex items-center gap-1.5 shrink-0"
+              >
+                {cronTestRunning ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+                {cronTestRunning ? 'Testing...' : 'Run Test'}
+              </button>
+            </div>
+            {cronTestResult && (
+              <div className="mt-2">
+                <div className={`text-xs font-mono font-semibold mb-2 ${cronTestResult.allPassed ? 'text-accent-green' : 'text-accent-red'}`}>
+                  {cronTestResult.summary}
+                </div>
+                <div className="flex flex-col gap-1">
+                  {cronTestResult.checks.map((check, i) => (
+                    <div key={i} className="flex items-center gap-2 text-[10px] font-mono">
+                      <span className={`shrink-0 ${check.status === 'pass' ? 'text-accent-green' : check.status === 'fail' ? 'text-accent-red' : 'text-accent-amber'}`}>
+                        {check.status === 'pass' ? '✓' : check.status === 'fail' ? '✗' : '⚠'}
+                      </span>
+                      <span className="text-text-secondary w-28 shrink-0">{check.name}</span>
+                      <span className="text-text-muted truncate">{check.detail}</span>
+                      {check.ms != null && (
+                        <span className="text-text-muted/50 shrink-0 ml-auto">{check.ms}ms</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <span className="text-[9px] font-mono text-text-muted/50 mt-1 block">
+                  Tested at {new Date(cronTestResult.timestamp).toLocaleTimeString()}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Trigger GitHub Actions */}
+          <div className="p-3 rounded-md bg-bg-primary/50 border border-border/10">
+            <div className="flex items-center justify-between mb-2">
+              <div>
+                <span className="text-xs font-mono text-text-primary font-semibold">Trigger Cron via GitHub Actions</span>
+                <p className="text-[10px] font-mono text-text-muted">
+                  Dispatches the real cron workflow end-to-end: GitHub Actions → /api/entropy/cron → engine run.
+                </p>
+              </div>
+              <button
+                onClick={triggerCron}
+                disabled={triggering || triggerAvailable === false}
+                title={triggerAvailable === false ? 'GITHUB_TOKEN not configured' : 'Dispatch workflow'}
+                className="px-3 py-1.5 rounded-md bg-accent-purple/10 border border-accent-purple/30 text-accent-purple text-[10px] font-mono hover:bg-accent-purple/20 transition-all disabled:opacity-50 flex items-center gap-1.5 shrink-0"
+              >
+                {triggering ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
+                {triggering ? 'Dispatching...' : 'Trigger Now'}
+              </button>
+            </div>
+            {triggerAvailable === false && (
+              <p className="text-[10px] font-mono text-accent-amber">
+                Requires GITHUB_TOKEN env var with <span className="text-text-secondary">actions:write</span> scope.
+                Add it in Vercel → Settings → Environment Variables.
+              </p>
+            )}
+            {triggerResult && (
+              <p className={`text-[10px] font-mono mt-1 ${triggerResult.success ? 'text-accent-green' : 'text-accent-red'}`}>
+                {triggerResult.success ? triggerResult.message : triggerResult.error}
+                {triggerResult.help && <span className="text-text-muted block mt-0.5">{triggerResult.help}</span>}
+              </p>
+            )}
+          </div>
+
+          {/* Gaps warning */}
+          {diagnostics?.gaps && diagnostics.gaps.length > 0 && (
+            <div className="p-3 rounded-md bg-accent-amber/10 border border-accent-amber/20">
+              <div className="flex items-center gap-1.5 mb-1">
+                <AlertTriangle className="w-3.5 h-3.5 text-accent-amber" />
+                <span className="text-xs font-mono text-accent-amber font-semibold">Gaps detected in history</span>
+              </div>
+              <div className="flex flex-col gap-0.5">
+                {diagnostics.gaps.map((gap, i) => (
+                  <span key={i} className="text-[10px] font-mono text-accent-amber/80">{gap}</span>
+                ))}
+              </div>
+              <p className="text-[10px] font-mono text-text-muted mt-1">
+                Gaps may indicate the cron job failed on those days. Check GitHub Actions for errors.
+              </p>
+            </div>
+          )}
+
+          {/* Recent run log */}
+          {diagnostics?.runLog && diagnostics.runLog.length > 0 && (
+            <div>
+              <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">Recent runs</span>
+              <div className="mt-1 overflow-x-auto">
+                <table className="w-full text-[10px] font-mono">
+                  <thead>
+                    <tr className="border-b border-border/20">
+                      {['Date', 'SPY', 'Composite', 'Chain Records'].map(h => (
+                        <th key={h} className="px-2 py-1 text-left text-text-muted font-normal">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {diagnostics.runLog.map(r => (
+                      <tr key={r.date} className="border-b border-border/5">
+                        <td className="px-2 py-1 text-text-muted">{r.date}</td>
+                        <td className="px-2 py-1 text-text-primary">${r.spot.toFixed(2)}</td>
+                        <td className="px-2 py-1 text-accent-purple">{r.composite != null ? r.composite.toFixed(4) : '—'}</td>
+                        <td className="px-2 py-1 text-text-secondary">{r.records ?? '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Danger zone: Purge */}
+          <div className="mt-2 p-3 rounded-md border border-accent-red/20 bg-accent-red/5">
+            <div className="flex items-center gap-1.5 mb-2">
+              <Trash2 className="w-3.5 h-3.5 text-accent-red" />
+              <span className="text-xs font-mono text-accent-red font-semibold">Danger Zone</span>
+            </div>
+            <p className="text-[10px] font-mono text-text-muted mb-3">
+              Permanently delete all entropy history, positions, trades, signals, and equity data.
+              The engine will restart from scratch with a 30-day warmup period.
+            </p>
+            {purgeResult && (
+              <p className={`text-[10px] font-mono mb-2 ${purgeResult.includes('failed') ? 'text-accent-red' : 'text-accent-green'}`}>
+                {purgeResult}
+              </p>
+            )}
+            {!purgeConfirm ? (
+              <button
+                onClick={() => setPurgeConfirm(true)}
+                className="px-3 py-1.5 rounded-md bg-accent-red/10 border border-accent-red/30 text-accent-red text-[10px] font-mono hover:bg-accent-red/20 transition-all flex items-center gap-1.5"
+              >
+                <Trash2 className="w-3 h-3" />
+                Purge All Entropy Data
+              </button>
+            ) : (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={purgeAllData}
+                  disabled={purging}
+                  className="px-3 py-1.5 rounded-md bg-accent-red/30 border border-accent-red/50 text-accent-red text-[10px] font-mono font-bold hover:bg-accent-red/40 transition-all disabled:opacity-50 flex items-center gap-1.5"
+                >
+                  {purging ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                  {purging ? 'Purging...' : 'Confirm — Delete Everything'}
+                </button>
+                <button
+                  onClick={() => setPurgeConfirm(false)}
+                  className="px-3 py-1.5 rounded-md bg-bg-tertiary border border-border/30 text-text-muted text-[10px] font-mono hover:text-text-secondary transition-all"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
   if (data.status === 'no_db') {
     return (
-      <div className="p-8">
+      <div className="flex flex-col gap-4 p-4">
         <div className="panel p-6 flex flex-col items-center gap-4 text-center">
           <Brain className="w-8 h-8 text-text-muted" />
           <p className="text-sm font-mono text-text-secondary">
@@ -554,29 +825,8 @@ export default function EntropyTab() {
               {runResult.message}
             </p>
           )}
-          {/* Diagnostics in uninitialized state */}
-          <div className="w-full max-w-md mt-2">
-            <button
-              onClick={() => { setShowDiagnostics(v => !v); if (!diagnostics) fetchDiagnostics(); }}
-              className="text-[10px] font-mono text-text-muted hover:text-text-secondary transition-all flex items-center gap-1"
-            >
-              <Settings className="w-3 h-3" />
-              {showDiagnostics ? 'Hide diagnostics' : 'Show diagnostics'}
-            </button>
-            {showDiagnostics && diagnostics && (
-              <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] font-mono">
-                <div className="flex items-center gap-1.5 p-2 rounded bg-bg-primary/50">
-                  {diagnostics.redisConnected ? <Wifi className="w-3 h-3 text-accent-green" /> : <WifiOff className="w-3 h-3 text-accent-red" />}
-                  <span className="text-text-muted">Redis: {diagnostics.redisConnected ? 'connected' : 'disconnected'}</span>
-                </div>
-                <div className="flex items-center gap-1.5 p-2 rounded bg-bg-primary/50">
-                  <CalendarCheck className="w-3 h-3 text-accent-cyan" />
-                  <span className="text-text-muted">Next: {diagnostics.nextExpectedRun}</span>
-                </div>
-              </div>
-            )}
-          </div>
         </div>
+        {renderDiagnosticsPanel()}
       </div>
     );
   }
@@ -1042,213 +1292,7 @@ export default function EntropyTab() {
       )}
 
       {/* Section 8: Engine Diagnostics & Administration */}
-      <div className="panel">
-        <div className="panel-header cursor-pointer" onClick={() => { setShowDiagnostics(v => !v); if (!diagnostics) fetchDiagnostics(); }}>
-          <div className="flex items-center gap-1.5">
-            <Settings className="w-3.5 h-3.5 text-text-muted" />
-            <span className="panel-title">Engine Health & Admin</span>
-          </div>
-          <span className="text-[10px] font-mono text-text-muted">{showDiagnostics ? '▲ collapse' : '▼ expand'}</span>
-        </div>
-
-        {showDiagnostics && (
-          <div className="p-4 flex flex-col gap-4">
-            {/* Connection & Cron Status */}
-            {diagnostics ? (
-              <div className="grid grid-cols-2 gap-3">
-                {/* Redis connection */}
-                <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
-                  {diagnostics.redisConnected ? (
-                    <Wifi className="w-4 h-4 text-accent-green shrink-0" />
-                  ) : (
-                    <WifiOff className="w-4 h-4 text-accent-red shrink-0" />
-                  )}
-                  <div>
-                    <span className="text-xs font-mono text-text-primary">Redis</span>
-                    <p className="text-[10px] font-mono text-text-muted">
-                      {diagnostics.redisConnected
-                        ? diagnostics.redisHasData ? 'Connected — data persisted' : 'Connected — no data yet'
-                        : 'Not connected — data will be lost on redeploy'}
-                    </p>
-                  </div>
-                </div>
-
-                {/* Data collection */}
-                <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
-                  <Database className="w-4 h-4 text-accent-purple shrink-0" />
-                  <div>
-                    <span className="text-xs font-mono text-text-primary">{diagnostics.totalDays} days collected</span>
-                    <p className="text-[10px] font-mono text-text-muted">
-                      {diagnostics.warmupComplete
-                        ? 'Warmup complete — signals active'
-                        : `${30 - diagnostics.totalDays} more days until signals activate`}
-                    </p>
-                  </div>
-                </div>
-
-                {/* Last run */}
-                <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
-                  <CheckCircle2 className={`w-4 h-4 shrink-0 ${diagnostics.lastRunDate ? 'text-accent-green' : 'text-accent-red'}`} />
-                  <div>
-                    <span className="text-xs font-mono text-text-primary">
-                      Last run: {diagnostics.lastRunDate || 'Never'}
-                    </span>
-                    <p className="text-[10px] font-mono text-text-muted">
-                      {diagnostics.lastRunDate
-                        ? `${Math.round((Date.now() - new Date(diagnostics.lastRunDate).getTime()) / (1000 * 60 * 60 * 24))} days ago`
-                        : 'Engine has not run yet'}
-                    </p>
-                  </div>
-                </div>
-
-                {/* Next expected */}
-                <div className="flex items-center gap-2 p-3 rounded-md bg-bg-primary/50">
-                  <CalendarCheck className="w-4 h-4 text-accent-cyan shrink-0" />
-                  <div>
-                    <span className="text-xs font-mono text-text-primary">Next run</span>
-                    <p className="text-[10px] font-mono text-text-muted">{diagnostics.nextExpectedRun}</p>
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="text-xs font-mono text-text-muted animate-pulse">Loading diagnostics...</div>
-            )}
-
-            {/* Cron Dry-Run Test */}
-            <div className="p-3 rounded-md bg-bg-primary/50 border border-border/10">
-              <div className="flex items-center justify-between mb-2">
-                <div>
-                  <span className="text-xs font-mono text-text-primary font-semibold">Cron Pipeline Test</span>
-                  <p className="text-[10px] font-mono text-text-muted">
-                    Verifies every dependency the cron job needs — without running the engine.
-                  </p>
-                </div>
-                <button
-                  onClick={runCronTest}
-                  disabled={cronTestRunning}
-                  className="px-3 py-1.5 rounded-md bg-accent-cyan/10 border border-accent-cyan/30 text-accent-cyan text-[10px] font-mono hover:bg-accent-cyan/20 transition-all disabled:opacity-50 flex items-center gap-1.5 shrink-0"
-                >
-                  {cronTestRunning ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
-                  {cronTestRunning ? 'Testing...' : 'Run Test'}
-                </button>
-              </div>
-              {cronTestResult && (
-                <div className="mt-2">
-                  <div className={`text-xs font-mono font-semibold mb-2 ${cronTestResult.allPassed ? 'text-accent-green' : 'text-accent-red'}`}>
-                    {cronTestResult.summary}
-                  </div>
-                  <div className="flex flex-col gap-1">
-                    {cronTestResult.checks.map((check, i) => (
-                      <div key={i} className="flex items-center gap-2 text-[10px] font-mono">
-                        <span className={`shrink-0 ${check.status === 'pass' ? 'text-accent-green' : check.status === 'fail' ? 'text-accent-red' : 'text-accent-amber'}`}>
-                          {check.status === 'pass' ? '✓' : check.status === 'fail' ? '✗' : '⚠'}
-                        </span>
-                        <span className="text-text-secondary w-28 shrink-0">{check.name}</span>
-                        <span className="text-text-muted truncate">{check.detail}</span>
-                        {check.ms != null && (
-                          <span className="text-text-muted/50 shrink-0 ml-auto">{check.ms}ms</span>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                  <span className="text-[9px] font-mono text-text-muted/50 mt-1 block">
-                    Tested at {new Date(cronTestResult.timestamp).toLocaleTimeString()}
-                  </span>
-                </div>
-              )}
-            </div>
-
-            {/* Gaps warning */}
-            {diagnostics?.gaps && diagnostics.gaps.length > 0 && (
-              <div className="p-3 rounded-md bg-accent-amber/10 border border-accent-amber/20">
-                <div className="flex items-center gap-1.5 mb-1">
-                  <AlertTriangle className="w-3.5 h-3.5 text-accent-amber" />
-                  <span className="text-xs font-mono text-accent-amber font-semibold">Gaps detected in history</span>
-                </div>
-                <div className="flex flex-col gap-0.5">
-                  {diagnostics.gaps.map((gap, i) => (
-                    <span key={i} className="text-[10px] font-mono text-accent-amber/80">{gap}</span>
-                  ))}
-                </div>
-                <p className="text-[10px] font-mono text-text-muted mt-1">
-                  Gaps may indicate the cron job failed on those days. Check GitHub Actions for errors.
-                </p>
-              </div>
-            )}
-
-            {/* Recent run log */}
-            {diagnostics?.runLog && diagnostics.runLog.length > 0 && (
-              <div>
-                <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">Recent runs</span>
-                <div className="mt-1 overflow-x-auto">
-                  <table className="w-full text-[10px] font-mono">
-                    <thead>
-                      <tr className="border-b border-border/20">
-                        {['Date', 'SPY', 'Composite', 'Chain Records'].map(h => (
-                          <th key={h} className="px-2 py-1 text-left text-text-muted font-normal">{h}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {diagnostics.runLog.map(r => (
-                        <tr key={r.date} className="border-b border-border/5">
-                          <td className="px-2 py-1 text-text-muted">{r.date}</td>
-                          <td className="px-2 py-1 text-text-primary">${r.spot.toFixed(2)}</td>
-                          <td className="px-2 py-1 text-accent-purple">{r.composite != null ? r.composite.toFixed(4) : '—'}</td>
-                          <td className="px-2 py-1 text-text-secondary">{r.records ?? '—'}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-
-            {/* Danger zone: Purge */}
-            <div className="mt-2 p-3 rounded-md border border-accent-red/20 bg-accent-red/5">
-              <div className="flex items-center gap-1.5 mb-2">
-                <Trash2 className="w-3.5 h-3.5 text-accent-red" />
-                <span className="text-xs font-mono text-accent-red font-semibold">Danger Zone</span>
-              </div>
-              <p className="text-[10px] font-mono text-text-muted mb-3">
-                Permanently delete all entropy history, positions, trades, signals, and equity data.
-                The engine will restart from scratch with a 30-day warmup period.
-              </p>
-              {purgeResult && (
-                <p className={`text-[10px] font-mono mb-2 ${purgeResult.includes('failed') ? 'text-accent-red' : 'text-accent-green'}`}>
-                  {purgeResult}
-                </p>
-              )}
-              {!purgeConfirm ? (
-                <button
-                  onClick={() => setPurgeConfirm(true)}
-                  className="px-3 py-1.5 rounded-md bg-accent-red/10 border border-accent-red/30 text-accent-red text-[10px] font-mono hover:bg-accent-red/20 transition-all flex items-center gap-1.5"
-                >
-                  <Trash2 className="w-3 h-3" />
-                  Purge All Entropy Data
-                </button>
-              ) : (
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={purgeAllData}
-                    disabled={purging}
-                    className="px-3 py-1.5 rounded-md bg-accent-red/30 border border-accent-red/50 text-accent-red text-[10px] font-mono font-bold hover:bg-accent-red/40 transition-all disabled:opacity-50 flex items-center gap-1.5"
-                  >
-                    {purging ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
-                    {purging ? 'Purging...' : 'Confirm — Delete Everything'}
-                  </button>
-                  <button
-                    onClick={() => setPurgeConfirm(false)}
-                    className="px-3 py-1.5 rounded-md bg-bg-tertiary border border-border/30 text-text-muted text-[10px] font-mono hover:text-text-secondary transition-all"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-      </div>
+      {renderDiagnosticsPanel()}
     </div>
   );
 }
