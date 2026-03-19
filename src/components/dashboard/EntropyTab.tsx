@@ -152,7 +152,7 @@ export default function EntropyTab() {
   } | null>(null);
   const [triggerAvailable, setTriggerAvailable] = useState<boolean | null>(null);
   const [triggering, setTriggering] = useState(false);
-  const [triggerResult, setTriggerResult] = useState<{ success: boolean; message?: string; error?: string; help?: string } | null>(null);
+  const [triggerResult, setTriggerResult] = useState<{ success: boolean; message?: string; error?: string; help?: string; detail?: string; debug?: Record<string, string> } | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const warmupCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -700,10 +700,24 @@ export default function EntropyTab() {
               </p>
             )}
             {triggerResult && (
-              <p className={`text-[10px] font-mono mt-1 ${triggerResult.success ? 'text-accent-green' : 'text-accent-red'}`}>
-                {triggerResult.success ? triggerResult.message : triggerResult.error}
-                {triggerResult.help && <span className="text-text-muted block mt-0.5">{triggerResult.help}</span>}
-              </p>
+              <div className="mt-1">
+                <p className={`text-[10px] font-mono ${triggerResult.success ? 'text-accent-green' : 'text-accent-red'}`}>
+                  {triggerResult.success ? triggerResult.message : triggerResult.error}
+                </p>
+                {triggerResult.help && (
+                  <p className="text-[10px] font-mono text-text-muted mt-0.5">{triggerResult.help}</p>
+                )}
+                {triggerResult.detail && (
+                  <pre className="text-[9px] font-mono text-text-muted/70 mt-1 p-2 rounded bg-bg-primary/50 overflow-x-auto whitespace-pre-wrap">{triggerResult.detail}</pre>
+                )}
+                {triggerResult.debug && (
+                  <div className="text-[9px] font-mono text-text-muted/50 mt-1">
+                    {Object.entries(triggerResult.debug).map(([k, v]) => (
+                      <span key={k} className="mr-3">{k}: {v}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
             )}
           </div>
 
