@@ -124,9 +124,23 @@ export async function restoreFromRedis(db: BetterSqlite3Database): Promise<void>
       redis.get<SignalRow[]>('entropy:signals'),
     ]);
 
-    // Check if DB already has data (avoid duplicate restore)
+    // Compare local SQLite count vs Redis count — re-sync if Redis has newer data
     const existingCount = (db.prepare('SELECT COUNT(*) as cnt FROM entropy_history').get() as { cnt: number }).cnt;
-    if (existingCount > 0) return; // Already populated (warm instance)
+    const redisHistoryCount = history ? history.length : 0;
+    if (existingCount > 0 && existingCount >= redisHistoryCount) {
+      return; // Local DB is up-to-date
+    }
+
+    // Clear stale local data before re-syncing from Redis
+    if (existingCount > 0 && redisHistoryCount > existingCount) {
+      db.exec(`
+        DELETE FROM entropy_history;
+        DELETE FROM positions;
+        DELETE FROM trades_log;
+        DELETE FROM equity_curve;
+        DELETE FROM signals_log;
+      `);
+    }
 
     if (history && history.length > 0) {
       const stmt = db.prepare('INSERT OR IGNORE INTO entropy_history (date, spot, metrics_json) VALUES (?, ?, ?)');

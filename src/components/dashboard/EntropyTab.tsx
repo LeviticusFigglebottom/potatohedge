@@ -283,7 +283,7 @@ export default function EntropyTab() {
   useEffect(() => {
     fetchData();
     fetchDiagnostics();
-    const interval = setInterval(fetchData, 60_000);
+    const interval = setInterval(fetchData, 15_000);
     const diagInterval = setInterval(fetchDiagnostics, 5 * 60_000);
     return () => { clearInterval(interval); clearInterval(diagInterval); };
   }, [fetchData, fetchDiagnostics]);
