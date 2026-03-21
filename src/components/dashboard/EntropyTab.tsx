@@ -138,6 +138,7 @@ export default function EntropyTab() {
     nextExpectedRun: string;
     gaps: string[];
     runLog: { date: string; spot: number; composite: number | null; records: number | null }[];
+    cronLog?: { timestamp: string; status: string; message: string; source: string }[];
   } | null>(null);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [purging, setPurging] = useState(false);
@@ -720,6 +721,53 @@ export default function EntropyTab() {
               </div>
             )}
           </div>
+
+          {/* Cron Activity Log */}
+          {diagnostics?.cronLog && diagnostics.cronLog.length > 0 && (
+            <div>
+              <span className="text-[10px] font-mono text-text-muted uppercase tracking-wider">Cron Activity Log</span>
+              <div className="mt-1 overflow-x-auto max-h-48 overflow-y-auto">
+                <table className="w-full text-[10px] font-mono">
+                  <thead>
+                    <tr className="border-b border-border/20">
+                      {['Time (ET)', 'Source', 'Status', 'Message'].map(h => (
+                        <th key={h} className="px-2 py-1 text-left text-text-muted font-normal">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {diagnostics.cronLog.slice(0, 20).map((entry, i) => (
+                      <tr key={i} className="border-b border-border/5">
+                        <td className="px-2 py-1 text-text-muted whitespace-nowrap">
+                          {new Date(entry.timestamp).toLocaleString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })}
+                        </td>
+                        <td className="px-2 py-1">
+                          <span className={`px-1.5 py-0.5 rounded text-[9px] ${
+                            entry.source === 'github-actions' ? 'bg-accent-purple/20 text-accent-purple'
+                            : entry.source === 'vercel-cron' ? 'bg-accent-cyan/20 text-accent-cyan'
+                            : 'bg-text-muted/20 text-text-muted'
+                          }`}>
+                            {entry.source === 'github-actions' ? 'GitHub' : entry.source === 'vercel-cron' ? 'Vercel' : 'Manual'}
+                          </span>
+                        </td>
+                        <td className="px-2 py-1">
+                          <span className={`${
+                            entry.status === 'executed' ? 'text-accent-green'
+                            : entry.status === 'error' ? 'text-accent-red'
+                            : entry.status === 'warmup' ? 'text-accent-amber'
+                            : 'text-text-muted'
+                          }`}>
+                            {entry.status}
+                          </span>
+                        </td>
+                        <td className="px-2 py-1 text-text-muted truncate max-w-[200px]">{entry.message}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
 
           {/* Gaps warning */}
           {diagnostics?.gaps && diagnostics.gaps.length > 0 && (

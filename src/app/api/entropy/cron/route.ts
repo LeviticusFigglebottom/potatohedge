@@ -3,6 +3,23 @@ import { NextRequest, NextResponse } from 'next/server';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
+/** Log a cron invocation to Redis so the UI can display activity history. */
+async function logCronActivity(entry: { timestamp: string; status: string; message: string; source: string }) {
+  try {
+    const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+    const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+    if (!url || !token) return;
+    const { Redis } = await import('@upstash/redis');
+    const redis = new Redis({ url, token });
+    const existing = await redis.get<typeof entry[]>('entropy:cron-log') || [];
+    existing.unshift(entry);
+    // Keep last 50 entries
+    await redis.set('entropy:cron-log', JSON.stringify(existing.slice(0, 50)));
+  } catch {
+    // Non-critical — don't let logging failures break the cron
+  }
+}
+
 /**
  * Vercel Cron endpoint for the entropy engine.
  *
@@ -26,25 +43,35 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  // Detect source from headers
+  const source = request.headers.get('user-agent')?.includes('github') ? 'github-actions'
+    : request.headers.get('x-vercel-cron') ? 'vercel-cron'
+    : 'manual';
+
   const now = new Date();
+  const timestamp = now.toISOString();
 
   // Check if today is a trading day (not weekend/holiday)
   if (!isTradingDay(now)) {
-    return NextResponse.json({
+    const result = {
       success: true,
       status: 'skipped',
       message: 'Not a trading day (weekend or holiday)',
-    });
+    };
+    await logCronActivity({ timestamp, status: result.status, message: result.message, source });
+    return NextResponse.json(result);
   }
 
   try {
     const { runEntropyEngine } = await import('@/lib/entropy/engine');
     const result = await runEntropyEngine();
     console.log(`[entropy-cron] ${result.status}: ${result.message}`);
+    await logCronActivity({ timestamp, status: result.status, message: result.message, source });
     return NextResponse.json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     console.error(`[entropy-cron] Error: ${message}`);
+    await logCronActivity({ timestamp, status: 'error', message, source });
     return NextResponse.json(
       { success: false, status: 'error', message },
       { status: 500 }

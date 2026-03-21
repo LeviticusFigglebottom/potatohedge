@@ -260,6 +260,18 @@ export async function GET(request: NextRequest) {
       const redisConnected = await hasRedisData().then(() => true).catch(() => false);
       const redisHasData = await hasRedisData().catch(() => false);
 
+      // Fetch cron activity log from Redis
+      let cronLog: { timestamp: string; status: string; message: string; source: string }[] = [];
+      try {
+        const redisUrl = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+        const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+        if (redisUrl && redisToken) {
+          const { Redis } = await import('@upstash/redis');
+          const redis = new Redis({ url: redisUrl, token: redisToken });
+          cronLog = await redis.get<typeof cronLog>('entropy:cron-log') || [];
+        }
+      } catch { /* non-critical */ }
+
       // History stats
       const historyRows = db.prepare(
         'SELECT date FROM entropy_history ORDER BY date DESC'
@@ -317,6 +329,7 @@ export async function GET(request: NextRequest) {
         nextExpectedRun: nextRunStr,
         gaps,
         runLog,
+        cronLog,
       });
     }
 
