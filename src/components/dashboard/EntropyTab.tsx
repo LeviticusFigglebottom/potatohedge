@@ -902,6 +902,7 @@ export default function EntropyTab() {
 
   const { metrics, medians, signals, openPositions, recentTrades, equity, stats } = data;
   const isWarmup = data.status === 'warmup';
+  const regime = (metrics as Record<string, unknown> | null)?.regime as string | undefined;
 
   return (
     <div className="flex flex-col gap-4 p-4">
@@ -985,25 +986,25 @@ export default function EntropyTab() {
       </div>
 
       {/* Regime Banner */}
-      {metrics?.regime && (
+      {regime && (
         <div className={`panel border ${
-          metrics.regime === 'EXTREME' ? 'border-accent-red/50 bg-accent-red/5' :
-          metrics.regime === 'STRESSED' ? 'border-accent-amber/50 bg-accent-amber/5' :
+          regime === 'EXTREME' ? 'border-accent-red/50 bg-accent-red/5' :
+          regime === 'STRESSED' ? 'border-accent-amber/50 bg-accent-amber/5' :
           'border-accent-green/30 bg-accent-green/5'
         }`}>
           <div className="p-3 flex items-center justify-between">
             <div className="flex items-center gap-2">
               <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-mono font-bold tracking-wider ${
-                metrics.regime === 'EXTREME' ? 'bg-accent-red/20 text-accent-red' :
-                metrics.regime === 'STRESSED' ? 'bg-accent-amber/20 text-accent-amber' :
+                regime === 'EXTREME' ? 'bg-accent-red/20 text-accent-red' :
+                regime === 'STRESSED' ? 'bg-accent-amber/20 text-accent-amber' :
                 'bg-accent-green/20 text-accent-green'
               }`}>
-                {String(metrics.regime)}
+                {regime}
               </span>
               <span className="text-xs font-mono text-text-muted">
-                {metrics.regime === 'EXTREME'
+                {regime === 'EXTREME'
                   ? 'Credit entries halted — debit trades only'
-                  : metrics.regime === 'STRESSED'
+                  : regime === 'STRESSED'
                   ? 'Credit trades at 50% size — elevated volatility'
                   : 'All trade types active — normal conditions'}
               </span>
@@ -1491,9 +1492,9 @@ export default function EntropyTab() {
                 <div className="p-2 rounded bg-bg-primary/50">
                   <span className="text-text-muted">Current Regime</span>
                   <div className={`font-bold ${
-                    metrics?.regime === 'EXTREME' ? 'text-accent-red' :
-                    metrics?.regime === 'STRESSED' ? 'text-accent-amber' : 'text-accent-green'
-                  }`}>{metrics?.regime ? String(metrics.regime) : 'N/A'}</div>
+                    regime === 'EXTREME' ? 'text-accent-red' :
+                    regime === 'STRESSED' ? 'text-accent-amber' : 'text-accent-green'
+                  }`}>{regime || 'N/A'}</div>
                 </div>
                 <div className="p-2 rounded bg-bg-primary/50">
                   <span className="text-text-muted">IV Thresholds</span>
@@ -1504,11 +1505,11 @@ export default function EntropyTab() {
                   <div className="text-text-primary">STRESSED: 1.5x+0.8% | EXTREME: 2.5x+1.5%</div>
                 </div>
               </div>
-              {metrics?.regime_details && (() => {
+              {(() => {
+                const rdRaw = (metrics as Record<string, unknown> | null)?.regime_details;
+                if (!rdRaw) return null;
                 try {
-                  const rd = typeof metrics.regime_details === 'string'
-                    ? JSON.parse(metrics.regime_details as string)
-                    : metrics.regime_details;
+                  const rd = typeof rdRaw === 'string' ? JSON.parse(rdRaw) : rdRaw;
                   return (
                     <div className="mt-2 p-2 rounded bg-bg-primary/30 text-[10px] font-mono text-text-muted">
                       <div>IV: {rd.iv_check || 'N/A'}</div>
