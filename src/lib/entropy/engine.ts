@@ -1414,7 +1414,7 @@ export async function runEntropyEngine(): Promise<RunResult> {
 
     // 5b. Gallacher defense — assess vol regime
     const getRegimeState = (k: string, def: string): string => {
-      const row = db.prepare('SELECT value FROM regime_state WHERE key = ?').get(k) as
+      const row = db!.prepare('SELECT value FROM regime_state WHERE key = ?').get(k) as
         | { value: string }
         | undefined;
       return row?.value ?? def;
@@ -1425,7 +1425,7 @@ export async function runEntropyEngine(): Promise<RunResult> {
     const lastRegimeChangeDay = parseInt(getRegimeState('last_regime_change_day', '0'), 10);
 
     // Build spot history from entropy_history
-    const spotRows = db
+    const spotRows = db!
       .prepare(
         'SELECT spot FROM entropy_history ORDER BY date DESC LIMIT ?',
       )
@@ -1446,7 +1446,7 @@ export async function runEntropyEngine(): Promise<RunResult> {
 
     // Persist regime state
     const setRegimeState = (k: string, v: string) => {
-      db.prepare('INSERT OR REPLACE INTO regime_state (key, value) VALUES (?, ?)').run(k, v);
+      db!.prepare('INSERT OR REPLACE INTO regime_state (key, value) VALUES (?, ?)').run(k, v);
     };
     setRegimeState('current_regime', regime);
     setRegimeState('trading_days', String(tradingDays));
@@ -1458,7 +1458,7 @@ export async function runEntropyEngine(): Promise<RunResult> {
     // Store regime in metrics for API/UI
     (store as Record<string, unknown>).regime = regime;
     (store as Record<string, unknown>).regime_details = JSON.stringify(regimeDetails);
-    db.prepare('UPDATE entropy_history SET metrics_json = ? WHERE date = ?').run(
+    db!.prepare('UPDATE entropy_history SET metrics_json = ? WHERE date = ?').run(
       JSON.stringify(store),
       todayStr,
     );
@@ -1512,7 +1512,7 @@ export async function runEntropyEngine(): Promise<RunResult> {
         if (activeStrats.size >= MAX_POSITIONS) break;
 
         // Per-signal-type limit
-        const sameSignal = db
+        const sameSignal = db!
           .prepare('SELECT COUNT(*) as cnt FROM positions WHERE is_open = 1 AND strategy = ?')
           .get(sn) as { cnt: number } | undefined;
         if (sameSignal && sameSignal.cnt >= MAX_PER_SIGNAL_TYPE) continue;
