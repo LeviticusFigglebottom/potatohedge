@@ -36,15 +36,30 @@ const RISK_FREE = 0.05;
 const MIN_DTE = 14;
 const MAX_DTE = 45;
 const TARGET_DTE = 28;
-const MAX_ALLOC = 0.12;
-const MAX_CONTRACTS = 25;
 const CLOSE_DTE = 5;
-const PROFIT_PCT = 0.50;
-const STOP_MULT = 2.0;
 const WARMUP_DAYS = 30;
-const MAX_LONG_CALLS = 2;
-const SPREAD_FILTER = 0.15;
 const INITIAL_CASH = 100_000;
+const SPREAD_FILTER = 0.15;
+
+// Position sizing
+const BASE_ALLOC = 0.06;
+const MAX_ALLOC = 0.14;
+const MAX_CONTRACTS = 20;
+const MAX_POSITIONS = 8;
+const MAX_PER_SIGNAL_TYPE = 3;
+const MAX_LONG_CALLS = 2;
+
+// Signal thresholds
+const ENTROPY_PERCENTILE = 30;
+const VOLCOLLAPSE_PERCENTILE = 85;
+const PCR_PERCENTILE = 80;
+const MIN_STRENGTH = 0.20;
+
+// Exit rules
+const PROFIT_TARGET_DEBIT = 0.80;
+const PROFIT_TARGET_CREDIT = 0.50;
+const STOP_LOSS_DEBIT = -0.60;
+const STOP_LOSS_CREDIT = -1.50;
 
 const TRADIER_BASE_URL = 'https://api.tradier.com/v1';
 const FETCH_TIMEOUT = 12_000;
@@ -580,7 +595,7 @@ function computeEntropy(
   // Dollar gamma by strike
   const dg: Record<number, number> = {};
   for (const r of recs) {
-    dg[r.strike] = (dg[r.strike] ?? 0) + Math.abs(r.gamma) * spot * spot * 0.01;
+    dg[r.strike] = (dg[r.strike] ?? 0) + Math.abs(r.gamma) * r.volume * spot * 100;
   }
   const daVals = Object.values(dg);
   const daSum = daVals.reduce((a, b) => a + b, 0);
@@ -618,15 +633,19 @@ function computeEntropy(
   const dflowSum = dflow.reduce((a: number, b: number) => a + b, 0);
   m.H_dflow_n = dflowSum > 0 ? hNorm(dflow) : null;
 
-  // Spread by strike
-  const sp: Record<number, number> = {};
-  for (const r of recs) sp[r.strike] = (sp[r.strike] ?? 0) + r.spread;
-  const spsVals = Object.values(sp).map(Math.abs);
-  const spsSum = spsVals.reduce((a, b) => a + b, 0);
-  m.H_spread_k_n = spsSum > 0 ? hNorm(spsVals) : null;
+  // Spread liquidity by strike (volume / spread)
+  const sl: Record<number, number> = {};
+  for (const r of recs) {
+    if (r.spread > 0 && r.volume > 0) {
+      sl[r.strike] = (sl[r.strike] ?? 0) + r.volume / r.spread;
+    }
+  }
+  const slVals = Object.values(sl);
+  const slSum = slVals.reduce((a, b) => a + b, 0);
+  m.H_spread_k_n = slVals.length > 0 && slSum > 0 ? hNorm(slVals) : 0.5;
 
   // Moneyness buckets
-  const mb = [0.85, 0.90, 0.95, 0.97, 1.0, 1.03, 1.05, 1.10, 1.15];
+  const mb = Array.from({ length: 16 }, (_, i) => 0.85 + i * 0.02);
   const mv = new Array(mb.length - 1).fill(0);
   for (const r of recs) {
     for (let b = 0; b < mb.length - 1; b++) {
@@ -639,8 +658,9 @@ function computeEntropy(
   const mvSum = mv.reduce((a: number, b: number) => a + b, 0);
   m.H_moneyness_n = mvSum > 0 ? hNorm(mv) : null;
 
-  // Charm by DTE bucket
-  const cb = [0, 7, 14, 21, 28, 35, 45];
+  // Charm by DTE bucket (range(MIN_DTE, MAX_DTE+2, 5))
+  const cb: number[] = [];
+  for (let d = MIN_DTE; d < MAX_DTE + 2; d += 5) cb.push(d);
   const cvArr = new Array(cb.length - 1).fill(0);
   for (const r of recs) {
     const charmVal =
@@ -648,7 +668,7 @@ function computeEntropy(
         ? Math.abs(r.gamma * (RISK_FREE - (r.iv * r.iv) / 2) / r.iv)
         : 0;
     for (let b = 0; b < cb.length - 1; b++) {
-      if (r.dte > cb[b] && r.dte <= cb[b + 1]) {
+      if (r.dte >= cb[b] && r.dte < cb[b + 1]) {
         cvArr[b] += Math.abs(charmVal);
         break;
       }
@@ -657,10 +677,13 @@ function computeEntropy(
   const cvSum = cvArr.reduce((a: number, b: number) => a + b, 0);
   m.H_charm_n = cvSum > 0 ? hNorm(cvArr) : null;
 
-  // IV mean (near-term ATM)
-  const nearRecs = recs.filter((r) => r.dte >= 7 && r.dte <= 45);
-  const ivs = nearRecs.filter((r) => r.iv > 0).map((r) => r.iv);
-  m.iv_mean = ivs.length > 5 ? mean(ivs) : null;
+  // IV mean (ATM near-term, fallback to all)
+  const atmNear = recs.filter((r) => r.moneyness >= 0.97 && r.moneyness <= 1.03 && r.dte <= 30);
+  if (atmNear.length > 0) {
+    m.iv_mean = mean(atmNear.map((r) => r.iv));
+  } else {
+    m.iv_mean = mean(recs.map((r) => r.iv));
+  }
 
   // Put skew
   const nearPuts = recs.filter((r) => !r.is_call && r.dte >= 14 && r.dte <= 45);
@@ -668,7 +691,7 @@ function computeEntropy(
     .filter((r) => r.moneyness >= 0.98 && r.moneyness <= 1.02)
     .map((r) => r.iv);
   const otmPutIvs = nearPuts
-    .filter((r) => r.moneyness >= 0.90 && r.moneyness < 0.97)
+    .filter((r) => r.moneyness >= 0.90 && r.moneyness <= 0.95)
     .map((r) => r.iv);
   const atmIv = atmPutIvs.length > 0 ? mean(atmPutIvs) : NaN;
   const otmIv = otmPutIvs.length > 0 ? mean(otmPutIvs) : NaN;
@@ -685,16 +708,16 @@ function computeEntropy(
   m.pcr_vol = cvol > 0 ? pvol / cvol : null;
 
   // Composites
-  const cvComps = [m.H_vol_term_n, m.H_prem_term_n, m.H_vol_k_n, m.H_vegavol_n].filter(
+  const cvComps = [m.H_vol_term_n, m.H_vol_k_n, m.H_prem_term_n, m.H_dflow_n].filter(
     (v): v is number => v !== null,
   );
   m.comp_volume = cvComps.length > 0 ? mean(cvComps) : null;
 
   const cgComps = [
-    m.H_gvx_n,
-    m.H_dflow_n,
     m.H_vegavol_n,
     m.H_dgamma_n,
+    m.H_gvx_n,
+    m.H_spread_k_n,
     m.H_charm_n,
   ].filter((v): v is number => v !== null);
   m.comp_greek = cgComps.length > 0 ? mean(cgComps) : null;
@@ -769,77 +792,92 @@ function diff(history: HistoryEntry[], key: string, lag: number = 1): number | n
   return null;
 }
 
+function stdVal(history: HistoryEntry[], key: string): number {
+  const vals = history
+    .slice(-LOOKBACK)
+    .map((h) => h[key])
+    .filter((v): v is number => v != null && typeof v === 'number');
+  if (vals.length <= 1) return 0.01;
+  const m = vals.reduce((a, b) => a + b, 0) / vals.length;
+  return Math.sqrt(vals.reduce((a, v) => a + (v - m) ** 2, 0) / (vals.length - 1));
+}
+
+function zStrength(val: number, key: string, history: HistoryEntry[]): number {
+  const m = med(history, key);
+  const s = stdVal(history, key);
+  if (m == null || s < 1e-8) return 0.0;
+  return Math.max(0.0, Math.min(1.0, (m - val) / s / 3.0));
+}
+
 function evaluateSignals(
   metrics: EntropyMetrics,
   history: HistoryEntry[],
 ): Record<string, Signal> {
   const sigs: Record<string, Signal> = {};
+  const ep = ENTROPY_PERCENTILE;
 
   const cv = metrics.comp_volume;
-  const cvM = med(history, 'comp_volume');
   const cg = metrics.comp_greek;
-  const cgM = med(history, 'comp_greek');
   const co = metrics.composite;
-  const coM = med(history, 'composite');
   const iv = metrics.iv_mean;
-  const ivM = med(history, 'iv_mean');
   const ps = metrics.put_skew;
+  const pcr = metrics.pcr_vol;
+
+  // Percentile thresholds
+  const tCv = pct(history, 'comp_volume', ep);
+  const tCg = pct(history, 'comp_greek', ep);
+  const tCc = pct(history, 'composite', ep);
+  const tIv = pct(history, 'iv_mean', ep);
   const psM = med(history, 'put_skew');
-  const pcr = metrics.pcr_dollar;
-  const d1cv = diff(history, 'comp_volume', 1);
-
-  // Compute d1cv percentile
-  const allD1cv: number[] = [];
-  for (let i = 1; i < history.length; i++) {
-    const prev = history[i - 1].comp_volume;
-    const curr = history[i].comp_volume;
-    if (prev != null && curr != null) {
-      allD1cv.push((curr as number) - (prev as number));
-    }
-  }
-  const p20D1cv =
-    allD1cv.length >= Math.floor(LOOKBACK / 2)
-      ? percentileValue(allD1cv, 20)
-      : null;
-
-  const strength = (a: number, b: number): number => {
-    if (!b || b === 0) return 0;
-    return Math.max(0, Math.min((b - a) / Math.abs(b), 1));
-  };
+  const ivM = med(history, 'iv_mean');
 
   // S_LowVolEnt
-  if (cv != null && cvM != null) {
-    const fire = cv < cvM;
+  if (cv != null && tCv != null) {
+    const fire = cv < tCv;
+    const s = fire ? zStrength(cv, 'comp_volume', history) : 0;
     const tt = iv != null && ivM != null && iv < ivM ? 'buy_call' : 'sell_put';
     sigs.S_LowVolEnt = {
-      fire,
-      strength: fire ? strength(cv, cvM) : 0,
+      fire: fire && s >= MIN_STRENGTH,
+      strength: s,
       direction: 1,
       trade_type: tt,
-      rationale: `cv=${cv.toFixed(4)} ${fire ? '<' : '>='} ${cvM.toFixed(4)}`,
+      rationale: `cv=${cv.toFixed(4)} ${fire ? '<' : '>='} p${ep}=${tCv.toFixed(4)} s=${s.toFixed(2)}`,
     };
   }
 
-  // S_VolCollapse
-  if (d1cv != null && p20D1cv != null) {
-    const fire = d1cv < p20D1cv;
-    const s =
-      p20D1cv !== 0 && fire ? Math.max(0, Math.min(Math.abs(d1cv / p20D1cv) - 1, 1)) : 0;
-    sigs.S_VolCollapse = {
-      fire,
-      strength: s,
-      direction: 1,
-      trade_type: 'bull_call_spread',
-      rationale: `d1cv=${d1cv.toFixed(4)} ${fire ? '<' : '>='} p20=${p20D1cv.toFixed(4)}`,
-    };
+  // S_VolCollapse — drop > 85th percentile of all historical drops
+  if (history.length >= 2) {
+    const histVals = history.map((h) => h.comp_volume).filter((v): v is number => v != null);
+    const currCv = metrics.comp_volume;
+    if (histVals.length >= 2 && currCv != null) {
+      const prevCv = histVals[histVals.length - 1] as number;
+      const drop = prevCv - currCv;
+      const drops: number[] = [];
+      for (let i = 1; i < histVals.length; i++) {
+        const d = (histVals[i - 1] as number) - (histVals[i] as number);
+        if (d > 0) drops.push(d);
+      }
+      if (drops.length > 0 && drop > 0) {
+        const thresh = percentileValue(drops, VOLCOLLAPSE_PERCENTILE);
+        const fire = drop > thresh;
+        const s = fire ? Math.max(MIN_STRENGTH, Math.min(1.0, drop / (thresh + 1e-8) - 1.0)) : 0;
+        sigs.S_VolCollapse = {
+          fire: fire && s >= MIN_STRENGTH,
+          strength: s,
+          direction: 1,
+          trade_type: 'bull_call_spread',
+          rationale: `drop=${drop.toFixed(4)} ${fire ? '>' : '<='} p${VOLCOLLAPSE_PERCENTILE}=${thresh.toFixed(4)}`,
+        };
+      }
+    }
   }
 
   // S_LowEntLowIV
-  if (co != null && coM != null && iv != null && ivM != null) {
-    const fire = co < coM && iv < ivM;
-    const s = fire ? (strength(co, coM) + strength(iv, ivM)) / 2 : 0;
+  if (co != null && tCc != null && iv != null && tIv != null) {
+    const fire = co < tCc && iv < tIv;
+    const s = fire ? zStrength(co, 'composite', history) : 0;
     sigs.S_LowEntLowIV = {
-      fire,
+      fire: fire && s >= MIN_STRENGTH,
       strength: s,
       direction: 1,
       trade_type: 'buy_call_longer',
@@ -848,45 +886,44 @@ function evaluateSignals(
   }
 
   // S_LowGreekEnt
-  if (cg != null && cgM != null) {
-    const fire = cg < cgM;
+  if (cg != null && tCg != null) {
+    const fire = cg < tCg;
+    const s = fire ? zStrength(cg, 'comp_greek', history) : 0;
     sigs.S_LowGreekEnt = {
-      fire,
-      strength: fire ? strength(cg, cgM) : 0,
+      fire: fire && s >= MIN_STRENGTH,
+      strength: s,
       direction: 1,
       trade_type: 'sell_put',
-      rationale: `cg=${cg.toFixed(4)} ${fire ? '<' : '>='} ${cgM.toFixed(4)}`,
+      rationale: `cg=${cg.toFixed(4)} ${fire ? '<' : '>='} p${ep}=${tCg.toFixed(4)} s=${s.toFixed(2)}`,
     };
   }
 
-  // S_SkewFlow
-  if (cv != null && cvM != null && ps != null && psM != null) {
-    const fire = cv < cvM && ps > psM;
-    const s1 = cv < cvM ? strength(cv, cvM) : 0;
-    const s2 =
-      psM !== 0 && ps > psM ? Math.max(0, Math.min((ps - psM) / Math.abs(psM), 1)) : 0;
+  // S_SkewFlow — requires comp_volume < 30th pct AND put_skew > median AND put_skew > 0.01
+  if (cv != null && tCv != null && ps != null && psM != null) {
+    const fire = cv < tCv && ps > psM && ps > 0.01;
+    const s = fire ? zStrength(cv, 'comp_volume', history) : 0;
     sigs.S_SkewFlow = {
-      fire,
-      strength: fire ? Math.min((s1 + s2) / 2, 1) : 0,
+      fire: fire && s >= MIN_STRENGTH,
+      strength: s,
       direction: 1,
       trade_type: 'sell_put_spread',
-      rationale: `cv=${cv.toFixed(4)} sk=${ps.toFixed(4)} ${ps > psM ? '>' : '<='} med=${psM.toFixed(4)}`,
+      rationale: `cv=${cv.toFixed(4)} sk=${ps.toFixed(4)} ${psM && ps > psM ? '>' : '<='} med=${psM.toFixed(4)}`,
     };
   }
 
-  // S_PCRContrarian
+  // S_PCRContrarian — uses pcr_vol > 80th percentile
   if (pcr != null) {
-    const pcrP80 = pct(history, 'pcr_dollar', 80);
+    const pcrP80 = pct(history, 'pcr_vol', PCR_PERCENTILE);
     if (pcrP80 != null) {
       const fire = pcr > pcrP80;
-      const s =
-        pcrP80 > 0 && fire ? Math.max(0, Math.min((pcr - pcrP80) / pcrP80, 1)) : 0;
+      const pcrStd = stdVal(history, 'pcr_vol');
+      const s = fire ? Math.min(1.0, (pcr - pcrP80) / (pcrStd + 1e-8)) : 0;
       sigs.S_PCRContrarian = {
-        fire,
+        fire: fire && s >= MIN_STRENGTH,
         strength: s,
         direction: 1,
         trade_type: 'sell_put',
-        rationale: `pcr=${pcr.toFixed(4)} ${fire ? '>' : '<='} p80=${pcrP80.toFixed(4)}`,
+        rationale: `pcr_vol=${pcr.toFixed(4)} ${fire ? '>' : '<='} p${PCR_PERCENTILE}=${pcrP80.toFixed(4)}`,
       };
     }
   }
@@ -1036,11 +1073,11 @@ async function managePositions(
     if (pos.is_credit) {
       const credit = Math.abs(entryCost);
       if (credit > 0) {
-        if (pnl >= credit * PROFIT_PCT) {
+        if (pnl >= credit * PROFIT_TARGET_CREDIT) {
           await closePositionDb(db, pos, todayStr, 'TP', pnl);
           continue;
         }
-        if (pnl < -credit * STOP_MULT) {
+        if (pnl < credit * STOP_LOSS_CREDIT) {
           await closePositionDb(db, pos, todayStr, 'SL', pnl);
           continue;
         }
@@ -1048,12 +1085,12 @@ async function managePositions(
     } else {
       const debit = Math.abs(entryCost);
       if (debit > 0) {
-        if (pnl < -debit * (STOP_MULT - 1)) {
-          await closePositionDb(db, pos, todayStr, 'SL', pnl);
+        if (pnl >= debit * PROFIT_TARGET_DEBIT) {
+          await closePositionDb(db, pos, todayStr, 'TP', pnl);
           continue;
         }
-        if (pnl >= debit * 1.0) {
-          await closePositionDb(db, pos, todayStr, 'TP', pnl);
+        if (pnl < debit * STOP_LOSS_DEBIT) {
+          await closePositionDb(db, pos, todayStr, 'SL', pnl);
           continue;
         }
       }

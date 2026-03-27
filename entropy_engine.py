@@ -38,15 +38,30 @@ RISK_FREE     = 0.05
 MIN_DTE       = 14
 MAX_DTE       = 45
 TARGET_DTE    = 28
-MAX_ALLOC     = 0.12
-MAX_CONTRACTS = 25
 CLOSE_DTE     = 5
-PROFIT_PCT    = 0.50
-STOP_MULT     = 2.0
 WARMUP_DAYS   = 30
-MAX_LONG_CALLS = 2
-SPREAD_FILTER = 0.15
 INITIAL_CASH  = 100_000
+SPREAD_FILTER = 0.15
+
+# Position sizing
+BASE_ALLOC    = 0.06
+MAX_ALLOC     = 0.14
+MAX_CONTRACTS = 20
+MAX_POSITIONS = 8
+MAX_PER_SIGNAL_TYPE = 3
+MAX_LONG_CALLS = 2
+
+# Signal thresholds
+ENTROPY_PERCENTILE = 30
+VOLCOLLAPSE_PERCENTILE = 85
+PCR_PERCENTILE = 80
+MIN_STRENGTH   = 0.20
+
+# Exit rules
+PROFIT_TARGET_DEBIT  = 0.80
+PROFIT_TARGET_CREDIT = 0.50
+STOP_LOSS_DEBIT      = -0.60
+STOP_LOSS_CREDIT     = -1.50
 
 TRADIER_TOKEN    = os.environ.get("TRADIER_TOKEN", "")
 TRADIER_ACCOUNT  = os.environ.get("TRADIER_ACCOUNT", "")
@@ -377,7 +392,7 @@ def compute_entropy(contracts: List[Dict], spot: float) -> Optional[Dict]:
     # Dollar gamma by strike
     dg = {}
     for r in recs:
-        dg[r["strike"]] = dg.get(r["strike"], 0) + abs(r["gamma"]) * spot * spot * 0.01
+        dg[r["strike"]] = dg.get(r["strike"], 0) + abs(r["gamma"]) * r["volume"] * spot * 100
     da = np.array(list(dg.values()))
     if da.sum() > 0:
         sd = np.sort(da)[::-1]
@@ -404,15 +419,16 @@ def compute_entropy(contracts: List[Dict], spot: float) -> Optional[Dict]:
                 break
     m["H_dflow_n"] = h_norm(dflow) if dflow.sum() > 0 else None
 
-    # Spread by strike
-    sp = {}
+    # Spread liquidity by strike (volume / spread)
+    sl = {}
     for r in recs:
-        sp[r["strike"]] = sp.get(r["strike"], 0) + r["spread"]
-    sps = np.abs(np.array(list(sp.values())))
-    m["H_spread_k_n"] = h_norm(sps) if sps.sum() > 0 else None
+        if r["spread"] > 0 and r["volume"] > 0:
+            sl[r["strike"]] = sl.get(r["strike"], 0) + r["volume"] / r["spread"]
+    sps = np.array(list(sl.values())) if sl else np.array([])
+    m["H_spread_k_n"] = h_norm(sps) if len(sps) > 0 and sps.sum() > 0 else 0.5
 
     # Moneyness buckets
-    mb = [0.85, 0.90, 0.95, 0.97, 1.0, 1.03, 1.05, 1.10, 1.15]
+    mb = [0.85 + i * 0.02 for i in range(16)]
     mv = np.zeros(len(mb) - 1)
     for r in recs:
         for b in range(len(mb) - 1):
@@ -421,26 +437,28 @@ def compute_entropy(contracts: List[Dict], spot: float) -> Optional[Dict]:
                 break
     m["H_moneyness_n"] = h_norm(mv) if mv.sum() > 0 else None
 
-    # Charm by DTE bucket
-    cb = [0, 7, 14, 21, 28, 35, 45]
+    # Charm by DTE bucket (range(MIN_DTE, MAX_DTE+2, 5))
+    cb = list(range(MIN_DTE, MAX_DTE + 2, 5))
     cv_arr = np.zeros(len(cb) - 1)
     for r in recs:
         charm = abs(r["gamma"] * (RISK_FREE - r["iv"] ** 2 / 2) / r["iv"]) if r["iv"] > 0 else 0
         for b in range(len(cb) - 1):
-            if cb[b] < r["dte"] <= cb[b + 1]:
+            if cb[b] <= r["dte"] < cb[b + 1]:
                 cv_arr[b] += abs(charm)
                 break
     m["H_charm_n"] = h_norm(cv_arr) if cv_arr.sum() > 0 else None
 
-    # IV mean (near-term ATM)
-    near = [r for r in recs if 7 <= r["dte"] <= 45]
-    ivs = [r["iv"] for r in near if r["iv"] > 0]
-    m["iv_mean"] = float(np.mean(ivs)) if len(ivs) > 5 else None
+    # IV mean (ATM near-term, fallback to all)
+    atm_near = [r for r in recs if 0.97 <= r["moneyness"] <= 1.03 and r["dte"] <= 30]
+    if atm_near:
+        m["iv_mean"] = float(np.mean([r["iv"] for r in atm_near]))
+    else:
+        m["iv_mean"] = float(np.mean([r["iv"] for r in recs]))
 
     # Put skew
     near_puts = [r for r in recs if not r["is_call"] and 14 <= r["dte"] <= 45]
     atm_iv = np.mean([r["iv"] for r in near_puts if 0.98 <= r["moneyness"] <= 1.02])
-    otm_iv = np.mean([r["iv"] for r in near_puts if 0.90 <= r["moneyness"] < 0.97])
+    otm_iv = np.mean([r["iv"] for r in near_puts if 0.90 <= r["moneyness"] <= 0.95])
     m["put_skew"] = float(otm_iv - atm_iv) if not (np.isnan(atm_iv) or np.isnan(otm_iv)) else None
 
     # PCR
@@ -454,12 +472,12 @@ def compute_entropy(contracts: List[Dict], spot: float) -> Optional[Dict]:
     m["pcr_vol"] = float(pvol / cvol) if cvol > 0 else None
 
     # Composites
-    cv_vals = [v for v in [m.get("H_vol_term_n"), m.get("H_prem_term_n"),
-                            m.get("H_vol_k_n"), m.get("H_vegavol_n")] if v is not None]
+    cv_vals = [v for v in [m.get("H_vol_term_n"), m.get("H_vol_k_n"),
+                            m.get("H_prem_term_n"), m.get("H_dflow_n")] if v is not None]
     m["comp_volume"] = float(np.mean(cv_vals)) if cv_vals else None
 
-    cg_vals = [v for v in [m.get("H_gvx_n"), m.get("H_dflow_n"), m.get("H_vegavol_n"),
-                            m.get("H_dgamma_n"), m.get("H_charm_n")] if v is not None]
+    cg_vals = [v for v in [m.get("H_vegavol_n"), m.get("H_dgamma_n"), m.get("H_gvx_n"),
+                            m.get("H_spread_k_n"), m.get("H_charm_n")] if v is not None]
     m["comp_greek"] = float(np.mean(cg_vals)) if cg_vals else None
 
     all_vals = [v for v in [m.get("H_vol_term_n"), m.get("H_vol_k_n"),
@@ -500,95 +518,122 @@ def diff(history: List[Dict], key: str, lag: int = 1) -> Optional[float]:
         return vals[-1] - vals[-1 - lag]
     return None
 
+def std_val(history: List[Dict], key: str) -> float:
+    """Standard deviation of a metric over history."""
+    vals = [h[key] for h in history[-LOOKBACK:] if h.get(key) is not None]
+    return float(np.std(vals)) if len(vals) > 1 else 0.01
+
+def zstrength(val: float, key: str, history: List[Dict]) -> float:
+    """Z-score based strength: (median - val) / std / 3.0, clamped [0, 1]."""
+    m = med(history, key)
+    s = std_val(history, key)
+    if m is None or s < 1e-8:
+        return 0.0
+    return max(0.0, min(1.0, (m - val) / s / 3.0))
+
 def evaluate_signals(metrics: Dict, history: List[Dict]) -> Dict[str, Dict]:
-    """Evaluate all 6 strategies. Returns dict of signal dicts."""
+    """Evaluate all 6 strategies — v2 logic with percentile thresholds + Z-score strength."""
     sigs = {}
+    ep = ENTROPY_PERCENTILE
 
     cv = metrics.get("comp_volume")
-    cv_m = med(history, "comp_volume")
     cg = metrics.get("comp_greek")
-    cg_m = med(history, "comp_greek")
     co = metrics.get("composite")
-    co_m = med(history, "composite")
     iv = metrics.get("iv_mean")
-    iv_m = med(history, "iv_mean")
     ps = metrics.get("put_skew")
+    pcr = metrics.get("pcr_vol")
+
+    # Percentile thresholds
+    t_cv = pct(history, "comp_volume", ep)
+    t_cg = pct(history, "comp_greek", ep)
+    t_cc = pct(history, "composite", ep)
+    t_iv = pct(history, "iv_mean", ep)
     ps_m = med(history, "put_skew")
-    pcr = metrics.get("pcr_dollar")
-    d1cv = diff(history, "comp_volume", 1)
-
-    # Compute d1cv percentile
-    all_d1cv = []
-    for i in range(1, len(history)):
-        prev = history[i - 1].get("comp_volume")
-        curr = history[i].get("comp_volume")
-        if prev is not None and curr is not None:
-            all_d1cv.append(curr - prev)
-    p20_d1cv = float(np.percentile(all_d1cv, 20)) if len(all_d1cv) >= LOOKBACK // 2 else None
-
-    def strength(a, b):
-        return max(0, min((b - a) / abs(b), 1)) if b and b != 0 else 0
+    iv_m = med(history, "iv_mean")
 
     # S_LowVolEnt
-    if cv is not None and cv_m is not None:
-        fire = cv < cv_m
+    if cv is not None and t_cv is not None:
+        fire = cv < t_cv
+        s = zstrength(cv, "comp_volume", history) if fire else 0
         tt = "buy_call" if (iv and iv_m and iv < iv_m) else "sell_put"
         sigs["S_LowVolEnt"] = {
-            "fire": fire, "strength": strength(cv, cv_m) if fire else 0,
+            "fire": fire and s >= MIN_STRENGTH, "strength": s,
             "direction": 1, "trade_type": tt,
-            "rationale": f"cv={cv:.4f} {'<' if fire else '>='} {cv_m:.4f}"
+            "rationale": f"cv={cv:.4f} {'<' if fire else '>='} p{ep}={t_cv:.4f} s={s:.2f}"
         }
 
-    # S_VolCollapse
-    if d1cv is not None and p20_d1cv is not None:
-        fire = d1cv < p20_d1cv
-        s = max(0, min(abs(d1cv / p20_d1cv) - 1, 1)) if p20_d1cv != 0 and fire else 0
-        sigs["S_VolCollapse"] = {
-            "fire": fire, "strength": s, "direction": 1,
-            "trade_type": "bull_call_spread",
-            "rationale": f"d1cv={d1cv:.4f} {'<' if fire else '>='} p20={p20_d1cv:.4f}"
-        }
+    # S_VolCollapse — drop > 85th percentile of all historical drops
+    if len(history) >= 2:
+        prev_cv = None
+        for h in reversed(history):
+            v = h.get("comp_volume")
+            if v is not None:
+                if prev_cv is None:
+                    prev_cv = v
+                else:
+                    prev_cv = v
+                    break
+        curr_cv = metrics.get("comp_volume")
+        if prev_cv is not None and curr_cv is not None:
+            drop = prev_cv - curr_cv
+            drops = []
+            hist_vals = [h.get("comp_volume") for h in history]
+            for i in range(1, len(hist_vals)):
+                if hist_vals[i-1] is not None and hist_vals[i] is not None:
+                    d = hist_vals[i-1] - hist_vals[i]
+                    if d > 0:
+                        drops.append(d)
+            if drops and drop > 0:
+                thresh = float(np.percentile(drops, VOLCOLLAPSE_PERCENTILE))
+                fire = drop > thresh
+                s = max(MIN_STRENGTH, min(1.0, drop / (thresh + 1e-8) - 1.0)) if fire else 0
+                sigs["S_VolCollapse"] = {
+                    "fire": fire and s >= MIN_STRENGTH, "strength": s,
+                    "direction": 1, "trade_type": "bull_call_spread",
+                    "rationale": f"drop={drop:.4f} {'>' if fire else '<='} p{VOLCOLLAPSE_PERCENTILE}={thresh:.4f}"
+                }
 
     # S_LowEntLowIV
-    if co is not None and co_m is not None and iv is not None and iv_m is not None:
-        fire = co < co_m and iv < iv_m
-        s = (strength(co, co_m) + strength(iv, iv_m)) / 2 if fire else 0
+    if co is not None and t_cc is not None and iv is not None and t_iv is not None:
+        fire = co < t_cc and iv < t_iv
+        s = zstrength(co, "composite", history) if fire else 0
         sigs["S_LowEntLowIV"] = {
-            "fire": fire, "strength": s, "direction": 1,
-            "trade_type": "buy_call_longer",
+            "fire": fire and s >= MIN_STRENGTH, "strength": s,
+            "direction": 1, "trade_type": "buy_call_longer",
             "rationale": f"co={co:.4f} iv={iv:.4f}"
         }
 
     # S_LowGreekEnt
-    if cg is not None and cg_m is not None:
-        fire = cg < cg_m
+    if cg is not None and t_cg is not None:
+        fire = cg < t_cg
+        s = zstrength(cg, "comp_greek", history) if fire else 0
         sigs["S_LowGreekEnt"] = {
-            "fire": fire, "strength": strength(cg, cg_m) if fire else 0,
+            "fire": fire and s >= MIN_STRENGTH, "strength": s,
             "direction": 1, "trade_type": "sell_put",
-            "rationale": f"cg={cg:.4f} {'<' if fire else '>='} {cg_m:.4f}"
+            "rationale": f"cg={cg:.4f} {'<' if fire else '>='} p{ep}={t_cg:.4f} s={s:.2f}"
         }
 
-    # S_SkewFlow
-    if cv is not None and cv_m is not None and ps is not None and ps_m is not None:
-        fire = cv < cv_m and ps > ps_m
-        s1 = strength(cv, cv_m) if cv < cv_m else 0
-        s2 = max(0, min((ps - ps_m) / abs(ps_m), 1)) if ps_m != 0 and ps > ps_m else 0
+    # S_SkewFlow — requires comp_volume < 30th pct AND put_skew > median AND put_skew > 0.01
+    if cv is not None and t_cv is not None and ps is not None and ps_m is not None:
+        fire = cv < t_cv and ps > ps_m and ps > 0.01
+        s = zstrength(cv, "comp_volume", history) if fire else 0
         sigs["S_SkewFlow"] = {
-            "fire": fire, "strength": min((s1 + s2) / 2, 1) if fire else 0,
+            "fire": fire and s >= MIN_STRENGTH, "strength": s,
             "direction": 1, "trade_type": "sell_put_spread",
-            "rationale": f"cv={cv:.4f} sk={ps:.4f} {'>' if ps > ps_m else '<='} med={ps_m:.4f}"
+            "rationale": f"cv={cv:.4f} sk={ps:.4f} {'>' if (ps_m and ps > ps_m) else '<='} med={ps_m:.4f}"
         }
 
-    # S_PCRContrarian
+    # S_PCRContrarian — uses pcr_vol > 80th percentile
     if pcr is not None:
-        pcr_p80 = pct(history, "pcr_dollar", 80)
+        pcr_p80 = pct(history, "pcr_vol", PCR_PERCENTILE)
         if pcr_p80 is not None:
             fire = pcr > pcr_p80
-            s = max(0, min((pcr - pcr_p80) / pcr_p80, 1)) if pcr_p80 > 0 and fire else 0
+            pcr_std = std_val(history, "pcr_vol")
+            s = min(1.0, (pcr - pcr_p80) / (pcr_std + 1e-8)) if fire else 0
             sigs["S_PCRContrarian"] = {
-                "fire": fire, "strength": s, "direction": 1,
-                "trade_type": "sell_put",
-                "rationale": f"pcr={pcr:.4f} {'>' if fire else '<='} p80={pcr_p80:.4f}"
+                "fire": fire and s >= MIN_STRENGTH, "strength": s,
+                "direction": 1, "trade_type": "sell_put",
+                "rationale": f"pcr_vol={pcr:.4f} {'>' if fire else '<='} p{PCR_PERCENTILE}={pcr_p80:.4f}"
             }
 
     return sigs
@@ -690,20 +735,20 @@ def manage_positions(conn: sqlite3.Connection, today_str: str):
         if pos["is_credit"]:
             credit = abs(entry_cost)
             if credit > 0:
-                if pnl >= credit * PROFIT_PCT:
+                if pnl >= credit * PROFIT_TARGET_CREDIT:
                     close_position(conn, pos, today_str, "TP", pnl)
                     continue
-                if pnl < -credit * STOP_MULT:
+                if pnl < credit * STOP_LOSS_CREDIT:
                     close_position(conn, pos, today_str, "SL", pnl)
                     continue
         else:
             debit = abs(entry_cost)
             if debit > 0:
-                if pnl < -debit * (STOP_MULT - 1):
-                    close_position(conn, pos, today_str, "SL", pnl)
-                    continue
-                if pnl >= debit * 1.0:
+                if pnl >= debit * PROFIT_TARGET_DEBIT:
                     close_position(conn, pos, today_str, "TP", pnl)
+                    continue
+                if pnl < debit * STOP_LOSS_DEBIT:
+                    close_position(conn, pos, today_str, "SL", pnl)
                     continue
 
 def close_position(conn: sqlite3.Connection, pos, date_str: str,
