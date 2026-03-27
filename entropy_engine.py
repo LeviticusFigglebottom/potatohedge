@@ -63,6 +63,20 @@ PROFIT_TARGET_CREDIT = 0.50
 STOP_LOSS_DEBIT      = -0.60
 STOP_LOSS_CREDIT     = -1.50
 
+# Gallacher defense thresholds
+IV_STRESSED_PCT    = 80
+IV_EXTREME_PCT     = 95
+IV_STRESSED_FLOOR  = 0.18
+IV_EXTREME_FLOOR   = 0.25
+MAD_STRESSED_MULT  = 1.5
+MAD_EXTREME_MULT   = 2.5
+MAD_STRESSED_FLOOR = 0.008
+MAD_EXTREME_FLOOR  = 0.015
+MAD_WINDOW         = 10
+MAD_BASELINE_LOOKBACK = 42
+STRESSED_SIZE_MULT = 0.50
+REGIME_COOLDOWN_DAYS = 5
+
 TRADIER_TOKEN    = os.environ.get("TRADIER_TOKEN", "")
 TRADIER_ACCOUNT  = os.environ.get("TRADIER_ACCOUNT", "")
 TRADIER_BASE     = os.environ.get("TRADIER_BASE_URL", "https://sandbox.tradier.com")
@@ -138,6 +152,10 @@ def init_db(path: str) -> sqlite3.Connection:
             rationale TEXT,
             executed INTEGER DEFAULT 0,
             PRIMARY KEY (date, strategy)
+        );
+        CREATE TABLE IF NOT EXISTS regime_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
         );
     """)
     conn.commit()
@@ -659,7 +677,9 @@ def select_contract(recs: List[Dict], spot: float, tt: str,
     atm_k = min(ae, key=lambda r: abs(r["moneyness"] - 1.0))["strike"]
 
     if tt == "buy_call":
-        cs = [r for r in ca if abs(r["strike"] - atm_k) <= 2 and r["mid"] > 0]
+        cs = [r for r in ca if 0.99 <= r["moneyness"] <= 1.01 and r["mid"] > 0.10]
+        if not cs:
+            cs = [r for r in ca if abs(r["strike"] - atm_k) <= 2 and r["mid"] > 0]
         if cs:
             c = min(cs, key=lambda r: abs(r["moneyness"] - 1.0))
             if c["spread"] < c["mid"] * SPREAD_FILTER:
@@ -667,36 +687,36 @@ def select_contract(recs: List[Dict], spot: float, tt: str,
 
     elif tt == "buy_call_longer":
         lo = [r for r in avail if r["is_call"] and 25 <= r["dte"] <= 45
-              and abs(r["moneyness"] - 1.0) < 0.02 and r["mid"] > 0
+              and 0.99 <= r["moneyness"] <= 1.01 and r["mid"] > 0.10
               and r["symbol"] not in used_symbols]
         if lo:
-            c = min(lo, key=lambda r: abs(r["moneyness"] - 1.0))
+            c = min(lo, key=lambda r: abs(r["dte"] - 35))
             if c["spread"] < c["mid"] * SPREAD_FILTER:
                 return {"type": "single", "contract": c, "qty_sign": 1}
 
     elif tt == "sell_put":
-        ot = [r for r in pa if 0.955 < r["moneyness"] < 0.995 and r["mid"] > 0.10]
+        ot = [r for r in pa if 0.96 <= r["moneyness"] <= 0.98 and r["mid"] > 0.10]
         if ot:
-            c = min(ot, key=lambda r: abs(r["moneyness"] - 0.97))
+            c = min(ot, key=lambda r: abs(r["dte"] - TARGET_DTE))
             if c["spread"] < c["mid"] * SPREAD_FILTER:
                 return {"type": "single", "contract": c, "qty_sign": -1}
 
     elif tt == "bull_call_spread":
-        lc = [r for r in ca if abs(r["moneyness"] - 1.0) < 0.02 and r["mid"] > 0]
-        sc = [r for r in ca if 1.02 < r["moneyness"] < 1.05 and r["mid"] > 0]
+        lc = [r for r in ca if 0.99 <= r["moneyness"] <= 1.01 and r["mid"] > 0]
+        sc = [r for r in ca if 1.02 <= r["moneyness"] <= 1.04 and r["mid"] > 0]
         if lc and sc:
             l = min(lc, key=lambda r: abs(r["moneyness"] - 1.0))
             s = min(sc, key=lambda r: abs(r["moneyness"] - 1.03))
-            if l["mid"] > s["mid"]:
+            if l["expiry"] == s["expiry"] and l["mid"] > s["mid"]:
                 return {"type": "spread", "long": l, "short": s}
 
     elif tt == "sell_put_spread":
-        sp_list = [r for r in pa if 0.96 < r["moneyness"] < 0.995 and r["mid"] > 0.10]
-        lp = [r for r in pa if 0.935 < r["moneyness"] < 0.975 and r["mid"] > 0.05]
+        sp_list = [r for r in pa if 0.97 <= r["moneyness"] <= 0.99 and r["mid"] > 0.10]
+        lp = [r for r in pa if 0.94 <= r["moneyness"] <= 0.96 and r["mid"] > 0.05]
         if sp_list and lp:
             s = min(sp_list, key=lambda r: abs(r["moneyness"] - 0.98))
             l = min(lp, key=lambda r: abs(r["moneyness"] - 0.95))
-            if s["strike"] > l["strike"] and s["mid"] > l["mid"]:
+            if s["expiry"] == l["expiry"] and s["strike"] > l["strike"] and s["mid"] > l["mid"]:
                 return {"type": "spread", "short": s, "long": l}
 
     return None
@@ -777,6 +797,77 @@ def close_position(conn: sqlite3.Connection, pos, date_str: str,
 # ═══════════════════════════════════════════════════════════════════
 #  MAIN ENGINE LOOP
 # ═══════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════
+#  GALLACHER DEFENSE LAYER
+# ═══════════════════════════════════════════════════════════════════
+
+def assess_regime(iv_mean: float, history: List[Dict], spot_history: List[float],
+                  current_regime: str, trading_days: int, last_regime_change_day: int) -> tuple:
+    """
+    Determine vol regime from IV percentile AND absolute floors + SPY MAD.
+    Returns (new_regime, details_dict).
+    """
+    raw_regime = "NORMAL"
+    details = {"iv_check": "N/A", "mad_check": "N/A", "raw": "NORMAL"}
+
+    # IV check: percentile AND absolute floor
+    if len(history) >= LOOKBACK:
+        iv_hist = [h.get("iv_mean") for h in history[-LOOKBACK:] if h.get("iv_mean") is not None]
+        if len(iv_hist) >= LOOKBACK // 2:
+            iv_p80 = float(np.percentile(iv_hist, IV_STRESSED_PCT))
+            iv_p95 = float(np.percentile(iv_hist, IV_EXTREME_PCT))
+            if iv_mean > iv_p95 and iv_mean > IV_EXTREME_FLOOR:
+                raw_regime = "EXTREME"
+                details["iv_check"] = f"EXTREME: iv={iv_mean:.3f} > p95={iv_p95:.3f} & floor={IV_EXTREME_FLOOR}"
+            elif iv_mean > iv_p80 and iv_mean > IV_STRESSED_FLOOR:
+                raw_regime = "STRESSED"
+                details["iv_check"] = f"STRESSED: iv={iv_mean:.3f} > p80={iv_p80:.3f} & floor={IV_STRESSED_FLOOR}"
+            else:
+                details["iv_check"] = f"NORMAL: iv={iv_mean:.3f}"
+
+    # MAD check: relative AND absolute floor
+    min_closes = MAD_WINDOW + MAD_BASELINE_LOOKBACK
+    if len(spot_history) >= min_closes:
+        closes = list(spot_history)
+        returns = [abs(closes[i] / closes[i-1] - 1) for i in range(1, len(closes))]
+        if len(returns) >= MAD_WINDOW:
+            current_mad = float(np.mean(returns[-MAD_WINDOW:]))
+            mad_history = []
+            for j in range(MAD_WINDOW, len(returns)):
+                mad_history.append(float(np.mean(returns[j-MAD_WINDOW:j])))
+            baseline_len = min(len(mad_history), MAD_BASELINE_LOOKBACK)
+            if baseline_len >= LOOKBACK:
+                mad_median = float(np.median(mad_history[-baseline_len:]))
+                if mad_median > 0:
+                    mad_ratio = current_mad / mad_median
+                    if mad_ratio > MAD_EXTREME_MULT and current_mad > MAD_EXTREME_FLOOR:
+                        raw_regime = "EXTREME"
+                        details["mad_check"] = f"EXTREME: mad={current_mad:.4f} ratio={mad_ratio:.1f}x"
+                    elif (mad_ratio > MAD_STRESSED_MULT and current_mad > MAD_STRESSED_FLOOR
+                          and raw_regime != "EXTREME"):
+                        raw_regime = "STRESSED"
+                        details["mad_check"] = f"STRESSED: mad={current_mad:.4f} ratio={mad_ratio:.1f}x"
+                    else:
+                        details["mad_check"] = f"NORMAL: mad={current_mad:.4f} ratio={mad_ratio:.1f}x"
+
+    details["raw"] = raw_regime
+
+    # Sticky decay: regime can only DOWNGRADE 1 level per cooldown period
+    levels = {"NORMAL": 0, "STRESSED": 1, "EXTREME": 2}
+    current_level = levels.get(current_regime, 0)
+    raw_level = levels[raw_regime]
+
+    if raw_level >= current_level:
+        return raw_regime, details
+    else:
+        days_since = trading_days - last_regime_change_day
+        if days_since >= REGIME_COOLDOWN_DAYS:
+            new_level = max(raw_level, current_level - 1)
+            new_regime = {0: "NORMAL", 1: "STRESSED", 2: "EXTREME"}[new_level]
+            return new_regime, details
+        return current_regime, details
+
 
 def run_daily():
     """Main daily execution — call at 3:50pm ET."""
@@ -863,6 +954,52 @@ def run_daily():
         status = "★ FIRE" if sig["fire"] else "  skip"
         log.info(f"  {status} {sn}: {sig['rationale']} → {sig['trade_type']}")
 
+    # 5b. Gallacher defense — assess vol regime
+    # Load regime state from DB
+    def _get_regime_state(k, default=""):
+        row = conn.execute("SELECT value FROM regime_state WHERE key = ?", (k,)).fetchone()
+        return row["value"] if row else default
+
+    current_regime = _get_regime_state("current_regime", "NORMAL")
+    trading_days = int(_get_regime_state("trading_days", "0")) + 1
+    last_regime_change_day = int(_get_regime_state("last_regime_change_day", "0"))
+
+    # Build spot history from entropy_history
+    spot_rows = conn.execute(
+        "SELECT spot FROM entropy_history ORDER BY date DESC LIMIT ?",
+        (MAD_WINDOW + MAD_BASELINE_LOOKBACK + 5,)
+    ).fetchall()
+    spot_history = [float(r["spot"]) for r in reversed(spot_rows) if r["spot"]]
+
+    iv_mean = metrics.get("iv_mean")
+    regime = current_regime
+    regime_details = {}
+    if iv_mean is not None:
+        regime, regime_details = assess_regime(
+            iv_mean, history, spot_history, current_regime,
+            trading_days, last_regime_change_day
+        )
+
+    # Persist regime state
+    for k, v in [("current_regime", regime), ("trading_days", str(trading_days)),
+                  ("last_regime_change_day",
+                   str(trading_days if regime != current_regime else last_regime_change_day))]:
+        conn.execute("INSERT OR REPLACE INTO regime_state (key, value) VALUES (?, ?)", (k, v))
+    conn.commit()
+
+    # Store regime in metrics for API/UI
+    store["regime"] = regime
+    store["regime_details"] = json.dumps(regime_details)
+    conn.execute(
+        "UPDATE entropy_history SET metrics_json = ? WHERE date = ?",
+        (json.dumps(store), today_str)
+    )
+    conn.commit()
+
+    log.info(f"[GALLACHER] Regime: {regime} | {regime_details.get('iv_check', '')} | {regime_details.get('mad_check', '')}")
+
+    is_credit = lambda tt: tt in ("sell_put", "sell_put_spread")
+
     # 6. Get active strategies (open positions)
     active_strats = set()
     open_positions = conn.execute("SELECT DISTINCT strategy FROM positions WHERE is_open = 1").fetchall()
@@ -883,19 +1020,33 @@ def run_daily():
     ).fetchall()
     active_lc_strats = set(r["strategy"] for r in active_lc)
 
-    # 7. Execute actionable signals
+    # 7. Execute actionable signals — strength-based allocation (v2)
     actionable = [sn for sn in firing if sn not in active_strats]
     if actionable:
         pv = get_paper_account_value()
-        avail = pv * 0.95  # Keep 5% buffer
-        alloc = min(avail / len(actionable), pv * MAX_ALLOC)
-        max_contracts = min(max(8, int(pv / 12500)), MAX_CONTRACTS)
 
-        log.info(f"PV=${pv:,.0f} alloc=${alloc:,.0f}/strat max_contracts={max_contracts}")
+        log.info(f"PV=${pv:,.0f} open={len(active_strats)}/{MAX_POSITIONS}")
 
         recs = metrics.get("_chain", [])
         for sn in sorted(actionable, key=lambda x: firing[x]["strength"], reverse=True):
             sig = firing[sn]
+
+            # Position limit checks
+            if len(active_strats) >= MAX_POSITIONS:
+                log.info(f"  ✗ {sn}: max positions ({MAX_POSITIONS})")
+                break
+
+            # Per-signal-type limit
+            same_type = sum(1 for s in active_strats
+                           if any(r["strategy"] == s for r in conn.execute(
+                               "SELECT strategy FROM positions WHERE is_open = 1 AND strategy = ?", (s,)
+                           ).fetchall()))
+            same_signal = conn.execute(
+                "SELECT COUNT(*) as cnt FROM positions WHERE is_open = 1 AND strategy = ?", (sn,)
+            ).fetchone()
+            if same_signal and same_signal["cnt"] >= MAX_PER_SIGNAL_TYPE:
+                log.info(f"  ✗ {sn}: per-signal cap ({MAX_PER_SIGNAL_TYPE})")
+                continue
 
             # Long-call cap
             if sig["trade_type"] in long_call_types:
@@ -911,13 +1062,29 @@ def run_daily():
             if selection["type"] == "single":
                 c = selection["contract"]
                 qs = selection["qty_sign"]
-                prem = c["mid"] * 100
-                if qs > 0:
-                    n = max(1, int(alloc / prem))
+                # Strength-based allocation: alloc = BASE + (MAX - BASE) × strength
+                alloc_pct = BASE_ALLOC + (MAX_ALLOC - BASE_ALLOC) * sig["strength"]
+                budget = pv * alloc_pct
+                net_cost = c["mid"] * qs * 100
+                if net_cost == 0:
+                    continue
+                if net_cost > 0:
+                    n = int(budget / net_cost)
                 else:
-                    margin = max(prem * 3, c["strike"] * 100 * 0.15)
-                    n = max(1, int(alloc / margin))
-                n = min(n, max_contracts)
+                    margin_per = abs(net_cost) * 2
+                    n = int(budget / margin_per) if margin_per > 0 else 0
+                n = max(1, min(n, MAX_CONTRACTS))
+
+                # [GALLACHER] Regime filter on credit trades
+                if is_credit(sig["trade_type"]):
+                    if regime == "EXTREME":
+                        log.info(f"  ✗ {sn}: EXTREME regime — credit entry blocked")
+                        continue
+                    elif regime == "STRESSED":
+                        original_n = n
+                        n = max(1, int(n * STRESSED_SIZE_MULT))
+                        if n < original_n:
+                            log.info(f"  ⚠ {sn}: STRESSED regime — credit reduced {original_n}→{n}")
 
                 qty = n * qs
                 side = "sell_to_open" if qs < 0 else "buy_to_open"

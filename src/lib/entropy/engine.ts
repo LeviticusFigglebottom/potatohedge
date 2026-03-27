@@ -61,6 +61,20 @@ const PROFIT_TARGET_CREDIT = 0.50;
 const STOP_LOSS_DEBIT = -0.60;
 const STOP_LOSS_CREDIT = -1.50;
 
+// Gallacher defense thresholds
+const IV_STRESSED_PCT = 80;
+const IV_EXTREME_PCT = 95;
+const IV_STRESSED_FLOOR = 0.18;
+const IV_EXTREME_FLOOR = 0.25;
+const MAD_STRESSED_MULT = 1.5;
+const MAD_EXTREME_MULT = 2.5;
+const MAD_STRESSED_FLOOR = 0.008;
+const MAD_EXTREME_FLOOR = 0.015;
+const MAD_WINDOW = 10;
+const MAD_BASELINE_LOOKBACK = 42;
+const STRESSED_SIZE_MULT = 0.50;
+const REGIME_COOLDOWN_DAYS = 5;
+
 const TRADIER_BASE_URL = 'https://api.tradier.com/v1';
 const FETCH_TIMEOUT = 12_000;
 
@@ -211,6 +225,7 @@ export interface RunResult {
   signalsFired?: string[];
   tradesExecuted?: string[];
   portfolioValue?: number;
+  regime?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -308,7 +323,112 @@ function initDb(db: BetterSqlite3Database): void {
       executed INTEGER DEFAULT 0,
       PRIMARY KEY (date, strategy)
     );
+    CREATE TABLE IF NOT EXISTS regime_state (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
   `);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  GALLACHER DEFENSE LAYER
+// ═══════════════════════════════════════════════════════════════════
+
+interface RegimeDetails {
+  iv_check: string;
+  mad_check: string;
+  raw: string;
+}
+
+function assessRegime(
+  ivMean: number,
+  history: HistoryEntry[],
+  spotHistory: number[],
+  currentRegime: string,
+  tradingDays: number,
+  lastRegimeChangeDay: number,
+): { regime: string; details: RegimeDetails } {
+  let rawRegime = 'NORMAL';
+  const details: RegimeDetails = { iv_check: 'N/A', mad_check: 'N/A', raw: 'NORMAL' };
+
+  // IV check: percentile AND absolute floor
+  if (history.length >= LOOKBACK) {
+    const ivHist = history
+      .slice(-LOOKBACK)
+      .map((h) => h.iv_mean)
+      .filter((v): v is number => v != null && typeof v === 'number');
+    if (ivHist.length >= Math.floor(LOOKBACK / 2)) {
+      const ivP80 = percentileValue(ivHist, IV_STRESSED_PCT);
+      const ivP95 = percentileValue(ivHist, IV_EXTREME_PCT);
+      if (ivMean > ivP95 && ivMean > IV_EXTREME_FLOOR) {
+        rawRegime = 'EXTREME';
+        details.iv_check = `EXTREME: iv=${ivMean.toFixed(3)} > p95=${ivP95.toFixed(3)} & floor=${IV_EXTREME_FLOOR}`;
+      } else if (ivMean > ivP80 && ivMean > IV_STRESSED_FLOOR) {
+        rawRegime = 'STRESSED';
+        details.iv_check = `STRESSED: iv=${ivMean.toFixed(3)} > p80=${ivP80.toFixed(3)} & floor=${IV_STRESSED_FLOOR}`;
+      } else {
+        details.iv_check = `NORMAL: iv=${ivMean.toFixed(3)}`;
+      }
+    }
+  }
+
+  // MAD check: relative AND absolute floor
+  const minCloses = MAD_WINDOW + MAD_BASELINE_LOOKBACK;
+  if (spotHistory.length >= minCloses) {
+    const returns: number[] = [];
+    for (let i = 1; i < spotHistory.length; i++) {
+      returns.push(Math.abs(spotHistory[i] / spotHistory[i - 1] - 1));
+    }
+    if (returns.length >= MAD_WINDOW) {
+      const currentMad = returns.slice(-MAD_WINDOW).reduce((a, b) => a + b, 0) / MAD_WINDOW;
+      const madHistory: number[] = [];
+      for (let j = MAD_WINDOW; j < returns.length; j++) {
+        madHistory.push(returns.slice(j - MAD_WINDOW, j).reduce((a, b) => a + b, 0) / MAD_WINDOW);
+      }
+      const baselineLen = Math.min(madHistory.length, MAD_BASELINE_LOOKBACK);
+      if (baselineLen >= LOOKBACK) {
+        const madSlice = madHistory.slice(-baselineLen).sort((a, b) => a - b);
+        const mid = Math.floor(madSlice.length / 2);
+        const madMedian =
+          madSlice.length % 2 === 0 ? (madSlice[mid - 1] + madSlice[mid]) / 2 : madSlice[mid];
+        if (madMedian > 0) {
+          const madRatio = currentMad / madMedian;
+          if (madRatio > MAD_EXTREME_MULT && currentMad > MAD_EXTREME_FLOOR) {
+            rawRegime = 'EXTREME';
+            details.mad_check = `EXTREME: mad=${currentMad.toFixed(4)} ratio=${madRatio.toFixed(1)}x`;
+          } else if (
+            madRatio > MAD_STRESSED_MULT &&
+            currentMad > MAD_STRESSED_FLOOR &&
+            rawRegime !== 'EXTREME'
+          ) {
+            rawRegime = 'STRESSED';
+            details.mad_check = `STRESSED: mad=${currentMad.toFixed(4)} ratio=${madRatio.toFixed(1)}x`;
+          } else {
+            details.mad_check = `NORMAL: mad=${currentMad.toFixed(4)} ratio=${madRatio.toFixed(1)}x`;
+          }
+        }
+      }
+    }
+  }
+
+  details.raw = rawRegime;
+
+  // Sticky decay: regime can only DOWNGRADE 1 level per cooldown period
+  const levels: Record<string, number> = { NORMAL: 0, STRESSED: 1, EXTREME: 2 };
+  const currentLevel = levels[currentRegime] ?? 0;
+  const rawLevel = levels[rawRegime];
+
+  if (rawLevel >= currentLevel) {
+    return { regime: rawRegime, details };
+  } else {
+    const daysSince = tradingDays - lastRegimeChangeDay;
+    if (daysSince >= REGIME_COOLDOWN_DAYS) {
+      const newLevel = Math.max(rawLevel, currentLevel - 1);
+      const levelNames: Record<number, string> = { 0: 'NORMAL', 1: 'STRESSED', 2: 'EXTREME' };
+      return { regime: levelNames[newLevel], details };
+    }
+    return { regime: currentRegime, details };
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -955,7 +1075,10 @@ function selectContract(
   ).strike;
 
   if (tt === 'buy_call') {
-    const cs = ca.filter((r) => Math.abs(r.strike - atmK) <= 2 && r.mid > 0);
+    let cs = ca.filter((r) => r.moneyness >= 0.99 && r.moneyness <= 1.01 && r.mid > 0.10);
+    if (cs.length === 0) {
+      cs = ca.filter((r) => Math.abs(r.strike - atmK) <= 2 && r.mid > 0);
+    }
     if (cs.length > 0) {
       const c = cs.reduce((best, r) =>
         Math.abs(r.moneyness - 1.0) < Math.abs(best.moneyness - 1.0) ? r : best,
@@ -970,13 +1093,14 @@ function selectContract(
         r.is_call &&
         r.dte >= 25 &&
         r.dte <= 45 &&
-        Math.abs(r.moneyness - 1.0) < 0.02 &&
-        r.mid > 0 &&
+        r.moneyness >= 0.99 &&
+        r.moneyness <= 1.01 &&
+        r.mid > 0.10 &&
         !usedSymbols.has(r.symbol),
     );
     if (lo.length > 0) {
       const c = lo.reduce((best, r) =>
-        Math.abs(r.moneyness - 1.0) < Math.abs(best.moneyness - 1.0) ? r : best,
+        Math.abs(r.dte - 35) < Math.abs(best.dte - 35) ? r : best,
       );
       if (c.spread < c.mid * SPREAD_FILTER) {
         return { type: 'single', contract: c, qty_sign: 1 };
@@ -984,19 +1108,19 @@ function selectContract(
     }
   } else if (tt === 'sell_put') {
     const ot = pa.filter(
-      (r) => r.moneyness > 0.955 && r.moneyness < 0.995 && r.mid > 0.10,
+      (r) => r.moneyness >= 0.96 && r.moneyness <= 0.98 && r.mid > 0.10,
     );
     if (ot.length > 0) {
       const c = ot.reduce((best, r) =>
-        Math.abs(r.moneyness - 0.97) < Math.abs(best.moneyness - 0.97) ? r : best,
+        Math.abs(r.dte - TARGET_DTE) < Math.abs(best.dte - TARGET_DTE) ? r : best,
       );
       if (c.spread < c.mid * SPREAD_FILTER) {
         return { type: 'single', contract: c, qty_sign: -1 };
       }
     }
   } else if (tt === 'bull_call_spread') {
-    const lc = ca.filter((r) => Math.abs(r.moneyness - 1.0) < 0.02 && r.mid > 0);
-    const sc = ca.filter((r) => r.moneyness > 1.02 && r.moneyness < 1.05 && r.mid > 0);
+    const lc = ca.filter((r) => r.moneyness >= 0.99 && r.moneyness <= 1.01 && r.mid > 0);
+    const sc = ca.filter((r) => r.moneyness >= 1.02 && r.moneyness <= 1.04 && r.mid > 0);
     if (lc.length > 0 && sc.length > 0) {
       const l = lc.reduce((best, r) =>
         Math.abs(r.moneyness - 1.0) < Math.abs(best.moneyness - 1.0) ? r : best,
@@ -1004,16 +1128,16 @@ function selectContract(
       const s = sc.reduce((best, r) =>
         Math.abs(r.moneyness - 1.03) < Math.abs(best.moneyness - 1.03) ? r : best,
       );
-      if (l.mid > s.mid) {
+      if (l.expiry === s.expiry && l.mid > s.mid) {
         return { type: 'spread', long: l, short: s };
       }
     }
   } else if (tt === 'sell_put_spread') {
     const spList = pa.filter(
-      (r) => r.moneyness > 0.96 && r.moneyness < 0.995 && r.mid > 0.10,
+      (r) => r.moneyness >= 0.97 && r.moneyness <= 0.99 && r.mid > 0.10,
     );
     const lp = pa.filter(
-      (r) => r.moneyness > 0.935 && r.moneyness < 0.975 && r.mid > 0.05,
+      (r) => r.moneyness >= 0.94 && r.moneyness <= 0.96 && r.mid > 0.05,
     );
     if (spList.length > 0 && lp.length > 0) {
       const s = spList.reduce((best, r) =>
@@ -1022,7 +1146,7 @@ function selectContract(
       const l = lp.reduce((best, r) =>
         Math.abs(r.moneyness - 0.95) < Math.abs(best.moneyness - 0.95) ? r : best,
       );
-      if (s.strike > l.strike && s.mid > l.mid) {
+      if (s.expiry === l.expiry && s.strike > l.strike && s.mid > l.mid) {
         return { type: 'spread', short: s, long: l };
       }
     }
@@ -1288,6 +1412,59 @@ export async function runEntropyEngine(): Promise<RunResult> {
       if (v.fire) firing[k] = v;
     }
 
+    // 5b. Gallacher defense — assess vol regime
+    const getRegimeState = (k: string, def: string): string => {
+      const row = db.prepare('SELECT value FROM regime_state WHERE key = ?').get(k) as
+        | { value: string }
+        | undefined;
+      return row?.value ?? def;
+    };
+
+    const prevRegime = getRegimeState('current_regime', 'NORMAL');
+    const tradingDays = parseInt(getRegimeState('trading_days', '0'), 10) + 1;
+    const lastRegimeChangeDay = parseInt(getRegimeState('last_regime_change_day', '0'), 10);
+
+    // Build spot history from entropy_history
+    const spotRows = db
+      .prepare(
+        'SELECT spot FROM entropy_history ORDER BY date DESC LIMIT ?',
+      )
+      .all(MAD_WINDOW + MAD_BASELINE_LOOKBACK + 5) as { spot: number }[];
+    const spotHistory = spotRows.filter((r) => r.spot).map((r) => r.spot).reverse();
+
+    const ivMeanVal = metrics.iv_mean;
+    let regime = prevRegime;
+    let regimeDetails: RegimeDetails = { iv_check: 'N/A', mad_check: 'N/A', raw: 'NORMAL' };
+    if (ivMeanVal != null) {
+      const result = assessRegime(
+        ivMeanVal, history, spotHistory, prevRegime,
+        tradingDays, lastRegimeChangeDay,
+      );
+      regime = result.regime;
+      regimeDetails = result.details;
+    }
+
+    // Persist regime state
+    const setRegimeState = (k: string, v: string) => {
+      db.prepare('INSERT OR REPLACE INTO regime_state (key, value) VALUES (?, ?)').run(k, v);
+    };
+    setRegimeState('current_regime', regime);
+    setRegimeState('trading_days', String(tradingDays));
+    setRegimeState(
+      'last_regime_change_day',
+      regime !== prevRegime ? String(tradingDays) : String(lastRegimeChangeDay),
+    );
+
+    // Store regime in metrics for API/UI
+    (store as Record<string, unknown>).regime = regime;
+    (store as Record<string, unknown>).regime_details = JSON.stringify(regimeDetails);
+    db.prepare('UPDATE entropy_history SET metrics_json = ? WHERE date = ?').run(
+      JSON.stringify(store),
+      todayStr,
+    );
+
+    const isCredit = (tt: string) => tt === 'sell_put' || tt === 'sell_put_spread';
+
     // 6. Get active strategies
     const activeStrats = new Set<string>();
     const openPositions = db
@@ -1310,7 +1487,7 @@ export async function runEntropyEngine(): Promise<RunResult> {
       .all('buy_call', 'buy_call_longer', 'bull_call_spread') as { strategy: string }[];
     const activeLcStrats = new Set(activeLc.map((r) => r.strategy));
 
-    // 7. Execute actionable signals
+    // 7. Execute actionable signals — strength-based allocation (v2)
     const tradesExecuted: string[] = [];
     const actionable = Object.keys(firing).filter((sn) => !activeStrats.has(sn));
 
@@ -1322,9 +1499,6 @@ export async function runEntropyEngine(): Promise<RunResult> {
       } catch {
         pv = INITIAL_CASH;
       }
-      const avail = pv * 0.95;
-      const alloc = Math.min(avail / actionable.length, pv * MAX_ALLOC);
-      const maxContracts = Math.min(Math.max(8, Math.floor(pv / 12500)), MAX_CONTRACTS);
 
       const recs = metrics._chain;
       const sorted = [...actionable].sort(
@@ -1333,6 +1507,15 @@ export async function runEntropyEngine(): Promise<RunResult> {
 
       for (const sn of sorted) {
         const sig = firing[sn];
+
+        // Position limit checks
+        if (activeStrats.size >= MAX_POSITIONS) break;
+
+        // Per-signal-type limit
+        const sameSignal = db
+          .prepare('SELECT COUNT(*) as cnt FROM positions WHERE is_open = 1 AND strategy = ?')
+          .get(sn) as { cnt: number } | undefined;
+        if (sameSignal && sameSignal.cnt >= MAX_PER_SIGNAL_TYPE) continue;
 
         // Long-call cap
         if (longCallTypes.includes(sig.trade_type)) {
@@ -1345,15 +1528,33 @@ export async function runEntropyEngine(): Promise<RunResult> {
         if (selection.type === 'single' && selection.contract && selection.qty_sign != null) {
           const c = selection.contract;
           const qs = selection.qty_sign;
-          const prem = c.mid * 100;
+          // Strength-based allocation: alloc = BASE + (MAX - BASE) × strength
+          const allocPct = BASE_ALLOC + (MAX_ALLOC - BASE_ALLOC) * sig.strength;
+          const budget = pv * allocPct;
+          const netCost = c.mid * qs * 100;
+          if (netCost === 0) continue;
           let n: number;
-          if (qs > 0) {
-            n = Math.max(1, Math.floor(alloc / prem));
+          if (netCost > 0) {
+            n = Math.floor(budget / netCost);
           } else {
-            const margin = Math.max(prem * 3, c.strike * 100 * 0.15);
-            n = Math.max(1, Math.floor(alloc / margin));
+            const marginPer = Math.abs(netCost) * 2;
+            n = marginPer > 0 ? Math.floor(budget / marginPer) : 0;
           }
-          n = Math.min(n, maxContracts);
+          n = Math.max(1, Math.min(n, MAX_CONTRACTS));
+
+          // [GALLACHER] Regime filter on credit trades
+          if (isCredit(sig.trade_type)) {
+            if (regime === 'EXTREME') {
+              console.log(`[entropy] ✗ ${sn}: EXTREME regime — credit entry blocked`);
+              continue;
+            } else if (regime === 'STRESSED') {
+              const origN = n;
+              n = Math.max(1, Math.floor(n * STRESSED_SIZE_MULT));
+              if (n < origN) {
+                console.log(`[entropy] ⚠ ${sn}: STRESSED regime — credit reduced ${origN}→${n}`);
+              }
+            }
+          }
 
           const qty = n * qs;
           const side: 'buy_to_open' | 'sell_to_open' =
@@ -1433,11 +1634,12 @@ export async function runEntropyEngine(): Promise<RunResult> {
       success: true,
       date: todayStr,
       status: 'executed',
-      message: `Daily complete: ${signalsFired.length} signals fired, ${tradesExecuted.length} trades executed`,
+      message: `Daily complete: ${signalsFired.length} signals fired, ${tradesExecuted.length} trades executed [${regime}]`,
       metrics: store as Record<string, number | null>,
       signalsFired,
       tradesExecuted,
       portfolioValue,
+      regime,
     };
   } catch (error) {
     if (db) {

@@ -54,7 +54,8 @@ interface HistoryRow {
   composite: number | null;
   iv_mean: number | null;
   put_skew: number | null;
-  pcr_dollar: number | null;
+  pcr_vol: number | null;
+  regime?: string;
   [key: string]: number | string | null | undefined;
 }
 
@@ -86,9 +87,9 @@ function daysUntil(expiry: string): number {
 }
 
 const GAUGE_INFO: Record<string, string> = {
-  comp_volume: 'Volume-weighted entropy composite. Measures disorder in option volume distribution across strikes and expirations. Lower values indicate concentrated (directional) flow — a potential signal.',
-  comp_greek: 'Greek-weighted entropy composite. Captures disorder in delta/gamma exposure across the chain. Low values suggest the market is pricing a specific move.',
-  composite: 'Master composite combining volume and greek entropy with auxiliary metrics. The primary signal driver — values below the 21-day median indicate exploitable structure.',
+  comp_volume: 'Volume entropy composite = mean(H_vol_term, H_vol_k, H_prem_term, H_dflow). Measures disorder in option volume/delta-flow distribution. Signals fire below 30th percentile of 21-day history.',
+  comp_greek: 'Greek entropy composite = mean(H_vegavol, H_dgamma, H_gvx, H_spread_k, H_charm). Captures disorder in vega/gamma/liquidity exposure. S_LowGreekEnt fires below 30th percentile.',
+  composite: 'Master composite of all 10 entropy dimensions. The primary signal driver — values below the 30th percentile indicate exploitable structure.',
 };
 
 const STRATEGY_LABELS: Record<string, string> = {
@@ -154,6 +155,7 @@ export default function EntropyTab() {
   const [triggerAvailable, setTriggerAvailable] = useState<boolean | null>(null);
   const [triggering, setTriggering] = useState(false);
   const [triggerResult, setTriggerResult] = useState<{ success: boolean; message?: string; error?: string; help?: string; detail?: string; debug?: Record<string, string> } | null>(null);
+  const [showFrameworkDiag, setShowFrameworkDiag] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const warmupCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -982,6 +984,35 @@ export default function EntropyTab() {
         </div>
       </div>
 
+      {/* Regime Banner */}
+      {metrics?.regime && (
+        <div className={`panel border ${
+          metrics.regime === 'EXTREME' ? 'border-accent-red/50 bg-accent-red/5' :
+          metrics.regime === 'STRESSED' ? 'border-accent-amber/50 bg-accent-amber/5' :
+          'border-accent-green/30 bg-accent-green/5'
+        }`}>
+          <div className="p-3 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-mono font-bold tracking-wider ${
+                metrics.regime === 'EXTREME' ? 'bg-accent-red/20 text-accent-red' :
+                metrics.regime === 'STRESSED' ? 'bg-accent-amber/20 text-accent-amber' :
+                'bg-accent-green/20 text-accent-green'
+              }`}>
+                {String(metrics.regime)}
+              </span>
+              <span className="text-xs font-mono text-text-muted">
+                {metrics.regime === 'EXTREME'
+                  ? 'Credit entries halted — debit trades only'
+                  : metrics.regime === 'STRESSED'
+                  ? 'Credit trades at 50% size — elevated volatility'
+                  : 'All trade types active — normal conditions'}
+              </span>
+            </div>
+            <span className="text-[10px] font-mono text-text-muted">Gallacher Defense</span>
+          </div>
+        </div>
+      )}
+
       {/* Section 1: Entropy Gauges */}
       <div className="panel">
         <div className="panel-header">
@@ -1047,7 +1078,7 @@ export default function EntropyTab() {
           {[
             { key: 'iv_mean', label: 'IV Mean', format: fmtPct, medFormat: fmtPct },
             { key: 'put_skew', label: 'Put Skew', format: (v: number | null | undefined) => v != null ? `${(v * 100).toFixed(1)}pp` : '—', medFormat: (v: number | null | undefined) => v != null ? `${(v * 100).toFixed(1)}pp` : '—' },
-            { key: 'pcr_dollar', label: 'PCR Dollar', format: fmtRatio, medFormat: fmtRatio },
+            { key: 'pcr_vol', label: 'PCR Vol', format: fmtRatio, medFormat: fmtRatio },
           ].map(({ key, label, format, medFormat }) => {
             const current = metrics?.[key] ?? null;
             const median = medians?.[key] ?? null;
@@ -1157,7 +1188,7 @@ export default function EntropyTab() {
                     <td className="px-2 py-1 text-accent-green">{fmt4(row.comp_greek)}</td>
                     <td className="px-2 py-1 text-text-secondary">{row.iv_mean != null ? fmtPct(row.iv_mean) : '—'}</td>
                     <td className="px-2 py-1 text-text-secondary">{row.put_skew != null ? `${(row.put_skew * 100).toFixed(1)}pp` : '—'}</td>
-                    <td className="px-2 py-1 text-text-secondary">{fmtRatio(row.pcr_dollar)}</td>
+                    <td className="px-2 py-1 text-text-secondary">{fmtRatio(row.pcr_vol as number | null)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1353,7 +1384,176 @@ export default function EntropyTab() {
         </div>
       )}
 
-      {/* Section 8: Engine Diagnostics & Administration */}
+      {/* Section 8: QC v2 Framework Verification */}
+      <div className="panel">
+        <div className="panel-header cursor-pointer" onClick={() => setShowFrameworkDiag(v => !v)}>
+          <div className="flex items-center gap-1.5">
+            <Settings className="w-3.5 h-3.5 text-accent-purple" />
+            <span className="panel-title">Framework Configuration (QC v2)</span>
+          </div>
+          <span className="text-[10px] font-mono text-text-muted">{showFrameworkDiag ? '▲ collapse' : '▼ expand'}</span>
+        </div>
+        {showFrameworkDiag && (
+          <div className="p-4 space-y-4">
+            {/* Composite Dimensions */}
+            <div>
+              <h4 className="text-[10px] font-mono text-text-muted uppercase tracking-wider mb-2">Composite Dimensions</h4>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-[10px] font-mono text-accent-cyan font-semibold">comp_volume</span>
+                  <p className="text-[10px] font-mono text-text-muted mt-1">H_vol_term, H_vol_k, H_prem_term, H_dflow</p>
+                </div>
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-[10px] font-mono text-accent-green font-semibold">comp_greek</span>
+                  <p className="text-[10px] font-mono text-text-muted mt-1">H_vegavol, H_dgamma, H_gvx, H_spread_k, H_charm</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Signal Thresholds */}
+            <div>
+              <h4 className="text-[10px] font-mono text-text-muted uppercase tracking-wider mb-2">Signal Configuration</h4>
+              <div className="grid grid-cols-3 gap-2 text-[10px] font-mono">
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">Entropy Threshold</span>
+                  <div className="text-accent-cyan">P30 (30th percentile)</div>
+                </div>
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">Min Strength</span>
+                  <div className="text-accent-cyan">0.20 (Z-score)</div>
+                </div>
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">PCR Signal</span>
+                  <div className="text-accent-cyan">pcr_vol &gt; P80</div>
+                </div>
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">VolCollapse</span>
+                  <div className="text-accent-cyan">drop &gt; P85 of drops</div>
+                </div>
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">Skew Floor</span>
+                  <div className="text-accent-cyan">put_skew &gt; 0.01</div>
+                </div>
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">Strength Formula</span>
+                  <div className="text-accent-cyan">(med-val)/std/3</div>
+                </div>
+              </div>
+            </div>
+
+            {/* Position Sizing & Exits */}
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <h4 className="text-[10px] font-mono text-text-muted uppercase tracking-wider mb-2">Position Sizing</h4>
+                <div className="space-y-1 text-[10px] font-mono">
+                  <div className="flex justify-between"><span className="text-text-muted">Allocation</span><span className="text-text-primary">6% + 8% x strength</span></div>
+                  <div className="flex justify-between"><span className="text-text-muted">Max Contracts</span><span className="text-text-primary">20</span></div>
+                  <div className="flex justify-between"><span className="text-text-muted">Max Positions</span><span className="text-text-primary">8</span></div>
+                  <div className="flex justify-between"><span className="text-text-muted">Per Signal Type</span><span className="text-text-primary">3</span></div>
+                  <div className="flex justify-between"><span className="text-text-muted">Credit Margin</span><span className="text-text-primary">2x premium</span></div>
+                </div>
+              </div>
+              <div>
+                <h4 className="text-[10px] font-mono text-text-muted uppercase tracking-wider mb-2">Exit Rules</h4>
+                <div className="space-y-1 text-[10px] font-mono">
+                  <div className="flex justify-between"><span className="text-text-muted">Credit TP</span><span className="text-accent-green">+50%</span></div>
+                  <div className="flex justify-between"><span className="text-text-muted">Credit SL</span><span className="text-accent-red">-150%</span></div>
+                  <div className="flex justify-between"><span className="text-text-muted">Debit TP</span><span className="text-accent-green">+80%</span></div>
+                  <div className="flex justify-between"><span className="text-text-muted">Debit SL</span><span className="text-accent-red">-60%</span></div>
+                  <div className="flex justify-between"><span className="text-text-muted">DTE Close</span><span className="text-accent-amber">≤ 5 DTE</span></div>
+                </div>
+              </div>
+            </div>
+
+            {/* Contract Selection */}
+            <div>
+              <h4 className="text-[10px] font-mono text-text-muted uppercase tracking-wider mb-2">Contract Selection (Moneyness Ranges)</h4>
+              <div className="grid grid-cols-5 gap-2 text-[10px] font-mono">
+                {[
+                  { label: 'buy_call', range: '0.99-1.01' },
+                  { label: 'sell_put', range: '0.96-0.98' },
+                  { label: 'buy_call_longer', range: '0.99-1.01 DTE~35' },
+                  { label: 'bull_call_spread', range: 'L:0.99-1.01 S:1.02-1.04' },
+                  { label: 'sell_put_spread', range: 'S:0.97-0.99 L:0.94-0.96' },
+                ].map(({ label, range }) => (
+                  <div key={label} className="p-2 rounded bg-bg-primary/50">
+                    <span className="text-text-muted">{label}</span>
+                    <div className="text-accent-cyan">{range}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Gallacher Defense */}
+            <div>
+              <h4 className="text-[10px] font-mono text-text-muted uppercase tracking-wider mb-2">Gallacher Defense Layer</h4>
+              <div className="grid grid-cols-3 gap-2 text-[10px] font-mono">
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">Current Regime</span>
+                  <div className={`font-bold ${
+                    metrics?.regime === 'EXTREME' ? 'text-accent-red' :
+                    metrics?.regime === 'STRESSED' ? 'text-accent-amber' : 'text-accent-green'
+                  }`}>{metrics?.regime ? String(metrics.regime) : 'N/A'}</div>
+                </div>
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">IV Thresholds</span>
+                  <div className="text-text-primary">STRESSED: P80+18% | EXTREME: P95+25%</div>
+                </div>
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">MAD Thresholds</span>
+                  <div className="text-text-primary">STRESSED: 1.5x+0.8% | EXTREME: 2.5x+1.5%</div>
+                </div>
+              </div>
+              {metrics?.regime_details && (() => {
+                try {
+                  const rd = typeof metrics.regime_details === 'string'
+                    ? JSON.parse(metrics.regime_details as string)
+                    : metrics.regime_details;
+                  return (
+                    <div className="mt-2 p-2 rounded bg-bg-primary/30 text-[10px] font-mono text-text-muted">
+                      <div>IV: {rd.iv_check || 'N/A'}</div>
+                      <div>MAD: {rd.mad_check || 'N/A'}</div>
+                    </div>
+                  );
+                } catch { return null; }
+              })()}
+            </div>
+
+            {/* Entropy Bucketing */}
+            <div>
+              <h4 className="text-[10px] font-mono text-text-muted uppercase tracking-wider mb-2">Entropy Bucketing</h4>
+              <div className="grid grid-cols-3 gap-2 text-[10px] font-mono">
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">Moneyness</span>
+                  <div className="text-text-primary">15 bins: 0.85-1.15 (2% step)</div>
+                </div>
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">Charm DTE</span>
+                  <div className="text-text-primary">7 bins: 14-49 (5-day step)</div>
+                </div>
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">Dollar Gamma</span>
+                  <div className="text-text-primary">gamma x vol x spot x 100</div>
+                </div>
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">Spread Liquidity</span>
+                  <div className="text-text-primary">volume / spread per strike</div>
+                </div>
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">Put Skew OTM</span>
+                  <div className="text-text-primary">0.90-0.95 moneyness</div>
+                </div>
+                <div className="p-2 rounded bg-bg-primary/50">
+                  <span className="text-text-muted">PCR Metric</span>
+                  <div className="text-text-primary">pcr_vol (volume-weighted)</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Section 9: Engine Diagnostics & Administration */}
       {renderDiagnosticsPanel()}
     </div>
   );

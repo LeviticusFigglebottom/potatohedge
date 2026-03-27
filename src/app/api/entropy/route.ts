@@ -76,6 +76,10 @@ function initSchema(db: ReturnType<typeof getDb>) {
       executed INTEGER DEFAULT 0,
       PRIMARY KEY (date, strategy)
     );
+    CREATE TABLE IF NOT EXISTS regime_state (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
   `);
 }
 
@@ -320,6 +324,16 @@ export async function GET(request: NextRequest) {
       }
       const nextRunStr = `${nextRun.getFullYear()}-${String(nextRun.getMonth() + 1).padStart(2, '0')}-${String(nextRun.getDate()).padStart(2, '0')} ~4:05pm ET`;
 
+      // Current regime from regime_state table
+      let currentRegime = 'NORMAL';
+      let tradingDaysElapsed = 0;
+      try {
+        const regimeRow = db.prepare('SELECT value FROM regime_state WHERE key = ?').get('current_regime') as { value: string } | undefined;
+        if (regimeRow) currentRegime = regimeRow.value;
+        const tdRow = db.prepare('SELECT value FROM regime_state WHERE key = ?').get('trading_days') as { value: string } | undefined;
+        if (tdRow) tradingDaysElapsed = parseInt(tdRow.value, 10);
+      } catch { /* table may not exist yet */ }
+
       return NextResponse.json({
         redisConnected,
         redisHasData,
@@ -330,6 +344,9 @@ export async function GET(request: NextRequest) {
         gaps,
         runLog,
         cronLog,
+        regime: currentRegime,
+        tradingDaysElapsed,
+        frameworkVersion: 'QC v2 + Gallacher',
       });
     }
 
