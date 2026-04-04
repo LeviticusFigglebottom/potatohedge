@@ -27,7 +27,7 @@ import {
 import { restoreFromRedis, persistToRedis } from '@/lib/entropy/persistence';
 
 // ═══════════════════════════════════════════════════════════════════
-//  CONFIG — matches T13 exactly
+//  CONFIG — QC v2 + Gallacher
 // ═══════════════════════════════════════════════════════════════════
 
 const TICKER = 'SPY';
@@ -154,6 +154,7 @@ interface EnrichedRecord {
   gamma: number;
   vega: number;
   theta: number;
+  charm: number;
   moneyness: number;
 }
 
@@ -604,7 +605,7 @@ async function fetchRawChain(): Promise<RawContract[]> {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  ENTROPY COMPUTATION — identical to T13
+//  ENTROPY COMPUTATION — QC v2
 // ═══════════════════════════════════════════════════════════════════
 
 function hNorm(dist: number[]): number {
@@ -645,16 +646,19 @@ function computeEntropy(
     const d2 = d1 - iv * Math.sqrt(T);
     const nd1 = Math.exp(-0.5 * d1 * d1) / Math.sqrt(2 * Math.PI);
     const expRT = Math.exp(-RISK_FREE * T);
+    const sqT = Math.sqrt(T);
     let thetaVal: number;
     if (isCall) {
       thetaVal =
-        (-spot * nd1 * iv / (2 * Math.sqrt(T)) -
+        (-spot * nd1 * iv / (2 * sqT) -
           RISK_FREE * K * expRT * normCDFInline(d2)) / 365;
     } else {
       thetaVal =
-        (-spot * nd1 * iv / (2 * Math.sqrt(T)) +
+        (-spot * nd1 * iv / (2 * sqT) +
           RISK_FREE * K * expRT * normCDFInline(-d2)) / 365;
     }
+    // BSM charm (exact QC v2 formula)
+    const charmVal = -nd1 * (2 * RISK_FREE * T - d2 * iv * sqT) / (2 * T * iv * sqT);
 
     recs.push({
       symbol: c.symbol,
@@ -665,13 +669,14 @@ function computeEntropy(
       mid: c.mid,
       bid: c.bid,
       ask: c.ask,
-      spread: c.ask - c.bid,
+      spread: c.mid > 0 ? (c.ask - c.bid) / c.mid : 999,
       volume: c.volume,
       iv,
       delta: dVal,
       gamma: gVal,
       vega: vVal,
       theta: thetaVal,
+      charm: charmVal,
       moneyness: K / spot,
     });
   }
@@ -697,7 +702,7 @@ function computeEntropy(
   // Premium by expiry
   const ep: Record<string, number> = {};
   for (const r of recs) {
-    ep[r.expiry] = (ep[r.expiry] ?? 0) + r.mid * Math.max(r.volume, 1) * 100;
+    ep[r.expiry] = (ep[r.expiry] ?? 0) + r.mid * r.volume * 100;
   }
   const peVals = Object.values(ep).map(Math.abs);
   const peSum = peVals.reduce((a, b) => a + b, 0);
@@ -783,13 +788,9 @@ function computeEntropy(
   for (let d = MIN_DTE; d < MAX_DTE + 2; d += 5) cb.push(d);
   const cvArr = new Array(cb.length - 1).fill(0);
   for (const r of recs) {
-    const charmVal =
-      r.iv > 0
-        ? Math.abs(r.gamma * (RISK_FREE - (r.iv * r.iv) / 2) / r.iv)
-        : 0;
     for (let b = 0; b < cb.length - 1; b++) {
       if (r.dte >= cb[b] && r.dte < cb[b + 1]) {
-        cvArr[b] += Math.abs(charmVal);
+        cvArr[b] += Math.abs(r.charm);
         break;
       }
     }
@@ -864,7 +865,7 @@ function computeEntropy(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  SIGNAL EVALUATION — identical to T13
+//  SIGNAL EVALUATION — QC v2
 // ═══════════════════════════════════════════════════════════════════
 
 interface HistoryEntry {
@@ -974,8 +975,7 @@ function evaluateSignals(
       const drop = prevCv - currCv;
       const drops: number[] = [];
       for (let i = 1; i < histVals.length; i++) {
-        const d = (histVals[i - 1] as number) - (histVals[i] as number);
-        if (d > 0) drops.push(d);
+        drops.push((histVals[i - 1] as number) - (histVals[i] as number));
       }
       if (drops.length > 0 && drop > 0) {
         const thresh = percentileValue(drops, VOLCOLLAPSE_PERCENTILE);
@@ -1052,7 +1052,7 @@ function evaluateSignals(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  CONTRACT SELECTION — identical to T13
+//  CONTRACT SELECTION — QC v2
 // ═══════════════════════════════════════════════════════════════════
 
 function selectContract(
@@ -1083,7 +1083,7 @@ function selectContract(
       const c = cs.reduce((best, r) =>
         Math.abs(r.moneyness - 1.0) < Math.abs(best.moneyness - 1.0) ? r : best,
       );
-      if (c.spread < c.mid * SPREAD_FILTER) {
+      if (c.spread < SPREAD_FILTER) {
         return { type: 'single', contract: c, qty_sign: 1 };
       }
     }
@@ -1102,7 +1102,7 @@ function selectContract(
       const c = lo.reduce((best, r) =>
         Math.abs(r.dte - 35) < Math.abs(best.dte - 35) ? r : best,
       );
-      if (c.spread < c.mid * SPREAD_FILTER) {
+      if (c.spread < SPREAD_FILTER) {
         return { type: 'single', contract: c, qty_sign: 1 };
       }
     }
@@ -1114,7 +1114,7 @@ function selectContract(
       const c = ot.reduce((best, r) =>
         Math.abs(r.dte - TARGET_DTE) < Math.abs(best.dte - TARGET_DTE) ? r : best,
       );
-      if (c.spread < c.mid * SPREAD_FILTER) {
+      if (c.spread < SPREAD_FILTER) {
         return { type: 'single', contract: c, qty_sign: -1 };
       }
     }

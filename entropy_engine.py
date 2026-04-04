@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════
-  ENTROPY PAPER TRADING ENGINE — T13 LOGIC, LIVE DATA
+  ENTROPY PAPER TRADING ENGINE — QC v2 + GALLACHER DEFENSE
 ═══════════════════════════════════════════════════════════════════════
   Run via cron at 3:50pm ET daily:
     50 15 * * 1-5 cd /path/to/potatohedge && python3 entropy_engine.py
@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, date
 from typing import Optional, Dict, List, Any
 
 # ═══════════════════════════════════════════════════════════════════
-#  CONFIG — matches T13 exactly
+#  CONFIG — QC v2 + Gallacher
 # ═══════════════════════════════════════════════════════════════════
 
 TICKER        = "SPY"
@@ -284,7 +284,7 @@ def place_paper_order(symbol: str, qty: int, side: str = "buy_to_open") -> Optio
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  BSM — identical to T13
+#  BSM — QC v2
 # ═══════════════════════════════════════════════════════════════════
 
 def bsm_price(S, K, T, r, sig, is_call):
@@ -310,23 +310,25 @@ def bsm_iv(price, S, K, T, r, is_call):
 
 def bsm_greeks(S, K, T, r, sig, is_call):
     if T <= 0 or sig <= 0:
-        return {"delta": 0, "gamma": 0, "vega": 0, "theta": 0}
-    d1 = (np.log(S/K) + (r + 0.5*sig**2)*T) / (sig*np.sqrt(T))
-    d2 = d1 - sig*np.sqrt(T)
+        return {"delta": 0, "gamma": 0, "vega": 0, "theta": 0, "charm": 0}
+    sqT = np.sqrt(T)
+    d1 = (np.log(S/K) + (r + 0.5*sig**2)*T) / (sig*sqT)
+    d2 = d1 - sig*sqT
     nd1 = sp_norm.pdf(d1)
-    gamma = float(nd1 / (S * sig * np.sqrt(T)))
-    vega = float(S * nd1 * np.sqrt(T) / 100)
+    gamma = float(nd1 / (S * sig * sqT))
+    vega = float(S * nd1 * sqT / 100)
+    charm = float(-nd1 * (2*r*T - d2*sig*sqT) / (2*T*sig*sqT))
     if is_call:
         delta = float(sp_norm.cdf(d1))
-        theta = float((-S*nd1*sig/(2*np.sqrt(T)) - r*K*np.exp(-r*T)*sp_norm.cdf(d2))/365)
+        theta = float((-S*nd1*sig/(2*sqT) - r*K*np.exp(-r*T)*sp_norm.cdf(d2))/365)
     else:
         delta = float(sp_norm.cdf(d1) - 1)
-        theta = float((-S*nd1*sig/(2*np.sqrt(T)) + r*K*np.exp(-r*T)*sp_norm.cdf(-d2))/365)
-    return {"delta": delta, "gamma": gamma, "vega": vega, "theta": theta}
+        theta = float((-S*nd1*sig/(2*sqT) + r*K*np.exp(-r*T)*sp_norm.cdf(-d2))/365)
+    return {"delta": delta, "gamma": gamma, "vega": vega, "theta": theta, "charm": charm}
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  ENTROPY — identical to T13
+#  ENTROPY — QC v2
 # ═══════════════════════════════════════════════════════════════════
 
 def h_norm(dist):
@@ -340,7 +342,7 @@ def h_norm(dist):
 
 def compute_entropy(contracts: List[Dict], spot: float) -> Optional[Dict]:
     """Compute all 12 entropy dimensions + composites.
-    IDENTICAL logic to T13 ComputeEntropy."""
+    Matches QC v2 _metrics() exactly."""
     if spot <= 0:
         return None
 
@@ -367,9 +369,9 @@ def compute_entropy(contracts: List[Dict], spot: float) -> Optional[Dict]:
         recs.append({
             "symbol": c["symbol"], "strike": K, "expiry": c["expiry"],
             "dte": dte, "is_call": is_call, "mid": mid, "bid": bid,
-            "ask": ask, "spread": ask - bid, "volume": vol, "iv": iv,
+            "ask": ask, "spread": (ask - bid) / mid if mid > 0 else 999, "volume": vol, "iv": iv,
             "delta": gr["delta"], "gamma": gr["gamma"],
-            "vega": gr["vega"], "theta": gr["theta"],
+            "vega": gr["vega"], "theta": gr["theta"], "charm": gr["charm"],
             "moneyness": K / spot,
         })
 
@@ -396,7 +398,7 @@ def compute_entropy(contracts: List[Dict], spot: float) -> Optional[Dict]:
     # Premium by expiry
     ep = {}
     for r in recs:
-        ep[r["expiry"]] = ep.get(r["expiry"], 0) + r["mid"] * max(r["volume"], 1) * 100
+        ep[r["expiry"]] = ep.get(r["expiry"], 0) + r["mid"] * r["volume"] * 100
     pe = np.abs(np.array(list(ep.values())))
     m["H_prem_term_n"] = h_norm(pe) if pe.sum() > 0 else None
 
@@ -459,10 +461,9 @@ def compute_entropy(contracts: List[Dict], spot: float) -> Optional[Dict]:
     cb = list(range(MIN_DTE, MAX_DTE + 2, 5))
     cv_arr = np.zeros(len(cb) - 1)
     for r in recs:
-        charm = abs(r["gamma"] * (RISK_FREE - r["iv"] ** 2 / 2) / r["iv"]) if r["iv"] > 0 else 0
         for b in range(len(cb) - 1):
             if cb[b] <= r["dte"] < cb[b + 1]:
-                cv_arr[b] += abs(charm)
+                cv_arr[b] += abs(r["charm"])
                 break
     m["H_charm_n"] = h_norm(cv_arr) if cv_arr.sum() > 0 else None
 
@@ -511,7 +512,7 @@ def compute_entropy(contracts: List[Dict], spot: float) -> Optional[Dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  SIGNALS — identical to T13
+#  SIGNALS — QC v2
 # ═══════════════════════════════════════════════════════════════════
 
 def get_history(conn: sqlite3.Connection, days: int = 60) -> List[Dict]:
@@ -598,9 +599,7 @@ def evaluate_signals(metrics: Dict, history: List[Dict]) -> Dict[str, Dict]:
             hist_vals = [h.get("comp_volume") for h in history]
             for i in range(1, len(hist_vals)):
                 if hist_vals[i-1] is not None and hist_vals[i] is not None:
-                    d = hist_vals[i-1] - hist_vals[i]
-                    if d > 0:
-                        drops.append(d)
+                    drops.append(hist_vals[i-1] - hist_vals[i])
             if drops and drop > 0:
                 thresh = float(np.percentile(drops, VOLCOLLAPSE_PERCENTILE))
                 fire = drop > thresh
@@ -658,7 +657,7 @@ def evaluate_signals(metrics: Dict, history: List[Dict]) -> Dict[str, Dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  CONTRACT SELECTION — identical to T13
+#  CONTRACT SELECTION — QC v2
 # ═══════════════════════════════════════════════════════════════════
 
 def select_contract(recs: List[Dict], spot: float, tt: str,
@@ -682,7 +681,7 @@ def select_contract(recs: List[Dict], spot: float, tt: str,
             cs = [r for r in ca if abs(r["strike"] - atm_k) <= 2 and r["mid"] > 0]
         if cs:
             c = min(cs, key=lambda r: abs(r["moneyness"] - 1.0))
-            if c["spread"] < c["mid"] * SPREAD_FILTER:
+            if c["spread"] < SPREAD_FILTER:
                 return {"type": "single", "contract": c, "qty_sign": 1}
 
     elif tt == "buy_call_longer":
@@ -691,14 +690,14 @@ def select_contract(recs: List[Dict], spot: float, tt: str,
               and r["symbol"] not in used_symbols]
         if lo:
             c = min(lo, key=lambda r: abs(r["dte"] - 35))
-            if c["spread"] < c["mid"] * SPREAD_FILTER:
+            if c["spread"] < SPREAD_FILTER:
                 return {"type": "single", "contract": c, "qty_sign": 1}
 
     elif tt == "sell_put":
         ot = [r for r in pa if 0.96 <= r["moneyness"] <= 0.98 and r["mid"] > 0.10]
         if ot:
             c = min(ot, key=lambda r: abs(r["dte"] - TARGET_DTE))
-            if c["spread"] < c["mid"] * SPREAD_FILTER:
+            if c["spread"] < SPREAD_FILTER:
                 return {"type": "single", "contract": c, "qty_sign": -1}
 
     elif tt == "bull_call_spread":
@@ -1114,7 +1113,7 @@ def run_daily():
             elif selection["type"] == "spread":
                 log.info(f"  ★ {sn}: spread execution (simplified for paper)")
                 # For paper trading, log the spread but execute legs separately
-                # Full spread execution would mirror T13's spread logic
+                # Full spread execution would mirror QC v2's spread logic
 
     conn.commit()
 
