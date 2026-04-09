@@ -1174,7 +1174,7 @@ export default function EntropyTab() {
             <table className="w-full text-[10px] font-mono">
               <thead>
                 <tr className="border-b border-border/20">
-                  {['Date', 'SPY', 'Composite', 'Vol Ent', 'Greek Ent', 'IV Mean', 'Put Skew', 'PCR $'].map(h => (
+                  {['Date', 'SPY', 'Composite', 'Vol Ent', 'Greek Ent', 'IV Mean', 'Put Skew', 'PCR Vol'].map(h => (
                     <th key={h} className="px-2 py-1.5 text-left text-text-muted font-normal uppercase tracking-wider">{h}</th>
                   ))}
                 </tr>
