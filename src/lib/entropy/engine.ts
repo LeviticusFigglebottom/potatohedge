@@ -1045,6 +1045,11 @@ function evaluateSignals(
       state,
       strength: sVal,
       direction: 1,
+      // WARNING: execution path for S_SkewFlow is not currently wired.
+      // If execution is ever enabled, verify sell_put routing end-to-end
+      // (selectContract → placeSingleOrder → positions insert) before
+      // trusting fills — previous routing targeted sell_put_spread and
+      // the single-leg path has not been exercised with this signal.
       trade_type: 'sell_put',
       rationale: `cv=${cv.toFixed(4)} p30=${cvThresh.toFixed(4)} sk=${ps.toFixed(4)} med(sk)=${psMed.toFixed(4)} z_str=${sVal.toFixed(3)}${cooldown ? ' (cooldown)' : ''}`,
     };
