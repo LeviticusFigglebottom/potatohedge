@@ -337,9 +337,9 @@ function brentIV(
 ): number | null {
   if (T <= 1e-6 || price <= 0) return null;
 
-  const disc = Math.exp(-r * T);
-  const intrinsic = isCall ? Math.max(S - K * disc, 0) : Math.max(K * disc - S, 0);
-  if (price < intrinsic * 0.90) return null;
+  // QC parity: undiscounted intrinsic, no leeway
+  const intrinsic = isCall ? Math.max(S - K, 0) : Math.max(K - S, 0);
+  if (price < intrinsic) return null;
 
   const priceFn = (sigma: number): number => {
     const params = { S, K, T, r, sigma };
@@ -348,8 +348,8 @@ function brentIV(
 
   let a = 0.01;
   let b = 5.0;
-  const tol = 1e-5;
-  const maxIter = 80;
+  const tol = 1e-6;
+  const maxIter = 100;
 
   let fa = priceFn(a);
   let fb = priceFn(b);
