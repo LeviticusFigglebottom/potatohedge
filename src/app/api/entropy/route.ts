@@ -77,6 +77,22 @@ function initSchema(db: ReturnType<typeof getDb>) {
       PRIMARY KEY (date, strategy)
     );
   `);
+
+  // Idempotent column additions for post-parity schema. Mirror engine.ts:initDb.
+  // Without these, persistence.ts INSERT statements referencing schema_version
+  // or signals_log.state fail to prepare and restoreFromRedis silently skips,
+  // leaving fresh Vercel instances with an empty local SQLite even though
+  // Redis data is intact.
+  const addColumn = (sql: string) => {
+    try {
+      db.exec(sql);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes('duplicate column')) throw err;
+    }
+  };
+  addColumn(`ALTER TABLE entropy_history ADD COLUMN schema_version TEXT`);
+  addColumn(`ALTER TABLE signals_log ADD COLUMN state TEXT`);
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
