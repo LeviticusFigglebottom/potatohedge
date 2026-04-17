@@ -149,6 +149,7 @@ interface EntropyMetrics {
   comp_volume: number | null;
   comp_greek: number | null;
   composite: number | null;
+  composite_v2: number | null;
   _n_records: number;
   _chain: EnrichedRecord[];
   [key: string]: unknown;
@@ -241,6 +242,9 @@ function getDb(): BetterSqlite3Database {
   return new Database(dbPath);
 }
 
+/** Current data schema version written into entropy_history.schema_version. */
+const SCHEMA_VERSION = 'parity-v1';
+
 function initDb(db: BetterSqlite3Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS entropy_history (
@@ -296,6 +300,17 @@ function initDb(db: BetterSqlite3Database): void {
       PRIMARY KEY (date, strategy)
     );
   `);
+
+  // Idempotent column additions for post-parity schema.
+  const addColumn = (sql: string) => {
+    try {
+      db.exec(sql);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes('duplicate column')) throw err;
+    }
+  };
+  addColumn(`ALTER TABLE entropy_history ADD COLUMN schema_version TEXT`);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -710,34 +725,47 @@ function computeEntropy(
   const pvol = puts.reduce((s, r) => s + r.volume, 0);
   m.pcr_vol = cvol > 0 ? pvol / cvol : null;
 
-  // Composites
-  const cvComps = [m.H_vol_term_n, m.H_prem_term_n, m.H_vol_k_n, m.H_vegavol_n].filter(
-    (v): v is number => v !== null,
-  );
-  m.comp_volume = cvComps.length > 0 ? mean(cvComps) : null;
+  // Composites — QC parity. Null dims substitute 0.5 (QC has_vol=False branch).
+  const neutral = (v: number | null) => (v == null ? 0.5 : v);
 
-  const cgComps = [
-    m.H_gvx_n,
-    m.H_dflow_n,
-    m.H_vegavol_n,
-    m.H_dgamma_n,
-    m.H_charm_n,
-  ].filter((v): v is number => v !== null);
-  m.comp_greek = cgComps.length > 0 ? mean(cgComps) : null;
+  // comp_volume = mean([H_vt, H_vk, H_pt, H_df])
+  m.comp_volume = mean([
+    neutral(m.H_vol_term_n),
+    neutral(m.H_vol_k_n),
+    neutral(m.H_prem_term_n),
+    neutral(m.H_dflow_n),
+  ]);
 
-  const allComps = [
-    m.H_vol_term_n,
-    m.H_vol_k_n,
-    m.H_prem_term_n,
-    m.H_vegavol_n,
-    m.H_dgamma_n,
-    m.H_gvx_n,
-    m.H_dflow_n,
-    m.H_spread_k_n,
-    m.H_moneyness_n,
-    m.H_charm_n,
-  ].filter((v): v is number => v !== null);
-  m.composite = allComps.length > 0 ? mean(allComps) : null;
+  // comp_greek = mean([H_vv, H_dg, H_gv, H_sk, H_ch])
+  m.comp_greek = mean([
+    neutral(m.H_vegavol_n),
+    neutral(m.H_dgamma_n),
+    neutral(m.H_gvx_n),
+    neutral(m.H_spread_k_n),
+    neutral(m.H_charm_n),
+  ]);
+
+  // composite = mean of all 10 dims
+  m.composite = mean([
+    neutral(m.H_vol_term_n),
+    neutral(m.H_vol_k_n),
+    neutral(m.H_prem_term_n),
+    neutral(m.H_vegavol_n),
+    neutral(m.H_dgamma_n),
+    neutral(m.H_gvx_n),
+    neutral(m.H_dflow_n),
+    neutral(m.H_spread_k_n),
+    neutral(m.H_moneyness_n),
+    neutral(m.H_charm_n),
+  ]);
+
+  // composite_v2 = mean([H_vt, H_pt, H_mn, H_ch])
+  m.composite_v2 = mean([
+    neutral(m.H_vol_term_n),
+    neutral(m.H_prem_term_n),
+    neutral(m.H_moneyness_n),
+    neutral(m.H_charm_n),
+  ]);
 
   return {
     ...m,
@@ -1245,8 +1273,8 @@ export async function runEntropyEngine(): Promise<RunResult> {
       if (!k.startsWith('_')) store[k] = v;
     }
     db.prepare(
-      'INSERT OR REPLACE INTO entropy_history (date, spot, metrics_json) VALUES (?, ?, ?)',
-    ).run(todayStr, spot, JSON.stringify(store));
+      'INSERT OR REPLACE INTO entropy_history (date, spot, metrics_json, schema_version) VALUES (?, ?, ?, ?)',
+    ).run(todayStr, spot, JSON.stringify(store), SCHEMA_VERSION);
 
     // 3. Load history
     const history = getHistory(db);

@@ -39,6 +39,7 @@ interface HistoryRow {
   date: string;
   spot: number;
   metrics_json: string;
+  schema_version?: string | null;
 }
 
 interface PositionRow {
@@ -143,9 +144,14 @@ export async function restoreFromRedis(db: BetterSqlite3Database): Promise<void>
     }
 
     if (history && history.length > 0) {
-      const stmt = db.prepare('INSERT OR IGNORE INTO entropy_history (date, spot, metrics_json) VALUES (?, ?, ?)');
+      const stmt = db.prepare('INSERT OR IGNORE INTO entropy_history (date, spot, metrics_json, schema_version) VALUES (?, ?, ?, ?)');
       for (const row of history) {
-        stmt.run(row.date, row.spot, typeof row.metrics_json === 'string' ? row.metrics_json : JSON.stringify(row.metrics_json));
+        stmt.run(
+          row.date,
+          row.spot,
+          typeof row.metrics_json === 'string' ? row.metrics_json : JSON.stringify(row.metrics_json),
+          row.schema_version ?? null,
+        );
       }
     }
 
@@ -205,7 +211,7 @@ export async function persistToRedis(db: BetterSqlite3Database): Promise<void> {
   if (!redis) return;
 
   try {
-    const history = db.prepare('SELECT date, spot, metrics_json FROM entropy_history ORDER BY date').all() as HistoryRow[];
+    const history = db.prepare('SELECT date, spot, metrics_json, schema_version FROM entropy_history ORDER BY date').all() as HistoryRow[];
     const positions = db.prepare('SELECT * FROM positions ORDER BY id').all() as PositionRow[];
     const trades = db.prepare('SELECT * FROM trades_log ORDER BY id').all() as TradeRow[];
     const equity = db.prepare('SELECT * FROM equity_curve ORDER BY date').all() as EquityRow[];
