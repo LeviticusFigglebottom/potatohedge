@@ -746,12 +746,19 @@ function med(history: HistoryEntry[], key: string, lookback: number = LOOKBACK):
   return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
-function pct(history: HistoryEntry[], key: string, percentile: number): number | null {
-  const vals = history
+function pct(
+  history: HistoryEntry[],
+  key: string,
+  percentile: number,
+  lookback: number | null = null,
+): number | null {
+  const windowed = lookback != null ? history.slice(-lookback) : history;
+  const vals = windowed
     .map((h) => h[key])
     .filter((v): v is number => v != null && typeof v === 'number')
     .sort((a, b) => a - b);
-  if (vals.length < Math.floor(LOOKBACK / 2)) return null;
+  const minRequired = Math.floor((lookback ?? LOOKBACK) / 2);
+  if (vals.length < minRequired) return null;
   const idx = (percentile / 100) * (vals.length - 1);
   const lo = Math.floor(idx);
   const hi = Math.ceil(idx);
@@ -785,7 +792,7 @@ function evaluateSignals(
   const ivM = med(history, 'iv_mean');
   const ps = metrics.put_skew;
   const psM = med(history, 'put_skew');
-  const pcr = metrics.pcr_dollar;
+  const pcrVol = metrics.pcr_vol;
   const d1cv = diff(history, 'comp_volume', 1);
 
   // Compute d1cv percentile
@@ -861,7 +868,7 @@ function evaluateSignals(
 
   // S_SkewFlow
   if (cv != null && cvM != null && ps != null && psM != null) {
-    const fire = cv < cvM && ps > psM;
+    const fire = cv < cvM && ps > psM && ps > 0.01;
     const s1 = cv < cvM ? strength(cv, cvM) : 0;
     const s2 =
       psM !== 0 && ps > psM ? Math.max(0, Math.min((ps - psM) / Math.abs(psM), 1)) : 0;
@@ -875,18 +882,18 @@ function evaluateSignals(
   }
 
   // S_PCRContrarian
-  if (pcr != null) {
-    const pcrP80 = pct(history, 'pcr_dollar', 80);
+  if (pcrVol != null) {
+    const pcrP80 = pct(history, 'pcr_vol', 80, LOOKBACK);
     if (pcrP80 != null) {
-      const fire = pcr > pcrP80;
+      const fire = pcrVol > pcrP80;
       const s =
-        pcrP80 > 0 && fire ? Math.max(0, Math.min((pcr - pcrP80) / pcrP80, 1)) : 0;
+        pcrP80 > 0 && fire ? Math.max(0, Math.min((pcrVol - pcrP80) / pcrP80, 1)) : 0;
       sigs.S_PCRContrarian = {
         fire,
         strength: s,
         direction: 1,
         trade_type: 'sell_put',
-        rationale: `pcr=${pcr.toFixed(4)} ${fire ? '>' : '<='} p80=${pcrP80.toFixed(4)}`,
+        rationale: `pcr_vol=${pcrVol.toFixed(4)} ${fire ? '>' : '<='} p80=${pcrP80.toFixed(4)}`,
       };
     }
   }
