@@ -184,15 +184,24 @@ export async function GET(request: NextRequest) {
       ).all() as { metrics_json: string }[];
 
       const medians: Record<string, number | null> = {};
+      const thresholds: Record<string, number | null> = {};
+      const percentileOf = (key: string, p: number): number | null => {
+        const vals = recentHistory
+          .map((r) => JSON.parse(r.metrics_json)[key])
+          .filter((v: unknown): v is number => v != null && typeof v === 'number')
+          .sort((a: number, b: number) => a - b);
+        if (vals.length === 0) return null;
+        const idx = (p / 100) * (vals.length - 1);
+        const lo = Math.floor(idx);
+        const hi = Math.ceil(idx);
+        return lo === hi ? vals[lo] : vals[lo] + (vals[hi] - vals[lo]) * (idx - lo);
+      };
       if (recentHistory.length >= 10) {
-        const keys = ['comp_volume', 'comp_greek', 'composite', 'iv_mean', 'put_skew', 'pcr_dollar'];
-        for (const key of keys) {
-          const vals = recentHistory
-            .map(r => JSON.parse(r.metrics_json)[key])
-            .filter((v: unknown): v is number => v != null && typeof v === 'number')
-            .sort((a: number, b: number) => a - b);
-          medians[key] = vals.length > 0 ? vals[Math.floor(vals.length / 2)] : null;
-        }
+        const keys = ['comp_volume', 'comp_greek', 'composite', 'composite_v2', 'iv_mean', 'put_skew', 'pcr_dollar', 'pcr_vol'];
+        for (const key of keys) medians[key] = percentileOf(key, 50);
+        // Parity thresholds the UI needs for the current-vs-threshold display.
+        thresholds.comp_volume_p30 = percentileOf('comp_volume', 30);
+        thresholds.pcr_vol_p80 = percentileOf('pcr_vol', 80);
       }
 
       return NextResponse.json({
@@ -202,6 +211,7 @@ export async function GET(request: NextRequest) {
         spot: latest?.spot || null,
         metrics,
         medians,
+        thresholds,
         signals: { date: signalDate, items: signals },
         openPositions,
         recentTrades,
@@ -320,6 +330,97 @@ export async function GET(request: NextRequest) {
       }
       const nextRunStr = `${nextRun.getFullYear()}-${String(nextRun.getMonth() + 1).padStart(2, '0')}-${String(nextRun.getDate()).padStart(2, '0')} ~4:05pm ET`;
 
+      // ── QC parity diagnostic payload ──────────────────────────
+      // Today's dim-level metrics, thresholds, and signal state so the
+      // user can eyeball what's driving fire/no-fire without round-tripping
+      // through the engine run log.
+      const todayRow = db.prepare(
+        'SELECT date, spot, metrics_json, schema_version FROM entropy_history ORDER BY date DESC LIMIT 1'
+      ).get() as { date: string; spot: number; metrics_json: string; schema_version: string | null } | undefined;
+      let parity: Record<string, unknown> | null = null;
+      if (todayRow) {
+        const m = JSON.parse(todayRow.metrics_json);
+        const hist = db.prepare(
+          'SELECT metrics_json FROM entropy_history ORDER BY date DESC LIMIT 21'
+        ).all() as { metrics_json: string }[];
+        const parsed = hist.map((r) => JSON.parse(r.metrics_json)).reverse();
+        const valsFor = (key: string): number[] =>
+          parsed.map((h) => h[key]).filter((v: unknown): v is number => typeof v === 'number');
+        const percentile = (arr: number[], p: number): number | null => {
+          if (arr.length === 0) return null;
+          const sorted = [...arr].sort((a, b) => a - b);
+          const idx = (p / 100) * (sorted.length - 1);
+          const lo = Math.floor(idx);
+          const hi = Math.ceil(idx);
+          return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+        };
+        const cvVals = valsFor('comp_volume');
+        const psVals = valsFor('put_skew');
+        const pcrVals = valsFor('pcr_vol');
+
+        // Cooldown status per signal (days since last fire)
+        const lastFireRows = db.prepare(
+          "SELECT strategy, MAX(date) AS last_date FROM signals_log WHERE fired = 1 AND strategy IN ('S_SkewFlow','S_PCRContrarian') GROUP BY strategy"
+        ).all() as { strategy: string; last_date: string | null }[];
+        const cooldownStatus: Record<string, { last_fire: string | null; days_since: number | null; in_cooldown: boolean }> = {};
+        for (const s of ['S_SkewFlow', 'S_PCRContrarian']) {
+          const row = lastFireRows.find((r) => r.strategy === s);
+          if (!row?.last_date) {
+            cooldownStatus[s] = { last_fire: null, days_since: null, in_cooldown: false };
+          } else {
+            const [ly, lm, ld] = row.last_date.split('-').map(Number);
+            const [ty, tm, td] = todayRow.date.split('-').map(Number);
+            const days = Math.round(
+              (Date.UTC(ty, tm - 1, td) - Date.UTC(ly, lm - 1, ld)) / (1000 * 60 * 60 * 24)
+            );
+            cooldownStatus[s] = { last_fire: row.last_date, days_since: days, in_cooldown: days < 2 };
+          }
+        }
+
+        // Today's signal-log rows (state, strength, rationale)
+        const todaySignals = db.prepare(
+          "SELECT strategy, fired, strength, state, rationale FROM signals_log WHERE date = ? AND strategy IN ('S_SkewFlow','S_PCRContrarian')"
+        ).all(todayRow.date) as { strategy: string; fired: number; strength: number; state: string | null; rationale: string }[];
+
+        parity = {
+          date: todayRow.date,
+          schema_version: todayRow.schema_version,
+          chain_records: m._n_records ?? null,
+          warmup_status: { days_elapsed: totalDays, required: 30, complete: totalDays >= 30 },
+          dims: {
+            H_vol_term_n: m.H_vol_term_n ?? null,
+            H_vol_k_n: m.H_vol_k_n ?? null,
+            H_prem_term_n: m.H_prem_term_n ?? null,
+            H_vegavol_n: m.H_vegavol_n ?? null,
+            H_dgamma_n: m.H_dgamma_n ?? null,
+            H_gvx_n: m.H_gvx_n ?? null,
+            H_dflow_n: m.H_dflow_n ?? null,
+            H_spread_k_n: m.H_spread_k_n ?? null,
+            H_moneyness_n: m.H_moneyness_n ?? null,
+            H_charm_n: m.H_charm_n ?? null,
+          },
+          composites: {
+            comp_volume: m.comp_volume ?? null,
+            comp_greek: m.comp_greek ?? null,
+            composite: m.composite ?? null,
+            composite_v2: m.composite_v2 ?? null,
+          },
+          aux: {
+            iv_mean: m.iv_mean ?? null,
+            put_skew: m.put_skew ?? null,
+            pcr_vol: m.pcr_vol ?? null,
+            pcr_dollar: m.pcr_dollar ?? null,
+          },
+          thresholds: {
+            comp_volume_p30: percentile(cvVals, 30),
+            put_skew_p50: percentile(psVals, 50),
+            pcr_vol_p80: percentile(pcrVals, 80),
+          },
+          cooldown_status: cooldownStatus,
+          today_signals: todaySignals,
+        };
+      }
+
       return NextResponse.json({
         redisConnected,
         redisHasData,
@@ -330,6 +431,7 @@ export async function GET(request: NextRequest) {
         gaps,
         runLog,
         cronLog,
+        parity,
       });
     }
 

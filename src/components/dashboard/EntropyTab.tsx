@@ -13,6 +13,7 @@ interface SignalItem {
   trade_type: string;
   rationale: string;
   executed: number;
+  state?: 'FIRED' | 'ARMED' | 'COOLDOWN' | 'IDLE' | null;
 }
 
 interface OpenPosition {
@@ -52,6 +53,7 @@ interface HistoryRow {
   comp_volume: number | null;
   comp_greek: number | null;
   composite: number | null;
+  composite_v2: number | null;
   iv_mean: number | null;
   put_skew: number | null;
   pcr_dollar: number | null;
@@ -65,6 +67,7 @@ interface EntropyData {
   spot: number | null;
   metrics: Record<string, number | null> | null;
   medians: Record<string, number | null>;
+  thresholds?: Record<string, number | null>;
   signals: { date: string; items: SignalItem[] };
   openPositions: OpenPosition[];
   recentTrades: RecentTrade[];
@@ -139,6 +142,22 @@ export default function EntropyTab() {
     gaps: string[];
     runLog: { date: string; spot: number; composite: number | null; records: number | null }[];
     cronLog?: { timestamp: string; status: string; message: string; source: string }[];
+    parity?: {
+      date: string;
+      schema_version: string | null;
+      chain_records: number | null;
+      warmup_status: { days_elapsed: number; required: number; complete: boolean };
+      dims: Record<string, number | null>;
+      composites: Record<string, number | null>;
+      aux: Record<string, number | null>;
+      thresholds: {
+        comp_volume_p30: number | null;
+        put_skew_p50: number | null;
+        pcr_vol_p80: number | null;
+      };
+      cooldown_status: Record<string, { last_fire: string | null; days_since: number | null; in_cooldown: boolean }>;
+      today_signals: { strategy: string; fired: number; strength: number; state: string | null; rationale: string }[];
+    } | null;
   } | null>(null);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [purging, setPurging] = useState(false);
@@ -1142,7 +1161,7 @@ export default function EntropyTab() {
             <table className="w-full text-[10px] font-mono">
               <thead>
                 <tr className="border-b border-border/20">
-                  {['Date', 'SPY', 'Composite', 'Vol Ent', 'Greek Ent', 'IV Mean', 'PCR Vol', 'Put Skew', 'PCR $'].map(h => (
+                  {['Date', 'SPY', 'Composite', 'Composite v2', 'Vol Ent', 'Greek Ent', 'IV Mean', 'PCR Vol', 'Put Skew', 'PCR $'].map(h => (
                     <th key={h} className="px-2 py-1.5 text-left text-text-muted font-normal uppercase tracking-wider">{h}</th>
                   ))}
                 </tr>
@@ -1153,6 +1172,7 @@ export default function EntropyTab() {
                     <td className="px-2 py-1 text-text-muted">{row.date}</td>
                     <td className="px-2 py-1 text-text-primary">${row.spot?.toFixed(2) ?? '—'}</td>
                     <td className="px-2 py-1 text-accent-purple">{fmt4(row.composite)}</td>
+                    <td className="px-2 py-1 text-accent-purple">{fmt4(row.composite_v2)}</td>
                     <td className="px-2 py-1 text-accent-cyan">{fmt4(row.comp_volume)}</td>
                     <td className="px-2 py-1 text-accent-green">{fmt4(row.comp_greek)}</td>
                     <td className="px-2 py-1 text-text-secondary">{row.iv_mean != null ? fmtPct(row.iv_mean) : '—'}</td>
@@ -1181,18 +1201,44 @@ export default function EntropyTab() {
         <div className="grid grid-cols-2 gap-3 p-4">
           {(['S_LowVolEnt', 'S_VolCollapse', 'S_LowEntLowIV', 'S_LowGreekEnt', 'S_SkewFlow', 'S_PCRContrarian'] as const).map((strat) => {
             const item = signals?.items?.find(s => s.strategy === strat);
-            const fired = item?.fired === 1;
             const executed = item?.executed === 1;
+
+            // Current-vs-threshold display for the two production signals.
+            let gapLine: string | null = null;
+            const thresholds = data?.thresholds;
+            const m = metrics;
+            if (strat === 'S_SkewFlow' && m && thresholds?.comp_volume_p30 != null && m.comp_volume != null) {
+              const gap = m.comp_volume - thresholds.comp_volume_p30;
+              gapLine = `cv=${m.comp_volume.toFixed(4)} | p30(21d)=${thresholds.comp_volume_p30.toFixed(4)} | gap=${gap >= 0 ? '+' : ''}${gap.toFixed(4)}`;
+            } else if (strat === 'S_PCRContrarian' && m && thresholds?.pcr_vol_p80 != null && m.pcr_vol != null) {
+              const gap = m.pcr_vol - thresholds.pcr_vol_p80;
+              gapLine = `pcr_vol=${m.pcr_vol.toFixed(3)} | p80(21d)=${thresholds.pcr_vol_p80.toFixed(3)} | gap=${gap >= 0 ? '+' : ''}${gap.toFixed(3)}`;
+            }
+            // Derive state: prefer the explicit `state` column; fall back to
+            // fired/unfired for legacy rows that predate the parity schema.
+            const state: 'FIRED' | 'ARMED' | 'COOLDOWN' | 'IDLE' =
+              item?.state ?? (item?.fired === 1 ? 'FIRED' : 'IDLE');
+
+            const STATE_STYLE: Record<typeof state, { dot: string; label: string; tone: string }> = {
+              FIRED:    { dot: 'bg-accent-green shadow-[0_0_6px_rgba(0,230,118,0.4)]', label: 'FIRED',    tone: 'text-accent-green' },
+              ARMED:    { dot: 'bg-accent-amber shadow-[0_0_6px_rgba(255,176,32,0.4)]', label: 'ARMED',    tone: 'text-accent-amber' },
+              COOLDOWN: { dot: 'bg-text-muted/40',                                      label: 'COOLDOWN', tone: 'text-text-muted' },
+              IDLE:     { dot: 'bg-text-muted/20',                                      label: 'IDLE',     tone: 'text-text-muted' },
+            };
+            const sty = STATE_STYLE[state];
 
             return (
               <div key={strat} className="flex items-center gap-3 p-2.5 rounded-md bg-bg-primary/50">
                 {/* Status dot */}
-                <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${fired ? 'bg-accent-green shadow-[0_0_6px_rgba(0,230,118,0.4)]' : 'bg-text-muted/20'}`} />
+                <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${sty.dot}`} />
 
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-mono text-text-primary truncate">
                       {STRATEGY_LABELS[strat] || strat}
+                    </span>
+                    <span className={`px-1.5 py-0.5 text-[8px] font-mono font-bold rounded uppercase tracking-wider bg-bg-primary/70 ${sty.tone}`}>
+                      {sty.label}
                     </span>
                     {executed && (
                       <span className="px-1.5 py-0.5 text-[8px] font-mono font-bold bg-accent-green/20 text-accent-green rounded uppercase tracking-wider">
@@ -1215,6 +1261,9 @@ export default function EntropyTab() {
                   )}
                   {item?.rationale && (
                     <p className="text-[9px] font-mono text-text-muted mt-0.5 truncate">{item.rationale}</p>
+                  )}
+                  {gapLine && (
+                    <p className="text-[9px] font-mono text-accent-cyan/80 mt-0.5 truncate">{gapLine}</p>
                   )}
                 </div>
               </div>
