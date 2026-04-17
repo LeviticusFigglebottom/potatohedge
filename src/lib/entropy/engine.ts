@@ -33,7 +33,7 @@ import { restoreFromRedis, persistToRedis } from '@/lib/entropy/persistence';
 const TICKER = 'SPY';
 const LOOKBACK = 21;
 const RISK_FREE = 0.05;
-const MIN_DTE = 14;
+const MIN_DTE = 7;
 const MAX_DTE = 45;
 const TARGET_DTE = 28;
 const MAX_ALLOC = 0.12;
@@ -404,7 +404,7 @@ function tradierHeaders(): Record<string, string> {
   };
 }
 
-async function fetchRawChain(): Promise<RawContract[]> {
+async function fetchRawChain(spot: number): Promise<RawContract[]> {
   // Fetch expirations
   const expRes = await fetch(
     `${TRADIER_BASE_URL}/markets/options/expirations?symbol=${TICKER}&includeAllRoots=true`,
@@ -448,11 +448,14 @@ async function fetchRawChain(): Promise<RawContract[]> {
     const dte = Math.round((expDate.getTime() - todayDate.getTime()) / (1000 * 60 * 60 * 24));
 
     for (const o of options) {
+      const strike = parseFloat(o.strike ?? 0);
+      // QC set_filter(strikes(-30, 30)): keep strikes within ±30 of spot
+      if (!Number.isFinite(strike) || Math.abs(strike - spot) > 30) continue;
       const bid = parseFloat(o.bid ?? 0) || 0;
       const ask = parseFloat(o.ask ?? 0) || 0;
       allContracts.push({
         symbol: o.symbol ?? '',
-        strike: parseFloat(o.strike ?? 0),
+        strike,
         expiry: exp,
         dte,
         is_call: o.option_type === 'call',
@@ -491,6 +494,7 @@ function computeEntropy(
 
   for (const c of contracts) {
     if (c.mid <= 0 || c.bid <= 0) continue;
+    if (c.ask <= 0 || c.ask < c.bid) continue;
     if (c.dte <= 0) continue;
 
     const K = c.strike;
@@ -1190,14 +1194,14 @@ export async function runEntropyEngine(): Promise<RunResult> {
       };
     }
 
-    const contracts = await fetchRawChain();
-    if (contracts.length === 0) {
+    const contracts = await fetchRawChain(spot);
+    if (contracts.length < 10) {
       db.close();
       return {
         success: false,
         date: todayStr,
         status: 'error',
-        message: 'Failed to get option chain',
+        message: `Insufficient raw chain contracts (${contracts.length} < 10)`,
       };
     }
 
