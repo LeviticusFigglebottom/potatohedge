@@ -1020,17 +1020,19 @@ function evaluateSignals(
   //   threshold: comp_volume < pct(comp_volume, ENTROPY_PERCENTILE=30, 21d)
   //   gates:     put_skew > median(put_skew) AND put_skew > 0.01
   //   cooldown:  2 calendar days since last fire
-  //   strength:  _zstr (ratio form below; z-score form lands in commit 7)
+  //   strength:  _zstr(cv, 'comp_volume') = max(0, min(1, (med - val) / (3*std)))
   //   MIN_STRENGTH: 0.20 floor before ARMED → FIRED
   if (cv != null && ps != null) {
     const cvThresh = pct(history, 'comp_volume', ENTROPY_PERCENTILE, LOOKBACK);
     const psMed = psM;
     const conditionsMet = cv < cvThresh && ps > psMed && ps > 0.01;
     const cooldown = inCooldown('S_SkewFlow', lastFires, todayStr);
-    // strength formula unchanged in this commit (commit 7 replaces with _zstr)
-    const s1 = cv < cvThresh ? strength(cv, cvThresh) : 0;
-    const s2 = psMed !== 0 && ps > psMed ? Math.max(0, Math.min((ps - psMed) / Math.abs(psMed), 1)) : 0;
-    const sVal = conditionsMet ? Math.min((s1 + s2) / 2, 1) : 0;
+    // QC _zstr: scales (med - val) by 3 standard deviations, clamps [0, 1].
+    // Positive only when val < median.
+    const cvMedian = med(history, 'comp_volume', LOOKBACK);
+    const cvStd = stddev(history, 'comp_volume', LOOKBACK);
+    const sVal =
+      cvStd < 1e-8 ? 0 : Math.max(0, Math.min(1, (cvMedian - cv) / (cvStd * 3)));
     const state: SignalState = cooldown
       ? 'COOLDOWN'
       : !conditionsMet
@@ -1044,23 +1046,24 @@ function evaluateSignals(
       strength: sVal,
       direction: 1,
       trade_type: 'sell_put',
-      rationale: `cv=${cv.toFixed(4)} p30=${cvThresh.toFixed(4)} sk=${ps.toFixed(4)} med(sk)=${psMed.toFixed(4)}${cooldown ? ' (cooldown)' : ''}`,
+      rationale: `cv=${cv.toFixed(4)} p30=${cvThresh.toFixed(4)} sk=${ps.toFixed(4)} med(sk)=${psMed.toFixed(4)} z_str=${sVal.toFixed(3)}${cooldown ? ' (cooldown)' : ''}`,
     };
   }
 
   // S_PCRContrarian — QC parity:
   //   threshold: pcr_vol > pct(pcr_vol, 80, 21d)
   //   cooldown:  2 calendar days
-  //   strength:  (val - p80) / std  (swapped in commit 7)
+  //   strength:  min(1, (val - p80) / std)  — divided by std (QC), not p80
   //   MIN_STRENGTH: 0.20 floor
   if (pcrVol != null) {
     const pcrP80 = pct(history, 'pcr_vol', 80, LOOKBACK);
+    const pcrStd = stddev(history, 'pcr_vol', LOOKBACK);
     const conditionsMet = pcrVol > pcrP80;
-    const cooldown = inCooldown('S_PCRContrarian', lastFires, todayStr);
     const sVal =
-      conditionsMet && pcrP80 > 0
-        ? Math.max(0, Math.min((pcrVol - pcrP80) / pcrP80, 1))
+      conditionsMet && pcrStd > 0
+        ? Math.min(1, (pcrVol - pcrP80) / (pcrStd + 1e-8))
         : 0;
+    const cooldown = inCooldown('S_PCRContrarian', lastFires, todayStr);
     const state: SignalState = cooldown
       ? 'COOLDOWN'
       : !conditionsMet
@@ -1074,7 +1077,7 @@ function evaluateSignals(
       strength: sVal,
       direction: 1,
       trade_type: 'sell_put',
-      rationale: `pcr_vol=${pcrVol.toFixed(4)} p80=${pcrP80.toFixed(4)}${cooldown ? ' (cooldown)' : ''}`,
+      rationale: `pcr_vol=${pcrVol.toFixed(4)} p80=${pcrP80.toFixed(4)} std=${pcrStd.toFixed(4)} s=${sVal.toFixed(3)}${cooldown ? ' (cooldown)' : ''}`,
     };
   }
 
