@@ -799,35 +799,77 @@ function getHistory(db: BetterSqlite3Database, days: number = 60): HistoryEntry[
   return rows.reverse().map((r) => JSON.parse(r.metrics_json) as HistoryEntry);
 }
 
-function med(history: HistoryEntry[], key: string, lookback: number = LOOKBACK): number | null {
-  const vals = history
-    .slice(-lookback)
-    .map((h) => h[key])
-    .filter((v): v is number => v != null && typeof v === 'number');
-  if (vals.length < Math.floor(lookback / 2)) return null;
-  const sorted = [...vals].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+/** numpy.percentile-equivalent linear (type 7) interpolation on pre-sorted values. */
+function percentileSorted(sorted: number[], percentile: number): number {
+  const idx = (percentile / 100) * (sorted.length - 1);
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
 }
 
+/**
+ * Rolling percentile over the last `lookback` history rows.
+ * QC parity: falls back to 0.5 on empty input (matches QC's `if v else 0.5`),
+ * and computes on whatever data exists (no minimum-window gate).
+ */
 function pct(
   history: HistoryEntry[],
   key: string,
   percentile: number,
   lookback: number | null = null,
-): number | null {
+): number {
   const windowed = lookback != null ? history.slice(-lookback) : history;
   const vals = windowed
     .map((h) => h[key])
     .filter((v): v is number => v != null && typeof v === 'number')
     .sort((a, b) => a - b);
-  const minRequired = Math.floor((lookback ?? LOOKBACK) / 2);
-  if (vals.length < minRequired) return null;
-  const idx = (percentile / 100) * (vals.length - 1);
-  const lo = Math.floor(idx);
-  const hi = Math.ceil(idx);
-  if (lo === hi) return vals[lo];
-  return vals[lo] + (vals[hi] - vals[lo]) * (idx - lo);
+  if (vals.length === 0) return 0.5;
+  return percentileSorted(vals, percentile);
+}
+
+/** Rolling median = 50th percentile over the last `lookback` rows. */
+function med(history: HistoryEntry[], key: string, lookback: number = LOOKBACK): number {
+  return pct(history, key, 50, lookback);
+}
+
+/**
+ * Population standard deviation (ddof=0) over the last `lookback` rows.
+ * QC parity: returns 0.01 floor when fewer than 2 values available,
+ * matching QC's `np.std(v) if len(v) > 1 else 0.01`.
+ */
+function stddev(history: HistoryEntry[], key: string, lookback: number | null = null): number {
+  const windowed = lookback != null ? history.slice(-lookback) : history;
+  const vals = windowed
+    .map((h) => h[key])
+    .filter((v): v is number => v != null && typeof v === 'number');
+  if (vals.length < 2) return 0.01;
+  const mu = vals.reduce((a, b) => a + b, 0) / vals.length;
+  const variance = vals.reduce((a, v) => a + (v - mu) ** 2, 0) / vals.length;
+  return Math.sqrt(variance);
+}
+
+/**
+ * z-score of a current value vs rolling window.
+ * QC parity: returns 0.0 when fewer than 10 values, or when std < 1e-8,
+ * matching QC's _zscore.
+ */
+function zscore(
+  history: HistoryEntry[],
+  key: string,
+  currentVal: number,
+  lookback: number | null = null,
+): number {
+  const windowed = lookback != null ? history.slice(-lookback) : history;
+  const vals = windowed
+    .map((h) => h[key])
+    .filter((v): v is number => v != null && typeof v === 'number');
+  if (vals.length < 10) return 0.0;
+  const mu = vals.reduce((a, b) => a + b, 0) / vals.length;
+  const variance = vals.reduce((a, v) => a + (v - mu) ** 2, 0) / vals.length;
+  const std = Math.sqrt(variance);
+  if (std < 1e-8) return 0.0;
+  return (currentVal - mu) / std;
 }
 
 function diff(history: HistoryEntry[], key: string, lag: number = 1): number | null {
