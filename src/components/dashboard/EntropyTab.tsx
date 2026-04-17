@@ -1142,7 +1142,7 @@ export default function EntropyTab() {
             <table className="w-full text-[10px] font-mono">
               <thead>
                 <tr className="border-b border-border/20">
-                  {['Date', 'SPY', 'Composite', 'Vol Ent', 'Greek Ent', 'IV Mean', 'Put Skew', 'PCR $'].map(h => (
+                  {['Date', 'SPY', 'Composite', 'Vol Ent', 'Greek Ent', 'IV Mean', 'PCR Vol', 'Put Skew', 'PCR $'].map(h => (
                     <th key={h} className="px-2 py-1.5 text-left text-text-muted font-normal uppercase tracking-wider">{h}</th>
                   ))}
                 </tr>
@@ -1156,6 +1156,7 @@ export default function EntropyTab() {
                     <td className="px-2 py-1 text-accent-cyan">{fmt4(row.comp_volume)}</td>
                     <td className="px-2 py-1 text-accent-green">{fmt4(row.comp_greek)}</td>
                     <td className="px-2 py-1 text-text-secondary">{row.iv_mean != null ? fmtPct(row.iv_mean) : '—'}</td>
+                    <td className="px-2 py-1 text-text-secondary">{fmtRatio(row.pcr_vol as number | null | undefined)}</td>
                     <td className="px-2 py-1 text-text-secondary">{row.put_skew != null ? `${(row.put_skew * 100).toFixed(1)}pp` : '—'}</td>
                     <td className="px-2 py-1 text-text-secondary">{fmtRatio(row.pcr_dollar)}</td>
                   </tr>
