@@ -698,22 +698,32 @@ function computeEntropy(
   const cvSum = cvArr.reduce((a: number, b: number) => a + b, 0);
   m.H_charm_n = cvSum > 0 ? hNorm(cvArr) : null;
 
-  // IV mean (near-term ATM)
-  const nearRecs = recs.filter((r) => r.dte >= 7 && r.dte <= 45);
-  const ivs = nearRecs.filter((r) => r.iv > 0).map((r) => r.iv);
-  m.iv_mean = ivs.length > 5 ? mean(ivs) : null;
+  // IV mean — QC: ATM (0.97 <= moneyness <= 1.03) AND dte <= 30.
+  // Fallback to all enriched contracts if the subset is empty.
+  const atmIv = recs
+    .filter((r) => r.moneyness >= 0.97 && r.moneyness <= 1.03 && r.dte <= 30 && r.iv > 0)
+    .map((r) => r.iv);
+  if (atmIv.length > 0) {
+    m.iv_mean = mean(atmIv);
+  } else {
+    const all = recs.filter((r) => r.iv > 0).map((r) => r.iv);
+    m.iv_mean = all.length > 0 ? mean(all) : null;
+  }
 
-  // Put skew
-  const nearPuts = recs.filter((r) => !r.is_call && r.dte >= 14 && r.dte <= 45);
-  const atmPutIvs = nearPuts
+  // Put skew — QC: OTM puts [0.90, 0.95] inclusive upper,
+  //                ATM puts [0.98, 1.02] inclusive. No DTE filter.
+  //                Empty bucket → return 0.0 (not null).
+  const putsOnly = recs.filter((r) => !r.is_call);
+  const atmPutIvs = putsOnly
     .filter((r) => r.moneyness >= 0.98 && r.moneyness <= 1.02)
     .map((r) => r.iv);
-  const otmPutIvs = nearPuts
-    .filter((r) => r.moneyness >= 0.90 && r.moneyness < 0.97)
+  const otmPutIvs = putsOnly
+    .filter((r) => r.moneyness >= 0.90 && r.moneyness <= 0.95)
     .map((r) => r.iv);
-  const atmIv = atmPutIvs.length > 0 ? mean(atmPutIvs) : NaN;
-  const otmIv = otmPutIvs.length > 0 ? mean(otmPutIvs) : NaN;
-  m.put_skew = !isNaN(atmIv) && !isNaN(otmIv) ? otmIv - atmIv : null;
+  m.put_skew =
+    atmPutIvs.length > 0 && otmPutIvs.length > 0
+      ? mean(otmPutIvs) - mean(atmPutIvs)
+      : 0.0;
 
   // PCR
   const calls = recs.filter((r) => r.is_call);
