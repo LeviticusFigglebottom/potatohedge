@@ -87,6 +87,7 @@ interface SignalRow {
   trade_type: string;
   rationale: string;
   executed: number;
+  state?: string | null;
 }
 
 interface EntropySnapshot {
@@ -189,10 +190,10 @@ export async function restoreFromRedis(db: BetterSqlite3Database): Promise<void>
 
     if (signals && signals.length > 0) {
       const stmt = db.prepare(
-        'INSERT OR IGNORE INTO signals_log (date, strategy, fired, strength, trade_type, rationale, executed) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        'INSERT OR IGNORE INTO signals_log (date, strategy, fired, strength, trade_type, rationale, executed, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
       );
       for (const row of signals) {
-        stmt.run(row.date, row.strategy, row.fired, row.strength, row.trade_type, row.rationale, row.executed);
+        stmt.run(row.date, row.strategy, row.fired, row.strength, row.trade_type, row.rationale, row.executed, row.state ?? null);
       }
     }
   } catch (err) {

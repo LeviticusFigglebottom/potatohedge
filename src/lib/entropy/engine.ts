@@ -36,6 +36,12 @@ const LOOKBACK = 21;
 const RISK_FREE = 0.05;
 const MIN_DTE = 7;
 const MAX_DTE = 45;
+/** Fraction-below-median threshold for comp_volume in S_SkewFlow / S_LowVolEnt. */
+const ENTROPY_PERCENTILE = 30;
+/** Minimum strength floor for signal to transition from ARMED to FIRED (QC). */
+const MIN_STRENGTH = 0.20;
+/** Cooldown window in calendar days between fires of the same signal (QC _cool). */
+const SIGNAL_COOLDOWN_DAYS = 2;
 const TARGET_DTE = 28;
 const MAX_ALLOC = 0.12;
 const MAX_CONTRACTS = 25;
@@ -155,8 +161,11 @@ interface EntropyMetrics {
   [key: string]: unknown;
 }
 
+export type SignalState = 'FIRED' | 'ARMED' | 'COOLDOWN' | 'IDLE';
+
 interface Signal {
   fire: boolean;
+  state: SignalState;
   strength: number;
   direction: number;
   trade_type: string;
@@ -311,6 +320,7 @@ function initDb(db: BetterSqlite3Database): void {
     }
   };
   addColumn(`ALTER TABLE entropy_history ADD COLUMN schema_version TEXT`);
+  addColumn(`ALTER TABLE signals_log ADD COLUMN state TEXT`);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -882,9 +892,39 @@ function diff(history: HistoryEntry[], key: string, lag: number = 1): number | n
   return null;
 }
 
+/**
+ * Look up last fire date per signal strategy from signals_log.
+ * Returns map of strategy → YYYY-MM-DD of most recent fired=1 row.
+ */
+function loadLastFires(db: BetterSqlite3Database): Record<string, string> {
+  const rows = db
+    .prepare('SELECT strategy, MAX(date) AS last_date FROM signals_log WHERE fired = 1 GROUP BY strategy')
+    .all() as { strategy: string; last_date: string | null }[];
+  const out: Record<string, string> = {};
+  for (const r of rows) if (r.last_date) out[r.strategy] = r.last_date;
+  return out;
+}
+
+/** Calendar-day diff (today - lastDate). Both args YYYY-MM-DD. */
+function daysBetween(lastDate: string, today: string): number {
+  const [ly, lm, ld] = lastDate.split('-').map(Number);
+  const [ty, tm, td] = today.split('-').map(Number);
+  const msPerDay = 1000 * 60 * 60 * 24;
+  return Math.round((Date.UTC(ty, tm - 1, td) - Date.UTC(ly, lm - 1, ld)) / msPerDay);
+}
+
+/** True if signal last fired strictly within SIGNAL_COOLDOWN_DAYS of today. */
+function inCooldown(strategy: string, lastFires: Record<string, string>, todayStr: string): boolean {
+  const last = lastFires[strategy];
+  if (!last) return false;
+  return daysBetween(last, todayStr) < SIGNAL_COOLDOWN_DAYS;
+}
+
 function evaluateSignals(
   metrics: EntropyMetrics,
   history: HistoryEntry[],
+  lastFires: Record<string, string> = {},
+  todayStr: string = '',
 ): Record<string, Signal> {
   const sigs: Record<string, Signal> = {};
 
@@ -926,6 +966,7 @@ function evaluateSignals(
     const tt = iv != null && ivM != null && iv < ivM ? 'buy_call' : 'sell_put';
     sigs.S_LowVolEnt = {
       fire,
+      state: fire ? 'FIRED' : 'IDLE',
       strength: fire ? strength(cv, cvM) : 0,
       direction: 1,
       trade_type: tt,
@@ -940,6 +981,7 @@ function evaluateSignals(
       p20D1cv !== 0 && fire ? Math.max(0, Math.min(Math.abs(d1cv / p20D1cv) - 1, 1)) : 0;
     sigs.S_VolCollapse = {
       fire,
+      state: fire ? 'FIRED' : 'IDLE',
       strength: s,
       direction: 1,
       trade_type: 'bull_call_spread',
@@ -953,6 +995,7 @@ function evaluateSignals(
     const s = fire ? (strength(co, coM) + strength(iv, ivM)) / 2 : 0;
     sigs.S_LowEntLowIV = {
       fire,
+      state: fire ? 'FIRED' : 'IDLE',
       strength: s,
       direction: 1,
       trade_type: 'buy_call_longer',
@@ -965,6 +1008,7 @@ function evaluateSignals(
     const fire = cg < cgM;
     sigs.S_LowGreekEnt = {
       fire,
+      state: fire ? 'FIRED' : 'IDLE',
       strength: fire ? strength(cg, cgM) : 0,
       direction: 1,
       trade_type: 'sell_put',
@@ -972,36 +1016,66 @@ function evaluateSignals(
     };
   }
 
-  // S_SkewFlow
-  if (cv != null && cvM != null && ps != null && psM != null) {
-    const fire = cv < cvM && ps > psM && ps > 0.01;
-    const s1 = cv < cvM ? strength(cv, cvM) : 0;
-    const s2 =
-      psM !== 0 && ps > psM ? Math.max(0, Math.min((ps - psM) / Math.abs(psM), 1)) : 0;
+  // S_SkewFlow — QC parity:
+  //   threshold: comp_volume < pct(comp_volume, ENTROPY_PERCENTILE=30, 21d)
+  //   gates:     put_skew > median(put_skew) AND put_skew > 0.01
+  //   cooldown:  2 calendar days since last fire
+  //   strength:  _zstr (ratio form below; z-score form lands in commit 7)
+  //   MIN_STRENGTH: 0.20 floor before ARMED → FIRED
+  if (cv != null && ps != null) {
+    const cvThresh = pct(history, 'comp_volume', ENTROPY_PERCENTILE, LOOKBACK);
+    const psMed = psM;
+    const conditionsMet = cv < cvThresh && ps > psMed && ps > 0.01;
+    const cooldown = inCooldown('S_SkewFlow', lastFires, todayStr);
+    // strength formula unchanged in this commit (commit 7 replaces with _zstr)
+    const s1 = cv < cvThresh ? strength(cv, cvThresh) : 0;
+    const s2 = psMed !== 0 && ps > psMed ? Math.max(0, Math.min((ps - psMed) / Math.abs(psMed), 1)) : 0;
+    const sVal = conditionsMet ? Math.min((s1 + s2) / 2, 1) : 0;
+    const state: SignalState = cooldown
+      ? 'COOLDOWN'
+      : !conditionsMet
+        ? 'IDLE'
+        : sVal < MIN_STRENGTH
+          ? 'ARMED'
+          : 'FIRED';
     sigs.S_SkewFlow = {
-      fire,
-      strength: fire ? Math.min((s1 + s2) / 2, 1) : 0,
+      fire: state === 'FIRED',
+      state,
+      strength: sVal,
       direction: 1,
-      trade_type: 'sell_put_spread',
-      rationale: `cv=${cv.toFixed(4)} sk=${ps.toFixed(4)} ${ps > psM ? '>' : '<='} med=${psM.toFixed(4)}`,
+      trade_type: 'sell_put',
+      rationale: `cv=${cv.toFixed(4)} p30=${cvThresh.toFixed(4)} sk=${ps.toFixed(4)} med(sk)=${psMed.toFixed(4)}${cooldown ? ' (cooldown)' : ''}`,
     };
   }
 
-  // S_PCRContrarian
+  // S_PCRContrarian — QC parity:
+  //   threshold: pcr_vol > pct(pcr_vol, 80, 21d)
+  //   cooldown:  2 calendar days
+  //   strength:  (val - p80) / std  (swapped in commit 7)
+  //   MIN_STRENGTH: 0.20 floor
   if (pcrVol != null) {
     const pcrP80 = pct(history, 'pcr_vol', 80, LOOKBACK);
-    if (pcrP80 != null) {
-      const fire = pcrVol > pcrP80;
-      const s =
-        pcrP80 > 0 && fire ? Math.max(0, Math.min((pcrVol - pcrP80) / pcrP80, 1)) : 0;
-      sigs.S_PCRContrarian = {
-        fire,
-        strength: s,
-        direction: 1,
-        trade_type: 'sell_put',
-        rationale: `pcr_vol=${pcrVol.toFixed(4)} ${fire ? '>' : '<='} p80=${pcrP80.toFixed(4)}`,
-      };
-    }
+    const conditionsMet = pcrVol > pcrP80;
+    const cooldown = inCooldown('S_PCRContrarian', lastFires, todayStr);
+    const sVal =
+      conditionsMet && pcrP80 > 0
+        ? Math.max(0, Math.min((pcrVol - pcrP80) / pcrP80, 1))
+        : 0;
+    const state: SignalState = cooldown
+      ? 'COOLDOWN'
+      : !conditionsMet
+        ? 'IDLE'
+        : sVal < MIN_STRENGTH
+          ? 'ARMED'
+          : 'FIRED';
+    sigs.S_PCRContrarian = {
+      fire: state === 'FIRED',
+      state,
+      strength: sVal,
+      direction: 1,
+      trade_type: 'sell_put',
+      rationale: `pcr_vol=${pcrVol.toFixed(4)} p80=${pcrP80.toFixed(4)}${cooldown ? ' (cooldown)' : ''}`,
+    };
   }
 
   return sigs;
@@ -1270,20 +1344,7 @@ export async function runEntropyEngine(): Promise<RunResult> {
       };
     }
 
-    // September skip — still manage existing positions
-    if (etMonth === 9) {
-      await managePositions(db, todayStr);
-      await persistToRedis(db);
-      db.close();
-      return {
-        success: true,
-        date: todayStr,
-        status: 'september_skip',
-        message: 'September skip — no new entries, managed existing positions',
-      };
-    }
-
-    // 1. Get market data
+    // 1. Get market data (always runs — September writes history too)
     const quote = await getQuote(TICKER);
     const spot = quote.last;
     if (!spot || spot <= 0) {
@@ -1328,7 +1389,22 @@ export async function runEntropyEngine(): Promise<RunResult> {
       'INSERT OR REPLACE INTO entropy_history (date, spot, metrics_json, schema_version) VALUES (?, ?, ?, ?)',
     ).run(todayStr, spot, JSON.stringify(store), SCHEMA_VERSION);
 
-    // 3. Load history
+    // QC parity: September — history is ALREADY written above, but skip
+    // signal evaluation entirely. Still manage existing positions.
+    if (etMonth === 9) {
+      await managePositions(db, todayStr);
+      await persistToRedis(db);
+      db.close();
+      return {
+        success: true,
+        date: todayStr,
+        status: 'september_skip',
+        message: 'September: metrics recorded, signal evaluation skipped',
+        metrics: store as Record<string, number | null>,
+      };
+    }
+
+    // 3. Load history (includes today's row we just wrote)
     const history = getHistory(db);
     if (history.length < WARMUP_DAYS) {
       // Persist to Redis so data survives redeployments
@@ -1346,16 +1422,17 @@ export async function runEntropyEngine(): Promise<RunResult> {
     // 4. Manage existing positions
     await managePositions(db, todayStr);
 
-    // 5. Evaluate signals
-    const signals = evaluateSignals(metrics, history);
+    // 5. Evaluate signals (passes lastFires for cooldown gate + todayStr)
+    const lastFires = loadLastFires(db);
+    const signals = evaluateSignals(metrics, history, lastFires, todayStr);
     const signalsFired: string[] = [];
 
-    // Log all signals
+    // Log all signals (with state for UI 4-state rendering)
     for (const [sn, sig] of Object.entries(signals)) {
       db.prepare(
-        `INSERT OR REPLACE INTO signals_log (date, strategy, fired, strength, trade_type, rationale)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      ).run(todayStr, sn, sig.fire ? 1 : 0, sig.strength, sig.trade_type, sig.rationale);
+        `INSERT OR REPLACE INTO signals_log (date, strategy, fired, strength, trade_type, rationale, state)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(todayStr, sn, sig.fire ? 1 : 0, sig.strength, sig.trade_type, sig.rationale, sig.state);
       if (sig.fire) signalsFired.push(sn);
     }
 
