@@ -16,6 +16,7 @@ import {
   gamma as bsGamma,
   delta as bsDelta,
   vega as bsVega,
+  charm as bsCharm,
 } from '@/lib/math/blackScholes';
 import { getQuote } from '@/lib/providers/tradier';
 import {
@@ -125,6 +126,7 @@ interface EnrichedRecord {
   gamma: number;
   vega: number;
   theta: number;
+  charm: number;
   moneyness: number;
 }
 
@@ -525,6 +527,8 @@ function computeEntropy(
           RISK_FREE * K * expRT * normCDFInline(-d2)) / 365;
     }
 
+    const charmVal = bsCharm(params, isCall ? 'call' : 'put');
+
     recs.push({
       symbol: c.symbol,
       strike: K,
@@ -541,6 +545,7 @@ function computeEntropy(
       gamma: gVal,
       vega: vVal,
       theta: thetaVal,
+      charm: charmVal,
       moneyness: K / spot,
     });
   }
@@ -563,10 +568,10 @@ function computeEntropy(
   const vkSum = vkVals.reduce((a, b) => a + b, 0);
   m.H_vol_k_n = vkSum > 0 ? hNorm(vkVals) : null;
 
-  // Premium by expiry
+  // Premium by expiry — QC: weight = mid * volume * 100, no floor on volume
   const ep: Record<string, number> = {};
   for (const r of recs) {
-    ep[r.expiry] = (ep[r.expiry] ?? 0) + r.mid * Math.max(r.volume, 1) * 100;
+    ep[r.expiry] = (ep[r.expiry] ?? 0) + r.mid * r.volume * 100;
   }
   const peVals = Object.values(ep).map(Math.abs);
   const peSum = peVals.reduce((a, b) => a + b, 0);
@@ -581,10 +586,10 @@ function computeEntropy(
   const vvSum = vvVals.reduce((a, b) => a + b, 0);
   m.H_vegavol_n = vvSum > 0 ? hNorm(vvVals) : null;
 
-  // Dollar gamma by strike
+  // Dollar gamma by strike — QC: weight = |gamma * volume * spot * 100|
   const dg: Record<number, number> = {};
   for (const r of recs) {
-    dg[r.strike] = (dg[r.strike] ?? 0) + Math.abs(r.gamma) * spot * spot * 0.01;
+    dg[r.strike] = (dg[r.strike] ?? 0) + Math.abs(r.gamma * r.volume * spot * 100);
   }
   const daVals = Object.values(dg);
   const daSum = daVals.reduce((a, b) => a + b, 0);
@@ -622,15 +627,29 @@ function computeEntropy(
   const dflowSum = dflow.reduce((a: number, b: number) => a + b, 0);
   m.H_dflow_n = dflowSum > 0 ? hNorm(dflow) : null;
 
-  // Spread by strike
-  const sp: Record<number, number> = {};
-  for (const r of recs) sp[r.strike] = (sp[r.strike] ?? 0) + r.spread;
-  const spsVals = Object.values(sp).map(Math.abs);
-  const spsSum = spsVals.reduce((a, b) => a + b, 0);
-  m.H_spread_k_n = spsSum > 0 ? hNorm(spsVals) : null;
+  // Liquidity concentration by strike — QC H_sk:
+  // per-strike weight = Σ volume / relative_spread, where relative_spread = (ask-bid)/mid.
+  // Skip contracts with relative_spread <= 0 or volume <= 0.
+  const sl: Record<number, number> = {};
+  for (const r of recs) {
+    if (r.mid <= 0 || r.volume <= 0) continue;
+    const relSpread = (r.ask - r.bid) / r.mid;
+    if (relSpread <= 0) continue;
+    sl[r.strike] = (sl[r.strike] ?? 0) + r.volume / relSpread;
+  }
+  const slVals = Object.values(sl);
+  const slSum = slVals.reduce((a, b) => a + b, 0);
+  m.H_spread_k_n = slSum > 0 ? hNorm(slVals) : null;
 
-  // Moneyness buckets
-  const mb = [0.85, 0.90, 0.95, 0.97, 1.0, 1.03, 1.05, 1.10, 1.15];
+  // Moneyness buckets — QC: 15 uniform bins width 0.02 on [0.85, 1.15].
+  // Edges: [0.85, 0.87, 0.89, ..., 1.13, 1.15] (16 edges → 15 bins).
+  // Matches numpy np.digitize on an in-range point; out-of-range points are
+  // dropped (QC's _bkt inner loop breaks only on a matching bin, skipping
+  // moneyness < 0.85 or >= 1.15).
+  const mb = [
+    0.85, 0.87, 0.89, 0.91, 0.93, 0.95, 0.97, 0.99,
+    1.01, 1.03, 1.05, 1.07, 1.09, 1.11, 1.13, 1.15,
+  ];
   const mv = new Array(mb.length - 1).fill(0);
   for (const r of recs) {
     for (let b = 0; b < mb.length - 1; b++) {
@@ -643,17 +662,20 @@ function computeEntropy(
   const mvSum = mv.reduce((a: number, b: number) => a + b, 0);
   m.H_moneyness_n = mvSum > 0 ? hNorm(mv) : null;
 
-  // Charm by DTE bucket
-  const cb = [0, 7, 14, 21, 28, 35, 45];
-  const cvArr = new Array(cb.length - 1).fill(0);
+  // Charm by DTE bucket — QC H_ch: weight = |charm| (standard BS charm,
+  // not the previous inline proxy), bucket edges parameterized by
+  // MIN_DTE/MAX_DTE as range(MIN_DTE, MAX_DTE+2, 5), matching QC's
+  // list(range(min_dte, max_dte + 2, 5)).
+  // Note: QC weights by |charm| alone (no volume multiplication); the
+  // user's spec for 2e requested |charm*volume|, but the QC helper does
+  // not include volume — QC CODE WINS per the spec's precedence rule.
+  const cb: number[] = [];
+  for (let edge = MIN_DTE; edge < MAX_DTE + 2; edge += 5) cb.push(edge);
+  const cvArr = new Array(Math.max(0, cb.length - 1)).fill(0);
   for (const r of recs) {
-    const charmVal =
-      r.iv > 0
-        ? Math.abs(r.gamma * (RISK_FREE - (r.iv * r.iv) / 2) / r.iv)
-        : 0;
     for (let b = 0; b < cb.length - 1; b++) {
-      if (r.dte > cb[b] && r.dte <= cb[b + 1]) {
-        cvArr[b] += Math.abs(charmVal);
+      if (r.dte >= cb[b] && r.dte < cb[b + 1]) {
+        cvArr[b] += Math.abs(r.charm);
         break;
       }
     }
