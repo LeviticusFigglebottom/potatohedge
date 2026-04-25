@@ -79,6 +79,9 @@ export default function AVWAPTab() {
   const [error, setError] = useState<string | null>(null);
   const [anchors, setAnchors] = useState<AnchorDef[]>([]);
   const [availableAnchors, setAvailableAnchors] = useState<{ date: string; label: string; type: string }[]>([]);
+  const [anchorsLoading, setAnchorsLoading] = useState(false);
+  const [anchorsError, setAnchorsError] = useState<string | null>(null);
+  const [anchorsRetry, setAnchorsRetry] = useState(0);
   const [retryCount, setRetryCount] = useState(0);
 
   // Fetch bars when ticker, timespan, or retry trigger changes
@@ -112,12 +115,22 @@ export default function AVWAPTab() {
     return () => { cancelled = true; };
   }, [ticker, selectedTimespan, retryCount]);
 
-  // Fetch available anchor dates (earnings, 52w, YTD)
+  // Fetch available anchor dates (earnings, 52w, YTD).
+  // Failure modes (transient network, /api/earnings-dates timeouts) used to
+  // silently swallow with .catch(() => {}), leaving the preset row hidden
+  // until the user clicked Analyze (which re-triggered the fetch). The
+  // loading and error states surfaced here drive AnchorSelector's skeleton
+  // / retry UI so the row is always visible while a ticker is set.
   useEffect(() => {
     if (!ticker) return;
     let cancelled = false;
+    setAnchorsLoading(true);
+    setAnchorsError(null);
     fetch(`/api/earnings-dates?ticker=${ticker}`)
-      .then(r => r.json())
+      .then(async r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
       .then(data => {
         if (cancelled) return;
         setAvailableAnchors(data.anchors || []);
@@ -133,9 +146,15 @@ export default function AVWAPTab() {
           }
         }
       })
-      .catch(() => {});
+      .catch(err => {
+        if (cancelled) return;
+        setAnchorsError(err instanceof Error ? err.message : 'Failed to load anchors');
+      })
+      .finally(() => {
+        if (!cancelled) setAnchorsLoading(false);
+      });
     return () => { cancelled = true; };
-  }, [ticker]);
+  }, [ticker, anchorsRetry]);
 
   // Compute all derived series
   const computedData = useMemo((): ComputedAVWAPData | null => {
@@ -283,6 +302,9 @@ export default function AVWAPTab() {
             availableAnchors={availableAnchors}
             anchors={anchors}
             onAnchorsChange={setAnchors}
+            loading={anchorsLoading}
+            error={anchorsError}
+            onRetry={() => setAnchorsRetry(c => c + 1)}
           />
 
           <AVWAPChart bars={bars} computedData={computedData} ticker={ticker} />

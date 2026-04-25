@@ -9,9 +9,19 @@ interface Props {
   availableAnchors: { date: string; label: string; type: string }[];
   anchors: AnchorDef[];
   onAnchorsChange: (anchors: AnchorDef[]) => void;
+  loading?: boolean;
+  error?: string | null;
+  onRetry?: () => void;
 }
 
-export default function AnchorSelector({ availableAnchors, anchors, onAnchorsChange }: Props) {
+export default function AnchorSelector({
+  availableAnchors,
+  anchors,
+  onAnchorsChange,
+  loading = false,
+  error = null,
+  onRetry,
+}: Props) {
   const [customDate, setCustomDate] = useState('');
 
   // Anchors are identified by (type, date). Two presets may legitimately share
@@ -63,28 +73,46 @@ export default function AnchorSelector({ availableAnchors, anchors, onAnchorsCha
         )}
       </div>
 
-      {/* Preset anchors */}
-      {availableAnchors.length > 0 && (
-        <div className="flex flex-wrap gap-1.5 mb-3">
-          {availableAnchors.map(anchor => {
-            const isActive = anchors.find(a => a.type === anchor.type && a.date === anchor.date);
-            return (
+      {/* Preset anchors — always rendered so the row doesn't disappear
+          while the earnings-dates fetch is in flight or failed silently. */}
+      <div className="flex flex-wrap gap-1.5 mb-3 items-center min-h-[28px]">
+        {loading && availableAnchors.length === 0 && (
+          <span className="text-text-muted text-xs animate-pulse">Loading presets...</span>
+        )}
+        {error && availableAnchors.length === 0 && (
+          <span className="text-amber-400 text-xs flex items-center gap-2">
+            Failed to load presets ({error})
+            {onRetry && (
               <button
-                key={`${anchor.type}-${anchor.date}`}
-                onClick={() => (isActive ? removeAnchor(anchor.type, anchor.date) : addAnchor(anchor))}
-                disabled={anchors.length >= 5 && !isActive}
-                className={`px-2.5 py-1 rounded text-xs border transition-colors ${
-                  isActive
-                    ? 'border-accent-cyan text-accent-cyan bg-accent-cyan/10'
-                    : 'border-border text-text-muted hover:border-text-muted hover:text-text-secondary'
-                } disabled:opacity-40`}
+                onClick={onRetry}
+                className="text-accent-cyan hover:text-accent-cyan/80 underline underline-offset-2"
               >
-                {anchor.label}
+                Retry
               </button>
-            );
-          })}
-        </div>
-      )}
+            )}
+          </span>
+        )}
+        {!loading && !error && availableAnchors.length === 0 && (
+          <span className="text-text-muted text-xs">No preset anchors available for this ticker</span>
+        )}
+        {availableAnchors.map(anchor => {
+          const isActive = anchors.find(a => a.type === anchor.type && a.date === anchor.date);
+          return (
+            <button
+              key={`${anchor.type}-${anchor.date}`}
+              onClick={() => (isActive ? removeAnchor(anchor.type, anchor.date) : addAnchor(anchor))}
+              disabled={anchors.length >= 5 && !isActive}
+              className={`px-2.5 py-1 rounded text-xs border transition-colors ${
+                isActive
+                  ? 'border-accent-cyan text-accent-cyan bg-accent-cyan/10'
+                  : 'border-border text-text-muted hover:border-text-muted hover:text-text-secondary'
+              } disabled:opacity-40`}
+            >
+              {anchor.label}
+            </button>
+          );
+        })}
+      </div>
 
       {/* Custom date input */}
       <div className="flex items-center gap-2">
