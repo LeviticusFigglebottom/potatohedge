@@ -47,6 +47,8 @@ export interface AnchorDef {
 export interface AVWAPSeriesData {
   anchor: AnchorDef;
   anchorIndex: number;
+  /** True when the anchor date falls outside the loaded bar range. */
+  outOfRange: boolean;
   avwap: (number | null)[];
   bands1: { upper: (number | null)[]; lower: (number | null)[] };
   bands2: { upper: (number | null)[]; lower: (number | null)[] };
@@ -143,6 +145,7 @@ export default function AVWAPTab() {
       // Parse anchor date as 9:30 AM ET (market open) to snap to correct session
       const anchorTs = anchorDateToTimestamp(anchor.date);
       const anchorIndex = findAnchorIndex(bars, anchorTs);
+      const outOfRange = anchorIndex < 0;
       const avwap = computeAVWAP(bars, anchorIndex);
       const bands1 = computeAVWAPBands(bars, anchorIndex, avwap, 1);
       const bands2 = computeAVWAPBands(bars, anchorIndex, avwap, 2);
@@ -150,7 +153,7 @@ export default function AVWAPTab() {
       const madState = classifyMADState(mad);
       const slopeAccel = computeAVWAPSlopeAcceleration(avwap);
 
-      return { anchor, anchorIndex, avwap, bands1, bands2, mad, madState, slopeAccel };
+      return { anchor, anchorIndex, outOfRange, avwap, bands1, bands2, mad, madState, slopeAccel };
     });
 
     const rvol = computeRVOL(bars);
@@ -243,6 +246,22 @@ export default function AVWAPTab() {
           currentADX={computedData.currentADX}
           ticker={ticker}
         />
+      )}
+
+      {/* Out-of-range anchor warning */}
+      {computedData && computedData.avwapSeries.some(s => s.outOfRange) && (
+        <div className="bg-amber-900/20 border border-amber-700/40 rounded-lg px-3 py-2 text-xs text-amber-200">
+          <span className="font-semibold">Anchor outside available bars:</span>{' '}
+          {computedData.avwapSeries
+            .filter(s => s.outOfRange)
+            .map(s => s.anchor.label)
+            .join(', ')}
+          {' — '}
+          <span className="text-amber-300/80">
+            switch to a longer timespan (the {selectedTimespan.label} preset only loads
+            {' '}{selectedTimespan.daysBack} days of history).
+          </span>
+        </div>
       )}
 
       {/* Empty state when no data */}

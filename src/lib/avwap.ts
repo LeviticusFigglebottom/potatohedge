@@ -19,9 +19,16 @@ export interface Bar {
  * Compute AVWAP from a specific anchor index forward.
  * Uses vw (volume-weighted price) as the price input when available,
  * falls back to typical price (H+L+C)/3.
+ *
+ * If anchorIndex is -1 (out-of-range, see findAnchorIndex) or refers to
+ * the last bar, returns an all-null array. A single-point AVWAP is not
+ * meaningful and the chart layer would otherwise render it as a flat
+ * horizontal price line.
  */
 export function computeAVWAP(bars: Bar[], anchorIndex: number): (number | null)[] {
   const result: (number | null)[] = new Array(bars.length).fill(null);
+  if (anchorIndex < 0 || anchorIndex >= bars.length - 1) return result;
+
   let cumulativePV = 0;
   let cumulativeV = 0;
 
@@ -48,6 +55,8 @@ export function computeAVWAPBands(
 ): { upper: (number | null)[]; lower: (number | null)[] } {
   const upper: (number | null)[] = new Array(bars.length).fill(null);
   const lower: (number | null)[] = new Array(bars.length).fill(null);
+  if (anchorIndex < 0 || anchorIndex >= bars.length - 1) return { upper, lower };
+
   let cumulativePV2 = 0;
   let cumulativeV = 0;
 
@@ -295,10 +304,33 @@ export function computeAVWAPSlopeAcceleration(
 }
 
 /**
- * Find the bar index closest to a given timestamp.
- * Used to resolve anchor date selections to bar array indices.
+ * Find the bar index closest to a given timestamp, with bounds rejection.
+ *
+ * Returns the closest matching index when the target falls inside the
+ * bar range. Returns -1 when the target is OUTSIDE the available range —
+ * i.e. before the earliest bar's timestamp or after the latest bar's
+ * timestamp.
+ *
+ * Why strict bounds matter: the AVWAP UI lets the user pick anchors like
+ * "52w High" which can resolve to dates months before the loaded bars
+ * (intraday timespans only carry ~5 trading days of history). Without
+ * bounds rejection, every too-old anchor clamps to bar 0, producing
+ * indistinguishable AVWAP lines that all start at the earliest bar
+ * (the user perceives this as "the new anchor replaced the old one,
+ * only the color changed"). Likewise, anchors that resolve past the
+ * latest bar (timezone edge cases, "today" anchors against yesterday's
+ * EOD bar) clamp to the last bar and produce a single-point AVWAP that
+ * renders as a horizontal price line at the most recent close.
+ *
+ * Callers should treat -1 as "anchor cannot be represented at this
+ * timespan" and surface that to the user (e.g. "switch to a longer
+ * timespan").
  */
 export function findAnchorIndex(bars: Bar[], targetTimestampMs: number): number {
+  if (bars.length === 0) return -1;
+  if (targetTimestampMs < bars[0].t) return -1;
+  if (targetTimestampMs > bars[bars.length - 1].t) return -1;
+
   let closest = 0;
   let minDiff = Infinity;
   for (let i = 0; i < bars.length; i++) {
