@@ -102,33 +102,59 @@ function aggregateBars(bars: PolygonBar[], n: number): PolygonBar[] {
 
 /**
  * Fallback: fetch bars from Tradier and convert to Polygon's bar shape.
- * Honors the AVWAP UI's `from`/`to` window. Note Tradier's intraday history
- * is shallower than Polygon's — minute-resolution data is typically only
- * the last ~5 trading days. Anchors set further back will not have bars
- * available; client-side AVWAP renders nothing.
+ *
+ * Tradier intraday history is shallower than Polygon's, and the exact limit
+ * varies by tier and resolution (typically ~40 calendar days for minute
+ * bars, ~90 for daily). When the requested `from` predates Tradier's limit,
+ * the API returns HTTP 400 with a body like
+ *   "Invalid parameter, start: must be on or after YYYY-MM-DD HH:MM:SS"
+ * — we parse that date out and retry once with the clamped start. The
+ * caller learns about the truncation via the returned `clampedFrom` field
+ * (so the UI can surface a "data clipped" banner).
  */
+interface TradierBarsResult {
+  bars: PolygonBar[];
+  clampedFrom?: string;
+}
+
 async function fetchTradierBars(
   ticker: string,
   multiplier: number,
   timespan: string,
   from: string,
   to: string,
-): Promise<PolygonBar[]> {
+): Promise<TradierBarsResult> {
   const mapping = tradierMapping(multiplier, timespan);
   if (!mapping) {
     throw new Error(`Tradier fallback does not support ${multiplier} ${timespan} bars`);
   }
-  const ohlcv = await getHistory(ticker, mapping.interval, from, to);
-  // OHLCV.time is unix seconds; Polygon Bar.t is unix milliseconds.
-  const baseBars: PolygonBar[] = ohlcv.map((b) => ({
-    t: b.time * 1000,
-    o: b.open,
-    h: b.high,
-    l: b.low,
-    c: b.close,
-    v: b.volume,
-  }));
-  return aggregateBars(baseBars, mapping.aggregate);
+
+  const tryFetch = async (startDate: string): Promise<PolygonBar[]> => {
+    const ohlcv = await getHistory(ticker, mapping.interval, startDate, to);
+    return ohlcv.map((b) => ({
+      t: b.time * 1000,
+      o: b.open,
+      h: b.high,
+      l: b.low,
+      c: b.close,
+      v: b.volume,
+    }));
+  };
+
+  let baseBars: PolygonBar[];
+  let clampedFrom: string | undefined;
+  try {
+    baseBars = await tryFetch(from);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Tradier sends back: "must be on or after 2026-02-27 00:00:00"
+    const match = msg.match(/on or after (\d{4}-\d{2}-\d{2})/);
+    if (!match) throw err;
+    clampedFrom = match[1];
+    baseBars = await tryFetch(clampedFrom);
+  }
+
+  return { bars: aggregateBars(baseBars, mapping.aggregate), clampedFrom };
 }
 
 export async function GET(request: NextRequest) {
@@ -188,8 +214,13 @@ export async function GET(request: NextRequest) {
 
   // ── Tradier fallback ────────────────────────────────────────────────
   try {
-    const bars = await fetchTradierBars(upperTicker, multiplier, timespan, from, to);
-    return NextResponse.json({ bars, ticker: upperTicker, source: 'tradier' });
+    const { bars, clampedFrom } = await fetchTradierBars(upperTicker, multiplier, timespan, from, to);
+    return NextResponse.json({
+      bars,
+      ticker: upperTicker,
+      source: 'tradier',
+      ...(clampedFrom ? { clampedFrom, requestedFrom: from } : {}),
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     return NextResponse.json(

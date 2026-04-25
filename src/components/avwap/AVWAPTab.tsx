@@ -77,6 +77,7 @@ export default function AVWAPTab() {
   const [bars, setBars] = useState<Bar[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [clampedFrom, setClampedFrom] = useState<string | null>(null);
   const [anchors, setAnchors] = useState<AnchorDef[]>([]);
   const [availableAnchors, setAvailableAnchors] = useState<{ date: string; label: string; type: string }[]>([]);
   const [anchorsLoading, setAnchorsLoading] = useState(false);
@@ -91,6 +92,7 @@ export default function AVWAPTab() {
     const fetchBars = async () => {
       setLoading(true);
       setError(null);
+      setClampedFrom(null);
       try {
         const to = new Date().toISOString().slice(0, 10);
         const from = new Date(Date.now() - selectedTimespan.daysBack * 24 * 60 * 60 * 1000)
@@ -104,6 +106,7 @@ export default function AVWAPTab() {
         if (cancelled) return;
         if (data.error) throw new Error(data.error);
         setBars(data.bars || []);
+        if (data.clampedFrom) setClampedFrom(data.clampedFrom);
       } catch (err) {
         if (cancelled) return;
         setError(err instanceof Error ? err.message : 'Failed to fetch data');
@@ -200,11 +203,18 @@ export default function AVWAPTab() {
 
   const handleTickerSearch = useCallback(() => {
     const cleaned = tickerInput.trim().toUpperCase();
-    if (cleaned) {
+    if (!cleaned) return;
+    // Only reset anchors when the ticker actually changes. Clicking Analyze
+    // on the same ticker (e.g. to refresh data) should preserve the user's
+    // current anchor selections rather than wiping them.
+    if (cleaned !== ticker) {
       setTicker(cleaned);
       setAnchors([]);
+    } else {
+      // Same ticker — just retrigger the bar fetch.
+      setRetryCount((c) => c + 1);
     }
-  }, [tickerInput]);
+  }, [tickerInput, ticker]);
 
   return (
     <div className="flex flex-col gap-4 animate-fade-in">
@@ -280,6 +290,15 @@ export default function AVWAPTab() {
             switch to a longer timespan (the {selectedTimespan.label} preset only loads
             {' '}{selectedTimespan.daysBack} days of history).
           </span>
+        </div>
+      )}
+
+      {/* Tradier clamped-range warning */}
+      {clampedFrom && (
+        <div className="bg-blue-900/20 border border-blue-700/40 rounded-lg px-3 py-2 text-xs text-blue-200">
+          <span className="font-semibold">Data clipped:</span>{' '}
+          Tradier intraday history goes back to {clampedFrom}; older bars
+          unavailable on this tier. Polygon would carry deeper history.
         </div>
       )}
 

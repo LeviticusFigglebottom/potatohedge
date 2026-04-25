@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { getHistory } from '@/lib/providers/tradier';
 
 export const maxDuration = 15;
 
@@ -68,53 +69,75 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    // Fetch 52-week high/low dates from daily aggregates
+    // Fetch 52-week high/low dates from daily aggregates.
+    // Polygon /v2/aggs is preferred (faster, longer adjusted history), but if
+    // the key is missing or the subscription is deactivated we fall back to
+    // Tradier daily history which carries ~1 year of bars by default.
+    let dailyBars: DailyBar[] = [];
+    let polygonOk = false;
     if (POLYGON_API_KEY) {
       try {
         const endDate = new Date().toISOString().slice(0, 10);
         const startDate = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
         const dailyUrl = `https://api.polygon.io/v2/aggs/ticker/${ticker.toUpperCase()}/range/1/day/${startDate}/${endDate}?adjusted=true&sort=asc&limit=365&apiKey=${POLYGON_API_KEY}`;
         const dailyRes = await fetchWithRetry(dailyUrl);
-
         if (dailyRes.ok) {
           const dailyData = await dailyRes.json();
-          const dailyBars: DailyBar[] = dailyData.results || [];
-
-          if (dailyBars.length > 0) {
-            // Compute median close for outlier detection
-            const closes = dailyBars.map(b => b.c).sort((a, b) => a - b);
-            const medianClose = closes[Math.floor(closes.length / 2)];
-
-            // Find 52-week high using close prices (not wicks) to avoid flash-crash outliers.
-            // Wicks can be extreme intraday anomalies (e.g., SPY flash to $69) that
-            // produce misleading structural anchors.
-            let highBar = dailyBars[0];
-            let lowBar = dailyBars[0];
-            for (const bar of dailyBars) {
-              if (bar.c > highBar.c) highBar = bar;
-              if (bar.c < lowBar.c) lowBar = bar;
-            }
-
-            // Only include if values are within a reasonable range of the median
-            // (filters out clearly erroneous data points)
-            if (highBar && highBar.c > 0 && highBar.c < medianClose * 3) {
-              structureAnchors.push({
-                date: new Date(highBar.t).toISOString().slice(0, 10),
-                label: `52-Week High ($${highBar.c.toFixed(2)})`,
-                type: '52w_high',
-              });
-            }
-            if (lowBar && lowBar.c > 0 && lowBar.c > medianClose * 0.2) {
-              structureAnchors.push({
-                date: new Date(lowBar.t).toISOString().slice(0, 10),
-                label: `52-Week Low ($${lowBar.c.toFixed(2)})`,
-                type: '52w_low',
-              });
-            }
-          }
+          dailyBars = dailyData.results || [];
+          polygonOk = dailyBars.length > 0;
         }
       } catch {
-        // Structure anchors are supplementary
+        // fall through to Tradier
+      }
+    }
+    if (!polygonOk) {
+      try {
+        const ohlcv = await getHistory(ticker.toUpperCase(), '1D');
+        // Tradier OHLCV uses unix seconds in `time`; convert to ms for parity
+        // with the Polygon shape used downstream.
+        dailyBars = ohlcv.map((b) => ({
+          t: b.time * 1000,
+          o: b.open,
+          h: b.high,
+          l: b.low,
+          c: b.close,
+          v: b.volume,
+        }));
+      } catch {
+        // Both providers failed — structureAnchors will only have YTD.
+      }
+    }
+
+    if (dailyBars.length > 0) {
+      // Compute median close for outlier detection
+      const closes = dailyBars.map(b => b.c).sort((a, b) => a - b);
+      const medianClose = closes[Math.floor(closes.length / 2)];
+
+      // Find 52-week high using close prices (not wicks) to avoid flash-crash outliers.
+      // Wicks can be extreme intraday anomalies (e.g., SPY flash to $69) that
+      // produce misleading structural anchors.
+      let highBar = dailyBars[0];
+      let lowBar = dailyBars[0];
+      for (const bar of dailyBars) {
+        if (bar.c > highBar.c) highBar = bar;
+        if (bar.c < lowBar.c) lowBar = bar;
+      }
+
+      // Only include if values are within a reasonable range of the median
+      // (filters out clearly erroneous data points)
+      if (highBar && highBar.c > 0 && highBar.c < medianClose * 3) {
+        structureAnchors.push({
+          date: new Date(highBar.t).toISOString().slice(0, 10),
+          label: `52-Week High ($${highBar.c.toFixed(2)})`,
+          type: '52w_high',
+        });
+      }
+      if (lowBar && lowBar.c > 0 && lowBar.c > medianClose * 0.2) {
+        structureAnchors.push({
+          date: new Date(lowBar.t).toISOString().slice(0, 10),
+          label: `52-Week Low ($${lowBar.c.toFixed(2)})`,
+          type: '52w_low',
+        });
       }
     }
 
