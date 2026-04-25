@@ -14,15 +14,18 @@ interface Props {
 export default function AnchorSelector({ availableAnchors, anchors, onAnchorsChange }: Props) {
   const [customDate, setCustomDate] = useState('');
 
+  // Anchors are identified by (type, date). Two presets may legitimately share
+  // a date (e.g. YTD start happens to be the 52w-low day) and the user should
+  // be able to add both — dedup by type+date instead of date alone.
   const addAnchor = (anchorDef: { date: string; label: string; type: string }) => {
     if (anchors.length >= 5) return;
-    if (anchors.find(a => a.date === anchorDef.date)) return;
+    if (anchors.find(a => a.type === anchorDef.type && a.date === anchorDef.date)) return;
     const color = ANCHOR_COLORS[anchors.length % ANCHOR_COLORS.length];
     onAnchorsChange([...anchors, { ...anchorDef, color }]);
   };
 
-  const removeAnchor = (date: string) => {
-    onAnchorsChange(anchors.filter(a => a.date !== date));
+  const removeAnchor = (type: string, date: string) => {
+    onAnchorsChange(anchors.filter(a => !(a.type === type && a.date === date)));
   };
 
   const addCustom = () => {
@@ -41,14 +44,14 @@ export default function AnchorSelector({ availableAnchors, anchors, onAnchorsCha
       <div className="flex flex-wrap gap-2 mb-3">
         {anchors.map(anchor => (
           <span
-            key={anchor.date}
+            key={`${anchor.type}-${anchor.date}`}
             className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border"
             style={{ borderColor: anchor.color, color: anchor.color }}
           >
             <span className="w-2 h-2 rounded-full" style={{ background: anchor.color }} />
             {anchor.label}
             <button
-              onClick={() => removeAnchor(anchor.date)}
+              onClick={() => removeAnchor(anchor.type, anchor.date)}
               className="ml-1 hover:text-white transition-colors"
             >
               &times;
@@ -64,11 +67,11 @@ export default function AnchorSelector({ availableAnchors, anchors, onAnchorsCha
       {availableAnchors.length > 0 && (
         <div className="flex flex-wrap gap-1.5 mb-3">
           {availableAnchors.map(anchor => {
-            const isActive = anchors.find(a => a.date === anchor.date);
+            const isActive = anchors.find(a => a.type === anchor.type && a.date === anchor.date);
             return (
               <button
                 key={`${anchor.type}-${anchor.date}`}
-                onClick={() => (isActive ? removeAnchor(anchor.date) : addAnchor(anchor))}
+                onClick={() => (isActive ? removeAnchor(anchor.type, anchor.date) : addAnchor(anchor))}
                 disabled={anchors.length >= 5 && !isActive}
                 className={`px-2.5 py-1 rounded text-xs border transition-colors ${
                   isActive
