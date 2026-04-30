@@ -1388,11 +1388,14 @@ export async function runEntropyEngine(): Promise<RunResult> {
       };
     }
 
-    // Store (without _chain and _n_records for DB)
+    // Store (drop _chain — large enriched-records array; keep n_records as
+    // a top-level diagnostic so post-hoc parity audits can verify the chain
+    // universe size that produced this row's entropy values).
     const store: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(metrics)) {
       if (!k.startsWith('_')) store[k] = v;
     }
+    store.n_records = metrics._n_records;
     db.prepare(
       'INSERT OR REPLACE INTO entropy_history (date, spot, metrics_json, schema_version) VALUES (?, ?, ?, ?)',
     ).run(todayStr, spot, JSON.stringify(store), SCHEMA_VERSION);

@@ -244,13 +244,14 @@ export async function GET(request: NextRequest) {
 
     if (view === 'history') {
       const rows = db.prepare(
-        'SELECT date, spot, metrics_json FROM entropy_history ORDER BY date DESC LIMIT ?'
-      ).all(days) as { date: string; spot: number; metrics_json: string }[];
+        'SELECT date, spot, metrics_json, schema_version FROM entropy_history ORDER BY date DESC LIMIT ?'
+      ).all(days) as { date: string; spot: number; metrics_json: string; schema_version: string | null }[];
 
       return NextResponse.json({
         history: rows.reverse().map(r => ({
           date: r.date,
           spot: r.spot,
+          schema_version: r.schema_version,
           ...JSON.parse(r.metrics_json),
         })),
       });
