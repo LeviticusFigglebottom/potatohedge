@@ -1,0 +1,32 @@
+{
+  "name": "potatohedge-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Railway worker: hourly automated options portfolio manager driven by the dashboard's AI briefing.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "tick": "tsx src/index.ts --once",
+    "migrate": "tsx src/migrate.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "fastify": "^5.0.0",
+    "node-cron": "^3.0.3",
+    "pg": "^8.13.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/node-cron": "^3.0.11",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

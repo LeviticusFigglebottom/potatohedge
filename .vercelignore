@@ -1,0 +1,7 @@
+node_modules
+.next
+out
+.git
+
+# Railway-only worker — not part of the Vercel deployment.
+worker
