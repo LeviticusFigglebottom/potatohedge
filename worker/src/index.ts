@@ -10,14 +10,25 @@ import { runTick } from './loop.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 async function main() {
-  const cfg = loadConfig();
+  console.error('[boot] starting');
+  let cfg;
+  try {
+    cfg = loadConfig();
+    console.error('[boot] env validated');
+  } catch (e) {
+    console.error('[boot] config error:', (e as Error).message);
+    throw e;
+  }
 
   // Run migrations on boot — Railway redeploys are fast and migrations
   // are idempotent (tracked in schema_migrations).
   const migrationsDir = path.resolve(__dirname, '..', 'migrations');
+  console.error('[boot] running migrations from', migrationsDir);
   try {
     await runMigrations(migrationsDir);
+    console.error('[boot] migrations applied');
   } catch (e) {
+    console.error('[boot] migration error:', (e as Error).message);
     log.error('startup migrations failed', { error: (e as Error).message });
     process.exit(1);
   }
@@ -95,6 +106,12 @@ async function main() {
 }
 
 main().catch((e) => {
+  // Print raw to stderr so the message survives any log-collector parsing.
+  // Railway sometimes shows only msg text from JSON lines, so we duplicate
+  // the failure as plain stderr text first.
+  console.error('========== FATAL BOOT FAILURE ==========');
+  console.error(e instanceof Error ? e.stack || e.message : String(e));
+  console.error('========================================');
   log.error('fatal', { error: (e as Error).message, stack: (e as Error).stack });
   process.exit(1);
 });
