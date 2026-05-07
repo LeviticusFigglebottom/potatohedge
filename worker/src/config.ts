@@ -7,7 +7,16 @@ const schema = z.object({
   ALPACA_SECRET_KEY: z.string().min(1),
   ALPACA_TRADING_BASE: z.string().url().default('https://paper-api.alpaca.markets'),
   ALPACA_DATA_BASE: z.string().url().default('https://data.alpaca.markets'),
-  BRIEFING_URL: z.string().url(),
+
+  // Briefing data providers (now run inside this worker, not via Vercel).
+  TRADIER_API_KEY: z.string().min(1),
+  TRADIER_SANDBOX: z.string().optional(),
+  POLYGON_API_KEY: z.string().min(1),
+
+  // Optional: HTTP fallback. If set, the worker falls back to fetching the
+  // dashboard's /api/ai/briefing instead of computing locally. Useful for
+  // dev/debug only — production should leave this unset.
+  BRIEFING_URL: z.string().url().optional(),
 
   TARGET_ALLOC_PCT: z.coerce.number().positive().max(1).default(0.10),
   MAX_CONCURRENT_POSITIONS: z.coerce.number().int().positive().default(10),

@@ -35,8 +35,22 @@ export type BriefingPayload = z.infer<typeof BriefingResponse>;
 export async function fetchBriefing(): Promise<BriefingPayload> {
   const cfg = loadConfig();
   const t0 = Date.now();
-  // The dashboard endpoint can take ~50s during peak; allow 5 minutes
-  // headroom because we're not on Vercel.
+
+  // Default path: compute the briefing locally inside the worker. No Vercel
+  // ceiling, no 504s. Only fall back to HTTP if BRIEFING_URL is explicitly
+  // set (dev/debug).
+  if (!cfg.BRIEFING_URL) {
+    const { runBriefing } = await import('./lib/briefing-runner.js');
+    const result = await runBriefing();
+    const parsed = BriefingResponse.parse(result);
+    log.info('briefing computed locally', {
+      ms: Date.now() - t0,
+      ideaCount: parsed.aiTradeIdeas.length,
+      analysisChars: parsed.analysis.length,
+    });
+    return parsed;
+  }
+
   const res = await fetch(cfg.BRIEFING_URL, {
     method: 'GET',
     headers: { Accept: 'application/json' },
@@ -48,7 +62,7 @@ export async function fetchBriefing(): Promise<BriefingPayload> {
   }
   const json = await res.json();
   const parsed = BriefingResponse.parse(json);
-  log.info('briefing fetched', {
+  log.info('briefing fetched via HTTP', {
     ms: Date.now() - t0,
     ideaCount: parsed.aiTradeIdeas.length,
     analysisChars: parsed.analysis.length,
