@@ -5,7 +5,8 @@ import {
   closeOptionPosition,
   getOptionQuote,
   listPositions,
-  type OptionQuote,
+  submitMlegOrder,
+  type MlegLeg,
 } from './alpaca.js';
 import { getPool } from './db.js';
 import type { OpenPositionSummary } from './risk.js';
@@ -26,8 +27,7 @@ interface DbPositionRow {
   exit_stop_pct: string | null;
   exit_invalidation: string | null;
   status: 'open' | 'closing' | 'closed';
-  // Trade key — recomputed from leg attrs because positions table is per leg.
-  trade_key?: string;
+  trade_key: string | null;
 }
 
 // Group rows that belong to the same opened trade. Heuristic: positions
@@ -156,51 +156,140 @@ export async function planExits(): Promise<ExitDecision[]> {
   return decisions;
 }
 
+// Close a whole spread atomically: any single-leg trigger pulls every sibling
+// leg with the same trade_key into one MLEG closing order. Legacy positions
+// without trade_key fall back to per-leg single closes.
 export async function executeExits(decisions: ExitDecision[], dryRun: boolean): Promise<number> {
-  let closed = 0;
+  if (decisions.length === 0) return 0;
+
+  // Group triggers by trade_key. Legs without a trade_key get a synthetic
+  // unique group so they're handled one-by-one (legacy fallback).
+  const groups = new Map<string, ExitDecision>();
   for (const d of decisions) {
-    log.info('closing position', {
-      occ_symbol: d.occSymbol,
-      qty: d.qty,
-      reason: d.reason,
-      dryRun,
-    });
-    if (dryRun) {
-      closed++;
-      continue;
-    }
+    const key = d.position.trade_key ?? `legacy:${d.position.id}`;
+    if (!groups.has(key)) groups.set(key, d);
+  }
+
+  let closed = 0;
+  for (const [groupKey, trigger] of groups) {
     try {
-      const order = await closeOptionPosition(d.occSymbol, d.qty, d.position.side);
-      if (order) {
-        await getPool().query(
-          `UPDATE positions SET status='closing', close_reason=$2 WHERE id=$1`,
-          [d.position.id, d.reason],
-        );
+      const isLegacy = groupKey.startsWith('legacy:');
+      const siblings = isLegacy
+        ? [trigger.position]
+        : await loadOpenLegsByTradeKey(groupKey);
+      if (siblings.length === 0) continue;
+
+      log.info('closing trade', {
+        trade_key: groupKey,
+        legs: siblings.length,
+        reason: trigger.reason,
+        dryRun,
+      });
+
+      if (dryRun) {
         closed++;
+        continue;
       }
+
+      if (siblings.length === 1) {
+        const sib = siblings[0]!;
+        const order = await closeOptionPosition(sib.occ_symbol, Math.abs(sib.qty), sib.side);
+        if (order) {
+          await markGroupClosing(groupKey, isLegacy ? sib.id : null, trigger.reason);
+          closed++;
+        }
+        continue;
+      }
+
+      // 2-4 legs → MLEG close at marketable net price.
+      const mlegLegs: MlegLeg[] = [];
+      let netDebitPerShare = 0;
+      let unquotable = false;
+      let qtySpread = Math.min(...siblings.map((s) => Math.abs(s.qty)));
+      if (!Number.isFinite(qtySpread) || qtySpread <= 0) qtySpread = 1;
+
+      for (const sib of siblings) {
+        const q = await getOptionQuote(sib.occ_symbol);
+        if (!q) {
+          unquotable = true;
+          break;
+        }
+        // Closing a long leg = sell at bid; closing a short leg = buy at ask.
+        const closeSide: 'buy' | 'sell' = sib.side === 'long' ? 'sell' : 'buy';
+        const px = sib.side === 'long' ? q.bid : q.ask;
+        const sign = sib.side === 'long' ? -1 : 1; // closing flips the sign
+        netDebitPerShare += sign * px;
+        mlegLegs.push({
+          occSymbol: sib.occ_symbol,
+          ratioQty: 1,
+          side: closeSide,
+          positionIntent: sib.side === 'long' ? 'sell_to_close' : 'buy_to_close',
+        });
+      }
+      if (unquotable) {
+        log.warn('cannot MLEG-close — leg unquotable', { trade_key: groupKey });
+        continue;
+      }
+
+      const order = await submitMlegOrder({
+        qty: qtySpread,
+        legs: mlegLegs,
+        netLimitPrice: netDebitPerShare,
+        timeInForce: 'day',
+      });
+      log.info('MLEG close submitted', {
+        trade_key: groupKey,
+        order_id: order.id,
+        net: netDebitPerShare.toFixed(2),
+      });
+      await markGroupClosing(groupKey, null, trigger.reason);
+      closed++;
     } catch (e) {
-      log.error('close failed', { occ_symbol: d.occSymbol, error: (e as Error).message });
+      log.error('group close failed', { groupKey, error: (e as Error).message });
     }
   }
   return closed;
 }
 
+async function loadOpenLegsByTradeKey(tradeKey: string): Promise<DbPositionRow[]> {
+  const { rows } = await getPool().query<DbPositionRow>(
+    `SELECT * FROM positions WHERE trade_key = $1 AND status = 'open' ORDER BY id`,
+    [tradeKey],
+  );
+  return rows;
+}
+
+async function markGroupClosing(
+  tradeKey: string,
+  legacyPositionId: number | null,
+  reason: string,
+): Promise<void> {
+  if (legacyPositionId !== null) {
+    await getPool().query(
+      `UPDATE positions SET status='closing', close_reason=$2 WHERE id=$1`,
+      [legacyPositionId, reason],
+    );
+    return;
+  }
+  await getPool().query(
+    `UPDATE positions SET status='closing', close_reason=$2
+     WHERE trade_key = $1 AND status = 'open'`,
+    [tradeKey, reason],
+  );
+}
+
 // Build the trade-level position summary the risk sizer expects.
+// Groups legs by their structural trade_key so a 4-leg iron condor counts
+// as one position against the concurrency / directional caps.
 export async function summarizeOpenPositionsForRisk(): Promise<OpenPositionSummary[]> {
-  // We treat each row in `positions` as a leg; group by (underlying, direction,
-  // opened_at minute) as a heuristic for "same trade". For the scaffold, group
-  // by entry_briefing_id when present; otherwise fall back to one-per-row.
   const { rows } = await getPool().query<{
     trade_key: string;
     underlying: string;
     direction: Direction;
   }>(
-    `SELECT
-        COALESCE(entry_briefing_id::text, '') || ':' || underlying AS trade_key,
-        underlying,
-        direction
+    `SELECT trade_key, underlying, direction
      FROM positions
-     WHERE status IN ('open', 'closing')
+     WHERE status IN ('open', 'closing') AND trade_key IS NOT NULL
      GROUP BY trade_key, underlying, direction`,
   );
   return rows.map((r) => ({
@@ -208,4 +297,14 @@ export async function summarizeOpenPositionsForRisk(): Promise<OpenPositionSumma
     underlying: r.underlying,
     direction: r.direction,
   }));
+}
+
+// Set of structural trade keys we currently hold. Used to refuse re-opening
+// an identical spread the briefing surfaces again on a later tick.
+export async function getOpenTradeKeys(): Promise<Set<string>> {
+  const { rows } = await getPool().query<{ trade_key: string }>(
+    `SELECT DISTINCT trade_key FROM positions
+     WHERE status IN ('open', 'closing') AND trade_key IS NOT NULL`,
+  );
+  return new Set(rows.map((r) => r.trade_key));
 }

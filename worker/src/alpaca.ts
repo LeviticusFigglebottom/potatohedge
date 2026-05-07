@@ -123,6 +123,60 @@ export async function submitOptionOrder(args: SubmitOrderArgs): Promise<{ id: st
   return { id: j.id };
 }
 
+// ─── Multi-leg (MLEG) orders ───────────────────────────────────────────────
+//
+// Alpaca routes spreads as a single MLEG order, which avoids partial-fill
+// risk between legs and gets you the broker's combo execution. We submit
+// with the net price per spread:
+//   limit_price > 0  → net debit  (you pay this)
+//   limit_price < 0  → net credit (you receive this)
+// Each leg has position_intent describing whether it opens or closes,
+// and side (buy/sell) describing the direction of that leg.
+
+export type PositionIntent =
+  | 'buy_to_open'
+  | 'buy_to_close'
+  | 'sell_to_open'
+  | 'sell_to_close';
+
+export interface MlegLeg {
+  occSymbol: string;
+  ratioQty: number; // legs per spread (almost always 1)
+  side: 'buy' | 'sell';
+  positionIntent: PositionIntent;
+}
+
+export interface SubmitMlegArgs {
+  qty: number; // number of *spread units*
+  legs: MlegLeg[];
+  netLimitPrice: number; // signed: + debit, - credit
+  timeInForce?: 'day' | 'gtc';
+}
+
+export async function submitMlegOrder(args: SubmitMlegArgs): Promise<{ id: string }> {
+  if (args.legs.length < 2 || args.legs.length > 4) {
+    throw new Error(`MLEG requires 2-4 legs, got ${args.legs.length}`);
+  }
+  const body = {
+    order_class: 'mleg',
+    qty: String(args.qty),
+    type: 'limit',
+    time_in_force: args.timeInForce ?? 'day',
+    limit_price: args.netLimitPrice.toFixed(2),
+    legs: args.legs.map((l) => ({
+      symbol: l.occSymbol,
+      ratio_qty: String(l.ratioQty),
+      side: l.side,
+      position_intent: l.positionIntent,
+    })),
+  };
+  const j = (await alpacaFetch('trading', '/v2/orders', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })) as { id: string };
+  return { id: j.id };
+}
+
 export async function closeOptionPosition(occSymbol: string, qty: number, currentSide: 'long' | 'short'): Promise<{ id: string } | null> {
   const quote = await getOptionQuote(occSymbol);
   if (!quote) {

@@ -6,17 +6,20 @@ import { getAccount } from './alpaca.js';
 import { fetchBriefing, normalizeTradeIdeas, type BriefingPayload } from './briefing.js';
 import {
   executeExits,
+  getOpenTradeKeys,
   planExits,
   reconcileWithAlpaca,
   summarizeOpenPositionsForRisk,
 } from './manager.js';
-import { sizeAndFilter } from './risk.js';
+import { sizeAndFilter, type SizingResult } from './risk.js';
 import {
   buildOccSymbol,
-  getOptionQuote,
+  submitMlegOrder,
   submitOptionOrder,
+  type MlegLeg,
+  type PositionIntent,
 } from './alpaca.js';
-import type { NormalizedTrade } from './types.js';
+import type { NormalizedLeg, NormalizedTrade } from './types.js';
 
 interface TickResult {
   status: 'ok' | 'skipped' | 'error';
@@ -120,16 +123,17 @@ export async function runTick(opts: { force?: boolean } = {}): Promise<TickResul
     const trades = await normalizeTradeIdeas(briefing, today);
     const briefingId = await persistBriefing(tickId, briefing, trades);
 
-    // ── 5. Filter out trades we already hold (dedupe by trade key).
-    const openSummary = await summarizeOpenPositionsForRisk();
-    const heldKeys = new Set(openSummary.map((p) => p.tradeKey));
+    // ── 5. Filter out trades we already hold (dedupe by structural trade key).
+    const [openSummary, heldKeys] = await Promise.all([
+      summarizeOpenPositionsForRisk(),
+      getOpenTradeKeys(),
+    ]);
     const fresh = trades.filter((t) => {
-      // Heuristic dedupe: existing summary key is "<briefing_id>:<underlying>"
-      // — that is a *db* artifact and won't match the structural trade.key.
-      // We dedupe by underlying+direction+legs hash via `t.key`.
-      // Track the last-N opened keys in a separate query if you need stronger
-      // dedupe across runs. For now we let live position checks below handle it.
-      return !heldKeys.has(t.key);
+      if (heldKeys.has(t.key)) {
+        log.info('skipping duplicate of open position', { trade: t.key });
+        return false;
+      }
+      return true;
     });
 
     // ── 6. Size each trade against PV / caps / live quotes.
@@ -139,60 +143,18 @@ export async function runTick(opts: { force?: boolean } = {}): Promise<TickResul
       openPositions: openSummary,
     });
 
-    // ── 7. Submit. Persist legs into `positions` keyed by entry_briefing_id.
+    // ── 7. Submit each accepted trade as a single Alpaca order:
+    //   - 1 leg  → ordinary limit order on /v2/orders
+    //   - 2-4    → MLEG order with net debit/credit (no partial-fill risk)
+    // Persist every leg into `positions` with a shared trade_key + order id
+    // so the manager can group them and dedupe the next briefing.
     for (const result of sized) {
       if (result.rejected) {
         log.info('trade rejected', { trade: result.trade.key, reason: result.reason });
         continue;
       }
       try {
-        for (const leg of result.trade.legs) {
-          const occ = buildOccSymbol(leg);
-          const quote = result.perLegQuotes[occ];
-          if (!quote) continue;
-          // Cross the spread on entry too.
-          const limit = leg.side === 'long' ? quote.ask : quote.bid;
-          const side: 'buy' | 'sell' = leg.side === 'long' ? 'buy' : 'sell';
-          const qty = result.contracts * leg.ratio;
-
-          if (cfg.DRY_RUN) {
-            log.info('DRY_RUN order', { occ, side, qty, limit });
-          } else {
-            const order = await submitOptionOrder({
-              occSymbol: occ,
-              qty,
-              side,
-              limitPrice: limit,
-              timeInForce: 'day',
-            });
-            log.info('order submitted', { occ, side, qty, limit, order_id: order.id });
-            await getPool().query(
-              `INSERT INTO positions (
-                 occ_symbol, underlying, "right", strike, expiration, side, direction,
-                 qty, entry_price, entry_order_id, entry_briefing_id,
-                 exit_target_pct, exit_stop_pct, exit_invalidation, exit_thesis
-               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-               ON CONFLICT (occ_symbol) DO NOTHING`,
-              [
-                occ,
-                leg.underlying,
-                leg.right,
-                leg.strike,
-                leg.expiration,
-                leg.side,
-                result.trade.direction,
-                qty,
-                limit,
-                order.id,
-                briefingId,
-                result.trade.exitTargetPct ?? null,
-                result.trade.exitStopPct ?? null,
-                result.trade.invalidation ?? null,
-                result.trade.thesis ?? null,
-              ],
-            );
-          }
-        }
+        await openTrade(result, briefingId, cfg.DRY_RUN);
         openedCount++;
       } catch (e) {
         log.error('trade open failed', {
@@ -222,4 +184,154 @@ export async function runTick(opts: { force?: boolean } = {}): Promise<TickResul
     await postAlert(`tick FAILED: ${msg}`);
     return r;
   }
+}
+
+// Submit one trade as either a single-leg limit order or an MLEG, persisting
+// every leg with a shared trade_key + Alpaca order id.
+async function openTrade(
+  result: SizingResult,
+  briefingId: number,
+  dryRun: boolean,
+): Promise<void> {
+  const trade = result.trade;
+  const contracts = result.contracts;
+
+  // Per-leg limit prices crossing the spread (long → ask, short → bid),
+  // and the implied net debit/credit per spread unit (positive = debit).
+  const legPlans = trade.legs.map((leg) => {
+    const occ = buildOccSymbol(leg);
+    const quote = result.perLegQuotes[occ];
+    if (!quote) throw new Error(`missing quote for ${occ}`);
+    const limit = leg.side === 'long' ? quote.ask : quote.bid;
+    return { leg, occ, limit };
+  });
+  const netDebitPerShare = legPlans.reduce(
+    (acc, { leg, limit }) => acc + (leg.side === 'long' ? 1 : -1) * limit * leg.ratio,
+    0,
+  );
+
+  if (legPlans.length === 1) {
+    const only = legPlans[0]!;
+    const side: 'buy' | 'sell' = only.leg.side === 'long' ? 'buy' : 'sell';
+    const qty = contracts * only.leg.ratio;
+    if (dryRun) {
+      log.info('DRY_RUN single-leg order', { occ: only.occ, side, qty, limit: only.limit });
+      return;
+    }
+    const order = await submitOptionOrder({
+      occSymbol: only.occ,
+      qty,
+      side,
+      limitPrice: only.limit,
+      timeInForce: 'day',
+    });
+    log.info('single-leg order submitted', {
+      occ: only.occ,
+      side,
+      qty,
+      limit: only.limit,
+      order_id: order.id,
+    });
+    await insertLeg({
+      occ: only.occ,
+      leg: only.leg,
+      qty,
+      entryPrice: only.limit,
+      orderId: order.id,
+      mlegOrderId: null,
+      trade,
+      briefingId,
+    });
+    return;
+  }
+
+  // 2-4 legs → MLEG.
+  const mlegLegs: MlegLeg[] = legPlans.map(({ leg, occ }) => ({
+    occSymbol: occ,
+    ratioQty: leg.ratio,
+    side: leg.side === 'long' ? 'buy' : 'sell',
+    positionIntent: legPositionIntent(leg, 'open'),
+  }));
+  if (dryRun) {
+    log.info('DRY_RUN MLEG order', {
+      trade: trade.key,
+      qty: contracts,
+      net: netDebitPerShare.toFixed(2),
+      legs: mlegLegs,
+    });
+    return;
+  }
+  const order = await submitMlegOrder({
+    qty: contracts,
+    legs: mlegLegs,
+    netLimitPrice: netDebitPerShare,
+    timeInForce: 'day',
+  });
+  log.info('MLEG order submitted', {
+    trade: trade.key,
+    qty: contracts,
+    net: netDebitPerShare.toFixed(2),
+    order_id: order.id,
+  });
+  for (const { leg, occ, limit } of legPlans) {
+    await insertLeg({
+      occ,
+      leg,
+      qty: contracts * leg.ratio,
+      entryPrice: limit,
+      orderId: order.id,
+      mlegOrderId: order.id,
+      trade,
+      briefingId,
+    });
+  }
+}
+
+function legPositionIntent(leg: NormalizedLeg, action: 'open' | 'close'): PositionIntent {
+  if (action === 'open') {
+    return leg.side === 'long' ? 'buy_to_open' : 'sell_to_open';
+  }
+  return leg.side === 'long' ? 'sell_to_close' : 'buy_to_close';
+}
+
+interface InsertLegArgs {
+  occ: string;
+  leg: NormalizedLeg;
+  qty: number;
+  entryPrice: number;
+  orderId: string;
+  mlegOrderId: string | null;
+  trade: NormalizedTrade;
+  briefingId: number;
+}
+
+async function insertLeg(a: InsertLegArgs): Promise<void> {
+  await getPool().query(
+    `INSERT INTO positions (
+       occ_symbol, underlying, "right", strike, expiration, side, direction,
+       qty, entry_price, entry_order_id, mleg_order_id, entry_briefing_id,
+       trade_key,
+       exit_target_pct, exit_stop_pct, exit_invalidation, exit_thesis
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+     ON CONFLICT (occ_symbol) DO NOTHING`,
+    [
+      a.occ,
+      a.leg.underlying,
+      a.leg.right,
+      a.leg.strike,
+      a.leg.expiration,
+      a.leg.side,
+      a.trade.direction,
+      a.qty,
+      a.entryPrice,
+      a.orderId,
+      a.mlegOrderId,
+      a.briefingId,
+      a.trade.key,
+      a.trade.exitTargetPct ?? null,
+      a.trade.exitStopPct ?? null,
+      a.trade.invalidation ?? null,
+      a.trade.thesis ?? null,
+    ],
+  );
 }
