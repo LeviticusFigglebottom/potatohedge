@@ -46,17 +46,23 @@ async function main() {
 
   app.get('/health', async () => ({ ok: true, ts: Date.now(), dryRun: cfg.DRY_RUN }));
 
-  // Manual run trigger (useful for the dashboard "run now" button).
-  app.post<{ Querystring: { force?: string } }>('/run', async (req, reply) => {
+  // Manual run trigger (useful for the dashboard "run now" button or
+  // ad-hoc curl/PowerShell from a terminal). GET-or-POST so callers don't
+  // have to set Content-Type for empty bodies.
+  const runHandler = async (
+    req: import('fastify').FastifyRequest<{ Querystring: { force?: string } }>,
+    reply: import('fastify').FastifyReply,
+  ) => {
     const force = req.query.force === 'true' || req.query.force === '1';
     log.info('manual /run triggered', { force });
-    // Fire-and-forget so the HTTP request doesn't block on the full tick.
     runTick({ force }).catch((e) =>
       log.error('manual tick failed', { error: (e as Error).message }),
     );
     reply.code(202);
     return { accepted: true, force };
-  });
+  };
+  app.get('/run', runHandler);
+  app.post('/run', runHandler);
 
   app.get('/positions', async () => {
     // Lightweight inspection endpoint.
