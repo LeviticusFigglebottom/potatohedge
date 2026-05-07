@@ -1,6 +1,7 @@
 import { loadConfig } from './config.js';
 import { log } from './log.js';
-import { buildOccSymbol, getOptionQuote, type OptionQuote } from './alpaca.js';
+import { buildOccSymbol } from './alpaca.js';
+import { getOptionQuoteForLeg, resetQuoteCache, type OptionQuote } from './quotes.js';
 import type { Direction, NormalizedTrade } from './types.js';
 
 // One entry per open *trade* (multi-leg spread = one entry), so the
@@ -41,6 +42,9 @@ export async function sizeAndFilter(
   // batch (not just against the snapshot at tick start).
   const liveOpen = [...opts.openPositions];
 
+  // Fresh tick — drop cached chains so we don't size against stale quotes.
+  resetQuoteCache();
+
   for (const trade of trades) {
     const reject = (reason: string): SizingResult => ({
       trade,
@@ -60,15 +64,23 @@ export async function sizeAndFilter(
       continue;
     }
 
-    // Pull live quotes for every leg. If anything is unquotable, skip.
+    // Pull live quotes for every leg via Tradier (chain-cached), fallback
+    // to Alpaca per-symbol. If anything is unquotable, skip.
     const quotes: Record<string, OptionQuote> = {};
     let unquotable = false;
     for (const leg of trade.legs) {
       const sym = buildOccSymbol(leg);
-      const q = await getOptionQuote(sym);
+      const q = await getOptionQuoteForLeg(leg);
       if (!q) {
         unquotable = true;
-        log.warn('skipping trade — leg unquotable', { trade: trade.key, leg: sym });
+        log.warn('skipping trade — leg unquotable', {
+          trade: trade.key,
+          leg: sym,
+          underlying: leg.underlying,
+          strike: leg.strike,
+          right: leg.right,
+          expiration: leg.expiration,
+        });
         break;
       }
       quotes[sym] = q;

@@ -3,11 +3,11 @@ import { log } from './log.js';
 import { dteFromExpiration } from './market.js';
 import {
   closeOptionPosition,
-  getOptionQuote,
   listPositions,
   submitMlegOrder,
   type MlegLeg,
 } from './alpaca.js';
+import { getOptionQuoteForLeg } from './quotes.js';
 import { getPool } from './db.js';
 import type { OpenPositionSummary } from './risk.js';
 import type { Direction, OptionRight, OptionSide } from './types.js';
@@ -33,6 +33,27 @@ interface DbPositionRow {
 // Group rows that belong to the same opened trade. Heuristic: positions
 // inserted with the same entry_briefing_id and underlying within the same
 // tick are one trade. (We rely on the loop writing them in one tx.)
+function rowToLeg(row: DbPositionRow): {
+  underlying: string;
+  right: OptionRight;
+  strike: number;
+  expiration: string;
+  side: 'long' | 'short';
+  ratio: number;
+} {
+  return {
+    underlying: row.underlying,
+    right: row.right,
+    strike: parseFloat(row.strike),
+    expiration:
+      typeof row.expiration === 'string'
+        ? row.expiration.slice(0, 10)
+        : new Date(row.expiration as unknown as Date).toISOString().slice(0, 10),
+    side: row.side,
+    ratio: 1,
+  };
+}
+
 async function loadOpenPositions(): Promise<DbPositionRow[]> {
   const { rows } = await getPool().query<DbPositionRow>(
     `SELECT * FROM positions WHERE status IN ('open', 'closing') ORDER BY id`,
@@ -97,7 +118,7 @@ export async function planExits(): Promise<ExitDecision[]> {
       // For a precise ITM call/put test we'd need the underlying spot;
       // querying it on every tick adds latency, so we approximate via the
       // option's current_price + intrinsic decomposition done by quote spread.
-      const quote = await getOptionQuote(row.occ_symbol);
+      const quote = await getOptionQuoteForLeg(rowToLeg(row));
       if (quote) {
         // Conservative heuristic: if mid <= 0.10 and DTE <= cap, the short
         // is either deep OTM (safe — but still close to free up capital) or
@@ -116,7 +137,7 @@ export async function planExits(): Promise<ExitDecision[]> {
     // Rules 2 & 3 — profit target / stop, from per-position quote.
     const entry = parseFloat(row.entry_price ?? '0');
     if (entry <= 0) continue;
-    const quote = await getOptionQuote(row.occ_symbol);
+    const quote = await getOptionQuoteForLeg(rowToLeg(row));
     if (!quote) continue;
     const tgt = row.exit_target_pct ? parseFloat(row.exit_target_pct) : null;
     const stp = row.exit_stop_pct ? parseFloat(row.exit_stop_pct) : null;
@@ -209,7 +230,7 @@ export async function executeExits(decisions: ExitDecision[], dryRun: boolean): 
       if (!Number.isFinite(qtySpread) || qtySpread <= 0) qtySpread = 1;
 
       for (const sib of siblings) {
-        const q = await getOptionQuote(sib.occ_symbol);
+        const q = await getOptionQuoteForLeg(rowToLeg(sib));
         if (!q) {
           unquotable = true;
           break;
