@@ -46,17 +46,23 @@ async function main() {
 
   app.get('/health', async () => ({ ok: true, ts: Date.now(), dryRun: cfg.DRY_RUN }));
 
-  // Manual run trigger (useful for the dashboard "run now" button).
-  app.post<{ Querystring: { force?: string } }>('/run', async (req, reply) => {
+  // Manual run trigger (useful for the dashboard "run now" button or
+  // ad-hoc curl/PowerShell from a terminal). GET-or-POST so callers don't
+  // have to set Content-Type for empty bodies.
+  const runHandler = async (
+    req: import('fastify').FastifyRequest<{ Querystring: { force?: string } }>,
+    reply: import('fastify').FastifyReply,
+  ) => {
     const force = req.query.force === 'true' || req.query.force === '1';
     log.info('manual /run triggered', { force });
-    // Fire-and-forget so the HTTP request doesn't block on the full tick.
     runTick({ force }).catch((e) =>
       log.error('manual tick failed', { error: (e as Error).message }),
     );
     reply.code(202);
     return { accepted: true, force };
-  });
+  };
+  app.get('/run', runHandler);
+  app.post('/run', runHandler);
 
   app.get('/positions', async () => {
     // Lightweight inspection endpoint.
@@ -69,6 +75,36 @@ async function main() {
        LIMIT 100`,
     );
     return { positions: rows };
+  });
+
+  // Inspect the most recent AI briefing — full prompt sent to Claude,
+  // analysis text returned, and the normalized trades the worker derived.
+  // Use ?id=N to fetch a specific briefing instead of the latest.
+  app.get<{ Querystring: { id?: string } }>('/briefings/latest', async (req) => {
+    const { getPool } = await import('./db.js');
+    const id = req.query.id ? parseInt(req.query.id, 10) : null;
+    const sql = id
+      ? `SELECT id, tick_run_id, fetched_at, prompt, payload, parsed
+           FROM briefings WHERE id = $1`
+      : `SELECT id, tick_run_id, fetched_at, prompt, payload, parsed
+           FROM briefings ORDER BY id DESC LIMIT 1`;
+    const args = id ? [id] : [];
+    const { rows } = await getPool().query(sql, args);
+    if (rows.length === 0) return { error: 'no briefings yet' };
+    const row = rows[0];
+    return {
+      id: row.id,
+      tick_run_id: row.tick_run_id,
+      fetched_at: row.fetched_at,
+      prompt_chars: row.prompt?.length ?? 0,
+      analysis_chars: row.payload?.analysis?.length ?? 0,
+      trade_idea_count: row.parsed?.length ?? 0,
+      // Full content (long — render in browser dev tools or a JSON viewer)
+      prompt: row.prompt,
+      analysis: row.payload?.analysis,
+      ai_trade_ideas: row.payload?.aiTradeIdeas,
+      normalized_trades: row.parsed,
+    };
   });
 
   app.get('/runs', async () => {

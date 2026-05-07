@@ -10,6 +10,8 @@ import type { NormalizedTrade, NormalizedLeg, Direction, OptionRight, OptionSide
 // through. Numeric fields are accepted as either numbers or strings.
 const BriefingResponse = z.object({
   analysis: z.string(),
+  // Optional — only the local runner returns this. HTTP fallback omits it.
+  prompt: z.string().optional(),
   aiTradeIdeas: z
     .array(
       z.object({

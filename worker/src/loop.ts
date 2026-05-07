@@ -56,10 +56,18 @@ async function finishTickRun(id: number, r: TickResult): Promise<void> {
   );
 }
 
-async function persistBriefing(tickRunId: number, payload: BriefingPayload, parsed: NormalizedTrade[]): Promise<number> {
+async function persistBriefing(
+  tickRunId: number,
+  payload: BriefingPayload,
+  parsed: NormalizedTrade[],
+  prompt: string | null,
+): Promise<number> {
+  // pg does NOT auto-stringify JS objects for jsonb columns — must pass JSON
+  // text and let Postgres parse. Otherwise: "invalid input syntax for type json".
   const { rows } = await getPool().query<{ id: number }>(
-    `INSERT INTO briefings (tick_run_id, payload, parsed) VALUES ($1, $2, $3) RETURNING id`,
-    [tickRunId, payload, parsed],
+    `INSERT INTO briefings (tick_run_id, payload, parsed, prompt)
+     VALUES ($1, $2::jsonb, $3::jsonb, $4) RETURNING id`,
+    [tickRunId, JSON.stringify(payload), JSON.stringify(parsed), prompt],
   );
   return rows[0]!.id;
 }
@@ -121,7 +129,7 @@ export async function runTick(opts: { force?: boolean } = {}): Promise<TickResul
     const briefing = await fetchBriefing();
     const today = new Date().toISOString().slice(0, 10);
     const trades = await normalizeTradeIdeas(briefing, today);
-    const briefingId = await persistBriefing(tickId, briefing, trades);
+    const briefingId = await persistBriefing(tickId, briefing, trades, briefing.prompt ?? null);
 
     // ── 5. Filter out trades we already hold (dedupe by structural trade key).
     const [openSummary, heldKeys] = await Promise.all([
