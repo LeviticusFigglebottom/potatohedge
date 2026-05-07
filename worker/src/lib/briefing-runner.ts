@@ -770,6 +770,8 @@ export interface BriefingRunResult {
   stocksScanned: number;
   timestamp: number;
   vix: number;
+  // Full Claude prompt — the worker stores this so you can audit decisions.
+  prompt: string;
   aiTradeIdeas: Array<{
     title: string;
     ticker: string;
@@ -1005,6 +1007,7 @@ export async function runBriefing(): Promise<BriefingRunResult> {
     stocksScanned: results.length,
     timestamp: Date.now(),
     vix: vixPrice,
+    prompt,
     aiTradeIdeas,
   };
 }

@@ -77,6 +77,36 @@ async function main() {
     return { positions: rows };
   });
 
+  // Inspect the most recent AI briefing — full prompt sent to Claude,
+  // analysis text returned, and the normalized trades the worker derived.
+  // Use ?id=N to fetch a specific briefing instead of the latest.
+  app.get<{ Querystring: { id?: string } }>('/briefings/latest', async (req) => {
+    const { getPool } = await import('./db.js');
+    const id = req.query.id ? parseInt(req.query.id, 10) : null;
+    const sql = id
+      ? `SELECT id, tick_run_id, fetched_at, prompt, payload, parsed
+           FROM briefings WHERE id = $1`
+      : `SELECT id, tick_run_id, fetched_at, prompt, payload, parsed
+           FROM briefings ORDER BY id DESC LIMIT 1`;
+    const args = id ? [id] : [];
+    const { rows } = await getPool().query(sql, args);
+    if (rows.length === 0) return { error: 'no briefings yet' };
+    const row = rows[0];
+    return {
+      id: row.id,
+      tick_run_id: row.tick_run_id,
+      fetched_at: row.fetched_at,
+      prompt_chars: row.prompt?.length ?? 0,
+      analysis_chars: row.payload?.analysis?.length ?? 0,
+      trade_idea_count: row.parsed?.length ?? 0,
+      // Full content (long — render in browser dev tools or a JSON viewer)
+      prompt: row.prompt,
+      analysis: row.payload?.analysis,
+      ai_trade_ideas: row.payload?.aiTradeIdeas,
+      normalized_trades: row.parsed,
+    };
+  });
+
   app.get('/runs', async () => {
     const { getPool } = await import('./db.js');
     const { rows } = await getPool().query(
