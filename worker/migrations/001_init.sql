@@ -8,7 +8,8 @@ CREATE TABLE IF NOT EXISTS positions (
     -- Alpaca option contract symbol, e.g. SPY250221C00605000
     occ_symbol          TEXT NOT NULL UNIQUE,
     underlying          TEXT NOT NULL,
-    right               TEXT NOT NULL CHECK (right IN ('call', 'put')),
+    -- "right" is a reserved word in Postgres (RIGHT JOIN), must be quoted.
+    "right"             TEXT NOT NULL CHECK ("right" IN ('call', 'put')),
     strike              NUMERIC(12, 4) NOT NULL,
     expiration          DATE NOT NULL,
     side                TEXT NOT NULL CHECK (side IN ('long', 'short')),
