@@ -104,9 +104,20 @@ export async function planExits(): Promise<ExitDecision[]> {
   const decisions: ExitDecision[] = [];
 
   for (const row of dbRows) {
-    if (row.status !== 'open') continue;
+    if (row.status !== 'open') {
+      log.info('skipping exit-check — row not open', {
+        occ_symbol: row.occ_symbol,
+        status: row.status,
+      });
+      continue;
+    }
     const lp = liveBy.get(row.occ_symbol);
-    if (!lp) continue; // reconcile pass already handles this
+    if (!lp) {
+      log.warn('skipping exit-check — DB has row but Alpaca does not', {
+        occ_symbol: row.occ_symbol,
+      });
+      continue;
+    }
 
     const dte = dteFromExpiration(row.expiration);
 
@@ -128,14 +139,38 @@ export async function planExits(): Promise<ExitDecision[]> {
       continue;
     }
 
-    // Rules 2 & 3 — profit target / stop, from per-position quote.
+    // Rules 2 & 3 — profit target / stop.
+    // Same defensive principle as assignment-risk: never skip a stop-loss
+    // check because a quote is missing. Fall back to Alpaca's running mark
+    // (always available for any open position).
     const entry = parseFloat(row.entry_price ?? '0');
-    if (entry <= 0) continue;
+    if (entry <= 0) {
+      log.warn('skipping exit-check — no entry price recorded', {
+        occ_symbol: row.occ_symbol,
+      });
+      continue;
+    }
     const quote = await getOptionQuoteForLeg(rowToLeg(row));
-    if (!quote) continue;
+    let mid: number;
+    let priceSource: string;
+    if (quote) {
+      mid = quote.mid;
+      priceSource = `tradier mid ${mid.toFixed(2)}`;
+    } else if (lp.currentPrice && lp.currentPrice > 0) {
+      mid = lp.currentPrice;
+      priceSource = `alpaca live mark ${mid.toFixed(2)} (no Tradier quote)`;
+      log.warn('exit-check using Alpaca live mark', {
+        occ_symbol: row.occ_symbol,
+        mark: mid,
+      });
+    } else {
+      log.error('exit-check skipped — no quote and no live mark', {
+        occ_symbol: row.occ_symbol,
+      });
+      continue;
+    }
     const tgt = row.exit_target_pct ? parseFloat(row.exit_target_pct) : null;
     const stp = row.exit_stop_pct ? parseFloat(row.exit_stop_pct) : null;
-    const mid = quote.mid;
 
     if (row.side === 'long' && tgt && mid >= entry * (1 + tgt)) {
       decisions.push({
@@ -165,9 +200,27 @@ export async function planExits(): Promise<ExitDecision[]> {
         qty: Math.abs(row.qty),
         reason: `stop-loss: mid ${mid.toFixed(2)} >= entry ${entry.toFixed(2)} × (1+${stp})`,
       });
+    } else {
+      // Visibility into "we looked at this row but it didn't trigger". Without
+      // this it's impossible to tell from logs whether the manager is even
+      // seeing a position vs. seeing it and deciding not to close.
+      log.info('exit-check no trigger', {
+        occ_symbol: row.occ_symbol,
+        side: row.side,
+        dte,
+        entry,
+        mid,
+        target_pct: tgt,
+        stop_pct: stp,
+        price_source: priceSource,
+      });
     }
   }
 
+  log.info('planExits summary', {
+    rows_examined: dbRows.length,
+    decisions_count: decisions.length,
+  });
   return decisions;
 }
 
