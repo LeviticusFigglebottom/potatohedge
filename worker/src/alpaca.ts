@@ -177,16 +177,25 @@ export async function submitMlegOrder(args: SubmitMlegArgs): Promise<{ id: strin
   return { id: j.id };
 }
 
-export async function closeOptionPosition(occSymbol: string, qty: number, currentSide: 'long' | 'short'): Promise<{ id: string } | null> {
+export async function closeOptionPosition(
+  occSymbol: string,
+  qty: number,
+  currentSide: 'long' | 'short',
+  fallbackMark?: number,
+): Promise<{ id: string } | null> {
   const quote = await getOptionQuote(occSymbol);
-  if (!quote) {
-    log.warn('cannot close — no quote', { occSymbol });
+  const side: 'buy' | 'sell' = currentSide === 'long' ? 'sell' : 'buy';
+  let limit: number;
+  if (quote) {
+    limit = currentSide === 'long' ? quote.bid : quote.ask;
+  } else if (fallbackMark && fallbackMark > 0) {
+    // Cross the spread aggressively from the broker's live mark.
+    limit = currentSide === 'long' ? fallbackMark * 0.7 : fallbackMark * 1.5;
+    log.warn('single-leg close using fallback mark', { occSymbol, fallbackMark, limit });
+  } else {
+    log.error('cannot close — no quote and no fallback mark', { occSymbol });
     return null;
   }
-  // Long → sell to close at bid (cross spread to exit reliably).
-  // Short → buy to close at ask.
-  const side: 'buy' | 'sell' = currentSide === 'long' ? 'sell' : 'buy';
-  const limit = currentSide === 'long' ? quote.bid : quote.ask;
   return submitOptionOrder({
     occSymbol,
     qty: Math.abs(qty),
