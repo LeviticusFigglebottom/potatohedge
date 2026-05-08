@@ -86,23 +86,38 @@ export interface ExitDecision {
   reason: string;
 }
 
-// Decide which positions need to be closed this tick.
-// Rules in priority order:
-//   1. Assignment risk: short leg ITM with DTE <= ASSIGNMENT_CLOSE_DTE.
-//   2. Profit target: live mid hits exit_target_pct of entry.
-//   3. Stop loss: live mid hits exit_stop_pct of entry.
-// Underlying spot is needed for the ITM check; we use Alpaca's last trade
-// price on the position itself (current_price), not a separate equity quote,
-// to keep this scaffold simple. A more accurate version would query equity.
+// Decide which TRADES (whole spreads) need to be closed this tick.
+//
+// Exit logic operates at spread-level, not per-leg, because:
+//   - Profit target ("50% of credit captured") is a spread-level concept;
+//     applied per-leg it doesn't trigger correctly.
+//   - Stop loss ("2× credit") on a credit spread can NEVER trigger per-leg
+//     because the leg's max value is bounded by the spread width.
+//
+// We sign-sum entry prices into initialNet (positive = debit paid up front,
+// negative = credit received) and sign-sum closing prices into closeNet,
+// then compute P/L% = (closeNet - initialNet) / |initialNet|. This formula
+// works for both debit and credit spreads under the standard convention
+// where target_pct and stop_pct describe percentage of initial cost/credit.
+//
+// Triggers (priority order):
+//   1. Assignment risk: any short leg with DTE <= ASSIGNMENT_CLOSE_DTE
+//   2. Stop loss:       P/L% <= -stop_pct
+//   3. Profit target:   P/L% >=  target_pct
 export async function planExits(): Promise<ExitDecision[]> {
   const cfg = loadConfig();
   const dbRows = await loadOpenPositions();
-  if (dbRows.length === 0) return [];
+  if (dbRows.length === 0) {
+    log.info('planExits summary', { rows_examined: 0, decisions_count: 0 });
+    return [];
+  }
 
   const live = await listPositions();
   const liveBy = new Map(live.map((p) => [p.symbol, p]));
-  const decisions: ExitDecision[] = [];
 
+  // Group rows by trade_key. Legacy rows (pre-trade_key column) get a
+  // synthetic single-row group keyed by their id.
+  const groups = new Map<string, DbPositionRow[]>();
   for (const row of dbRows) {
     if (row.status !== 'open') {
       log.info('skipping exit-check — row not open', {
@@ -111,114 +126,134 @@ export async function planExits(): Promise<ExitDecision[]> {
       });
       continue;
     }
-    const lp = liveBy.get(row.occ_symbol);
-    if (!lp) {
-      log.warn('skipping exit-check — DB has row but Alpaca does not', {
-        occ_symbol: row.occ_symbol,
+    const key = row.trade_key ?? `legacy:${row.id}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(row);
+  }
+
+  const decisions: ExitDecision[] = [];
+
+  for (const [tradeKey, legs] of groups) {
+    // All legs must still be present at Alpaca for spread-level math.
+    const missing = legs.filter((l) => !liveBy.get(l.occ_symbol));
+    if (missing.length > 0) {
+      log.warn('skipping exit-check — leg(s) missing at Alpaca', {
+        tradeKey,
+        missing_legs: missing.map((l) => l.occ_symbol),
       });
       continue;
     }
 
-    const dte = dteFromExpiration(row.expiration);
+    // initialNet: sign-summed entry prices.
+    //   long  →  +entry_price (we paid the ask)
+    //   short →  -entry_price (we received the bid)
+    // Positive net = debit spread, negative net = credit spread.
+    let initialNet = 0;
+    let entryMissing = false;
+    for (const leg of legs) {
+      const e = parseFloat(leg.entry_price ?? '0');
+      if (e <= 0) {
+        log.warn('exit-check — leg has no entry price', {
+          occ_symbol: leg.occ_symbol,
+        });
+        entryMissing = true;
+        break;
+      }
+      const sign = leg.side === 'long' ? +1 : -1;
+      initialNet += sign * e;
+    }
+    if (entryMissing) continue;
 
-    // Rule 1 — assignment risk on a short leg.
-    // CRITICAL: this path must trigger whether or not we can fetch a fresh
-    // quote. The whole point of assignment-close is "DTE is dangerous, get
-    // out". Skipping the decision because Tradier hiccupped on a quote is
-    // exactly the failure mode that lets a $4k drawdown sit through 6 ticks.
-    if (row.side === 'short' && dte <= cfg.ASSIGNMENT_CLOSE_DTE) {
-      const quote = await getOptionQuoteForLeg(rowToLeg(row));
-      decisions.push({
-        position: row,
-        occSymbol: row.occ_symbol,
-        qty: Math.abs(row.qty),
-        reason: quote
-          ? `assignment-risk: short DTE ${dte} <= ${cfg.ASSIGNMENT_CLOSE_DTE}, mid ${quote.mid.toFixed(2)}`
-          : `assignment-risk: short DTE ${dte} <= ${cfg.ASSIGNMENT_CLOSE_DTE} (no quote — using live mark)`,
-      });
-      continue;
+    // closeNet: sign-summed conservative closing prices.
+    //   long  →  +bid (sell to close)
+    //   short →  -ask (buy to close)
+    // Tradier first; Alpaca live mark fallback so we never bail silently.
+    let closeNet = 0;
+    let priceableAll = true;
+    let priceSourceMix = '';
+    for (const leg of legs) {
+      const lp = liveBy.get(leg.occ_symbol)!;
+      const q = await getOptionQuoteForLeg(rowToLeg(leg));
+      let closingPx: number;
+      if (q) {
+        closingPx = leg.side === 'long' ? q.bid : q.ask;
+        priceSourceMix += 'T';
+      } else if (lp.currentPrice && lp.currentPrice > 0) {
+        closingPx = lp.currentPrice;
+        priceSourceMix += 'A';
+      } else {
+        log.error('exit-check skipped — leg unpriceable', {
+          tradeKey,
+          occ_symbol: leg.occ_symbol,
+        });
+        priceableAll = false;
+        break;
+      }
+      const sign = leg.side === 'long' ? +1 : -1;
+      closeNet += sign * closingPx;
+    }
+    if (!priceableAll) continue;
+
+    const targetPct = legs[0].exit_target_pct ? parseFloat(legs[0].exit_target_pct) : null;
+    const stopPct = legs[0].exit_stop_pct ? parseFloat(legs[0].exit_stop_pct) : null;
+    const plRatio = (closeNet - initialNet) / Math.abs(initialNet);
+
+    // 1. Assignment risk on any short leg.
+    let assignmentReason: string | null = null;
+    for (const leg of legs) {
+      if (leg.side !== 'short') continue;
+      try {
+        const dte = dteFromExpiration(leg.expiration);
+        if (dte <= cfg.ASSIGNMENT_CLOSE_DTE) {
+          assignmentReason = `assignment-risk: ${leg.occ_symbol} short DTE ${dte} <= ${cfg.ASSIGNMENT_CLOSE_DTE}`;
+          break;
+        }
+      } catch (e) {
+        log.warn('dte calc failed', {
+          occ_symbol: leg.occ_symbol,
+          error: (e as Error).message,
+        });
+      }
     }
 
-    // Rules 2 & 3 — profit target / stop.
-    // Same defensive principle as assignment-risk: never skip a stop-loss
-    // check because a quote is missing. Fall back to Alpaca's running mark
-    // (always available for any open position).
-    const entry = parseFloat(row.entry_price ?? '0');
-    if (entry <= 0) {
-      log.warn('skipping exit-check — no entry price recorded', {
-        occ_symbol: row.occ_symbol,
-      });
-      continue;
+    let triggerReason: string | null = null;
+    if (assignmentReason) {
+      triggerReason = assignmentReason;
+    } else if (stopPct !== null && plRatio <= -stopPct) {
+      triggerReason = `stop-loss: P/L ${(plRatio * 100).toFixed(0)}% <= -${(stopPct * 100).toFixed(0)}% (initialNet ${initialNet.toFixed(2)}, closeNet ${closeNet.toFixed(2)})`;
+    } else if (targetPct !== null && plRatio >= targetPct) {
+      triggerReason = `profit-target: P/L ${(plRatio * 100).toFixed(0)}% >= ${(targetPct * 100).toFixed(0)}% (initialNet ${initialNet.toFixed(2)}, closeNet ${closeNet.toFixed(2)})`;
     }
-    const quote = await getOptionQuoteForLeg(rowToLeg(row));
-    let mid: number;
-    let priceSource: string;
-    if (quote) {
-      mid = quote.mid;
-      priceSource = `tradier mid ${mid.toFixed(2)}`;
-    } else if (lp.currentPrice && lp.currentPrice > 0) {
-      mid = lp.currentPrice;
-      priceSource = `alpaca live mark ${mid.toFixed(2)} (no Tradier quote)`;
-      log.warn('exit-check using Alpaca live mark', {
-        occ_symbol: row.occ_symbol,
-        mark: mid,
-      });
+
+    if (triggerReason) {
+      // Push one decision per leg — executeExits dedupes by trade_key and
+      // closes all sibling legs as one MLEG order anyway.
+      for (const leg of legs) {
+        decisions.push({
+          position: leg,
+          occSymbol: leg.occ_symbol,
+          qty: Math.abs(leg.qty),
+          reason: triggerReason,
+        });
+      }
     } else {
-      log.error('exit-check skipped — no quote and no live mark', {
-        occ_symbol: row.occ_symbol,
-      });
-      continue;
-    }
-    const tgt = row.exit_target_pct ? parseFloat(row.exit_target_pct) : null;
-    const stp = row.exit_stop_pct ? parseFloat(row.exit_stop_pct) : null;
-
-    if (row.side === 'long' && tgt && mid >= entry * (1 + tgt)) {
-      decisions.push({
-        position: row,
-        occSymbol: row.occ_symbol,
-        qty: Math.abs(row.qty),
-        reason: `profit-target: mid ${mid.toFixed(2)} >= entry ${entry.toFixed(2)} × (1+${tgt})`,
-      });
-    } else if (row.side === 'short' && tgt && mid <= entry * (1 - tgt)) {
-      decisions.push({
-        position: row,
-        occSymbol: row.occ_symbol,
-        qty: Math.abs(row.qty),
-        reason: `profit-target: mid ${mid.toFixed(2)} <= entry ${entry.toFixed(2)} × (1-${tgt})`,
-      });
-    } else if (row.side === 'long' && stp && mid <= entry * (1 - stp)) {
-      decisions.push({
-        position: row,
-        occSymbol: row.occ_symbol,
-        qty: Math.abs(row.qty),
-        reason: `stop-loss: mid ${mid.toFixed(2)} <= entry ${entry.toFixed(2)} × (1-${stp})`,
-      });
-    } else if (row.side === 'short' && stp && mid >= entry * (1 + stp)) {
-      decisions.push({
-        position: row,
-        occSymbol: row.occ_symbol,
-        qty: Math.abs(row.qty),
-        reason: `stop-loss: mid ${mid.toFixed(2)} >= entry ${entry.toFixed(2)} × (1+${stp})`,
-      });
-    } else {
-      // Visibility into "we looked at this row but it didn't trigger". Without
-      // this it's impossible to tell from logs whether the manager is even
-      // seeing a position vs. seeing it and deciding not to close.
       log.info('exit-check no trigger', {
-        occ_symbol: row.occ_symbol,
-        side: row.side,
-        dte,
-        entry,
-        mid,
-        target_pct: tgt,
-        stop_pct: stp,
-        price_source: priceSource,
+        tradeKey,
+        legs: legs.length,
+        initialNet: initialNet.toFixed(2),
+        closeNet: closeNet.toFixed(2),
+        pl_ratio_pct: (plRatio * 100).toFixed(0),
+        target_pct: targetPct,
+        stop_pct: stopPct,
+        spread_type: initialNet > 0 ? 'debit' : 'credit',
+        price_sources: priceSourceMix,
       });
     }
   }
 
   log.info('planExits summary', {
     rows_examined: dbRows.length,
+    spreads: groups.size,
     decisions_count: decisions.length,
   });
   return decisions;
