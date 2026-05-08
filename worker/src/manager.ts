@@ -111,27 +111,21 @@ export async function planExits(): Promise<ExitDecision[]> {
     const dte = dteFromExpiration(row.expiration);
 
     // Rule 1 — assignment risk on a short leg.
+    // CRITICAL: this path must trigger whether or not we can fetch a fresh
+    // quote. The whole point of assignment-close is "DTE is dangerous, get
+    // out". Skipping the decision because Tradier hiccupped on a quote is
+    // exactly the failure mode that lets a $4k drawdown sit through 6 ticks.
     if (row.side === 'short' && dte <= cfg.ASSIGNMENT_CLOSE_DTE) {
-      // ITM check uses option's intrinsic > extrinsic as a robust proxy:
-      // an ITM short near expiry has near-zero extrinsic. We use Alpaca's
-      // current_price (option mark) and compare to the strike.
-      // For a precise ITM call/put test we'd need the underlying spot;
-      // querying it on every tick adds latency, so we approximate via the
-      // option's current_price + intrinsic decomposition done by quote spread.
       const quote = await getOptionQuoteForLeg(rowToLeg(row));
-      if (quote) {
-        // Conservative heuristic: if mid <= 0.10 and DTE <= cap, the short
-        // is either deep OTM (safe — but still close to free up capital) or
-        // pinned. Either way, close.
-        // If mid is meaningful, we still close because of the DTE rule.
-        decisions.push({
-          position: row,
-          occSymbol: row.occ_symbol,
-          qty: Math.abs(row.qty),
-          reason: `assignment-risk: short DTE ${dte} <= ${cfg.ASSIGNMENT_CLOSE_DTE}, mid ${quote.mid.toFixed(2)}`,
-        });
-        continue;
-      }
+      decisions.push({
+        position: row,
+        occSymbol: row.occ_symbol,
+        qty: Math.abs(row.qty),
+        reason: quote
+          ? `assignment-risk: short DTE ${dte} <= ${cfg.ASSIGNMENT_CLOSE_DTE}, mid ${quote.mid.toFixed(2)}`
+          : `assignment-risk: short DTE ${dte} <= ${cfg.ASSIGNMENT_CLOSE_DTE} (no quote — using live mark)`,
+      });
+      continue;
     }
 
     // Rules 2 & 3 — profit target / stop, from per-position quote.
@@ -214,7 +208,13 @@ export async function executeExits(decisions: ExitDecision[], dryRun: boolean): 
 
       if (siblings.length === 1) {
         const sib = siblings[0]!;
-        const order = await closeOptionPosition(sib.occ_symbol, Math.abs(sib.qty), sib.side);
+        const liveSingle = (await listPositions()).find((p) => p.symbol === sib.occ_symbol);
+        const order = await closeOptionPosition(
+          sib.occ_symbol,
+          Math.abs(sib.qty),
+          sib.side,
+          liveSingle?.currentPrice,
+        );
         if (order) {
           await markGroupClosing(groupKey, isLegacy ? sib.id : null, trigger.reason);
           closed++;
@@ -223,22 +223,44 @@ export async function executeExits(decisions: ExitDecision[], dryRun: boolean): 
       }
 
       // 2-4 legs → MLEG close at marketable net price.
+      // If a leg is unquotable on Tradier, fall back to Alpaca's live
+      // position.current_price (the broker's running mark — always available
+      // for any open position, even when the quote endpoint isn't). Cross
+      // the spread aggressively (×1.5 / ÷1.5 buffer) to guarantee a fill —
+      // a partial-loss exit is infinitely better than a position that sits
+      // bleeding because we couldn't get a clean two-sided quote.
       const mlegLegs: MlegLeg[] = [];
       let netDebitPerShare = 0;
-      let unquotable = false;
       let qtySpread = Math.min(...siblings.map((s) => Math.abs(s.qty)));
       if (!Number.isFinite(qtySpread) || qtySpread <= 0) qtySpread = 1;
+      const liveBy = new Map((await listPositions()).map((p) => [p.symbol, p]));
 
+      let priceable = true;
       for (const sib of siblings) {
         const q = await getOptionQuoteForLeg(rowToLeg(sib));
-        if (!q) {
-          unquotable = true;
-          break;
-        }
-        // Closing a long leg = sell at bid; closing a short leg = buy at ask.
         const closeSide: 'buy' | 'sell' = sib.side === 'long' ? 'sell' : 'buy';
-        const px = sib.side === 'long' ? q.bid : q.ask;
-        const sign = sib.side === 'long' ? -1 : 1; // closing flips the sign
+        let px: number;
+        if (q) {
+          px = sib.side === 'long' ? q.bid : q.ask;
+        } else {
+          const live = liveBy.get(sib.occ_symbol);
+          if (!live || !live.currentPrice || live.currentPrice <= 0) {
+            log.error('cannot price leg for emergency close — no Tradier quote and no live mark', {
+              occ_symbol: sib.occ_symbol,
+            });
+            priceable = false;
+            break;
+          }
+          // Cross the spread aggressively. Long-side close (sell) accepts
+          // less than mark; short-side close (buy) pays more than mark.
+          px = sib.side === 'long' ? live.currentPrice * 0.7 : live.currentPrice * 1.5;
+          log.warn('using Alpaca live mark for emergency close', {
+            occ_symbol: sib.occ_symbol,
+            mark: live.currentPrice,
+            limit: px,
+          });
+        }
+        const sign = sib.side === 'long' ? -1 : 1;
         netDebitPerShare += sign * px;
         mlegLegs.push({
           occSymbol: sib.occ_symbol,
@@ -247,8 +269,8 @@ export async function executeExits(decisions: ExitDecision[], dryRun: boolean): 
           positionIntent: sib.side === 'long' ? 'sell_to_close' : 'buy_to_close',
         });
       }
-      if (unquotable) {
-        log.warn('cannot MLEG-close — leg unquotable', { trade_key: groupKey });
+      if (!priceable) {
+        log.warn('cannot MLEG-close — leg unpriceable', { trade_key: groupKey });
         continue;
       }
 

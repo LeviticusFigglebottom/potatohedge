@@ -134,7 +134,8 @@ const NORMALIZER_TOOL = {
                   strike: { type: 'number' },
                   expiration: {
                     type: 'string',
-                    description: 'YYYY-MM-DD. Resolve relative phrases like "weekly" or "30 DTE" into a concrete date.',
+                    description:
+                      'YYYY-MM-DD. MUST be one of the per-idea expiration fields: nearestExp, weeklyExp, or monthlyExp. NEVER invent a date — those three fields are the only expirations the briefing has verified for this ticker. If "30-45 DTE" is mentioned, use monthlyExp. If "weekly", use weeklyExp. If "0DTE", use nearestExp.',
                   },
                   side: { type: 'string', enum: ['long', 'short'] },
                   ratio: { type: 'integer', minimum: 1, default: 1 },
@@ -190,8 +191,20 @@ Input is a JSON array of trade ideas extracted from a market briefing. Each
 idea has free-text fields like strikes ("Sell $595P / Buy $590P"), expiration
 ("2025-02-21 (7 DTE)" or "weekly" or "monthly"), entry, target, etc.
 
+Each idea ALSO carries three pre-computed valid expirations for that ticker:
+- nearestExp  (typically 0-3 DTE, the next available expiration)
+- weeklyExp   (typically 5-10 DTE)
+- monthlyExp  (typically 25-50 DTE — the standard monthly)
+
+CRITICAL EXPIRATION RULE: the "expiration" field on every leg you emit MUST
+be exactly one of those three values from the same idea. Do not invent a
+date. Do not pick a date because it sounds right. If the idea says "30-45
+DTE", use monthlyExp verbatim. If "weekly" or "7 DTE", use weeklyExp. If
+"0DTE" or "today", use nearestExp. If none of the three fields is suitable
+for the strategy, skip the idea entirely.
+
 Convert every idea into one entry in the trades array. Rules:
-- Resolve every expiration to YYYY-MM-DD using today's date as the anchor.
+- Resolve every expiration to one of nearestExp/weeklyExp/monthlyExp (above).
 - Expand multi-leg structures (spreads, condors, straddles, strangles) into
   separate legs with side=long|short.
 - direction: classify the structure as bullish, bearish, or neutral.
@@ -200,7 +213,8 @@ Convert every idea into one entry in the trades array. Rules:
   entry/credit numbers; if absent, estimate.
 - exit_target_pct / exit_stop_pct: extract from the target/stopMaxLoss fields
   as decimal fractions. If "50% of max credit" → 0.5. If absent, omit.
-- Skip any idea where strikes or expiration cannot be resolved.
+- Skip any idea where strikes or expiration cannot be resolved from the
+  three valid expirations above.
 
 Trade ideas:
 \`\`\`json

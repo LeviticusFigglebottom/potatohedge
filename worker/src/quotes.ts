@@ -12,10 +12,40 @@
 // instead of an OCC symbol so we can group lookups by underlying+expiration
 // and fetch each chain once per tick instead of once per leg.
 
-import { getOptionsChain } from './lib/providers/tradier.js';
+import { getOptionsChain, getExpirations } from './lib/providers/tradier.js';
 import { getOptionQuote as alpacaQuote, buildOccSymbol } from './alpaca.js';
 import { log } from './log.js';
 import type { NormalizedLeg, OptionRight } from './types.js';
+
+const SNAP_MAX_DAYS = 7;
+const expirationsCache = new Map<string, string[]>();
+
+async function listExpirations(underlying: string): Promise<string[]> {
+  const hit = expirationsCache.get(underlying);
+  if (hit) return hit;
+  try {
+    const exps = await getExpirations(underlying);
+    const dates = exps.map((e) => e.date);
+    expirationsCache.set(underlying, dates);
+    return dates;
+  } catch (e) {
+    log.warn('expirations fetch failed', { underlying, error: (e as Error).message });
+    return [];
+  }
+}
+
+function nearestExpiration(target: string, list: string[]): string | null {
+  if (list.length === 0) return null;
+  const targetMs = new Date(target + 'T16:00:00').getTime();
+  let best: { date: string; dist: number } | null = null;
+  for (const d of list) {
+    const dist = Math.abs(new Date(d + 'T16:00:00').getTime() - targetMs);
+    if (best === null || dist < best.dist) best = { date: d, dist };
+  }
+  if (!best) return null;
+  if (best.dist > SNAP_MAX_DAYS * 24 * 3600 * 1000) return null;
+  return best.date === target ? null : best.date;
+}
 
 export interface OptionQuote {
   bid: number;
@@ -46,6 +76,7 @@ function key(k: ChainKey): string {
 
 export function resetQuoteCache(): void {
   chainCache.clear();
+  expirationsCache.clear();
 }
 
 async function loadTradierChain(k: ChainKey): Promise<CachedRow[] | null> {
@@ -73,7 +104,32 @@ async function loadTradierChain(k: ChainKey): Promise<CachedRow[] | null> {
 }
 
 export async function getOptionQuoteForLeg(leg: NormalizedLeg): Promise<OptionQuote | null> {
-  const rows = await loadTradierChain({ underlying: leg.underlying, expiration: leg.expiration });
+  let effectiveExpiration = leg.expiration;
+  let rows = await loadTradierChain({ underlying: leg.underlying, expiration: effectiveExpiration });
+
+  // Snap-to-nearest fallback: if Tradier said the expiration was valid in
+  // getExpirations but the chain came back empty (Tradier data inconsistency
+  // we've seen on sector ETFs), find the closest valid expiration that does
+  // have a chain. Only allowed within SNAP_MAX_DAYS so we don't silently
+  // change the trade's risk profile by weeks.
+  if (rows && rows.length === 0) {
+    const list = await listExpirations(leg.underlying);
+    const snap = nearestExpiration(leg.expiration, list);
+    if (snap) {
+      log.warn('snapping leg expiration to nearest valid', {
+        underlying: leg.underlying,
+        requested: leg.expiration,
+        snapped_to: snap,
+      });
+      effectiveExpiration = snap;
+      rows = await loadTradierChain({ underlying: leg.underlying, expiration: snap });
+      // Mutate the leg object so downstream code (OCC symbol builder, DB
+      // persistence) uses the snapped date — otherwise we'd write an order
+      // for a contract that doesn't exist.
+      leg.expiration = snap;
+    }
+  }
+
   if (rows) {
     const sameRight = rows.filter((r) => r.right === leg.right);
     const match = sameRight.find((r) => Math.abs(r.strike - leg.strike) < 0.001);
