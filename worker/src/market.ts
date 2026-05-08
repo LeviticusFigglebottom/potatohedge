@@ -19,8 +19,26 @@ export function isMarketOpenNow(now = new Date()): boolean {
   return t >= 9 * 60 + 30 && t <= 16 * 60;
 }
 
-export function dteFromExpiration(expiration: string, now = new Date()): number {
-  const exp = new Date(`${expiration}T20:00:00-04:00`);
+// Robust DTE calculation. Postgres reads `DATE` columns back as JS Date
+// objects (not strings), so the same field can arrive here either way.
+// Failing silently with NaN here is what let assignment-risk on bleeding
+// short positions never trigger — defensively normalize first.
+export function dteFromExpiration(expiration: string | Date, now = new Date()): number {
+  let dateOnly: string;
+  if (expiration instanceof Date) {
+    dateOnly = expiration.toISOString().slice(0, 10);
+  } else if (typeof expiration === 'string') {
+    dateOnly = expiration.slice(0, 10);
+  } else {
+    throw new Error(`dteFromExpiration: bad input ${typeof expiration}`);
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateOnly)) {
+    throw new Error(`dteFromExpiration: invalid date ${dateOnly}`);
+  }
+  const exp = new Date(`${dateOnly}T20:00:00-04:00`);
+  if (Number.isNaN(exp.getTime())) {
+    throw new Error(`dteFromExpiration: failed to parse ${dateOnly}`);
+  }
   const ms = exp.getTime() - now.getTime();
   return Math.ceil(ms / (1000 * 60 * 60 * 24));
 }
