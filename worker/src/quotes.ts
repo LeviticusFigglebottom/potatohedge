@@ -75,11 +75,8 @@ async function loadTradierChain(k: ChainKey): Promise<CachedRow[] | null> {
 export async function getOptionQuoteForLeg(leg: NormalizedLeg): Promise<OptionQuote | null> {
   const rows = await loadTradierChain({ underlying: leg.underlying, expiration: leg.expiration });
   if (rows) {
-    // Strike match with small float tolerance — Tradier sometimes returns
-    // 52.5 vs our normalized 52.5000.
-    const match = rows.find(
-      (r) => r.right === leg.right && Math.abs(r.strike - leg.strike) < 0.001,
-    );
+    const sameRight = rows.filter((r) => r.right === leg.right);
+    const match = sameRight.find((r) => Math.abs(r.strike - leg.strike) < 0.001);
     if (match && match.bid > 0 && match.ask > 0) {
       return {
         bid: match.bid,
@@ -88,10 +85,25 @@ export async function getOptionQuoteForLeg(leg: NormalizedLeg): Promise<OptionQu
         source: 'tradier',
       };
     }
+    // Diagnostic: log what we *did* find so we can tell strike-rounding
+    // mismatch ("$735 requested, $735.5 available") apart from a contract
+    // that genuinely isn't on the chain.
+    const nearest = sameRight
+      .map((r) => ({ strike: r.strike, bid: r.bid, ask: r.ask, dist: Math.abs(r.strike - leg.strike) }))
+      .sort((a, b) => a.dist - b.dist)
+      .slice(0, 4)
+      .map((r) => `${r.strike}${r.bid > 0 && r.ask > 0 ? '' : '(no bid/ask)'}`);
+    log.warn('tradier no match for leg', {
+      underlying: leg.underlying,
+      expiration: leg.expiration,
+      requested_strike: leg.strike,
+      requested_right: leg.right,
+      tradier_chain_size: sameRight.length,
+      nearest_strikes: nearest,
+      had_match_zero_bidask: !!match,
+    });
   }
 
-  // Fallback: try Alpaca per-symbol. Useful for the rare case Tradier is
-  // missing a specific contract or the chain fetch failed.
   const occ = buildOccSymbol(leg);
   const alpaca = await alpacaQuote(occ);
   if (alpaca) {

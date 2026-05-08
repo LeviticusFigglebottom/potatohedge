@@ -131,14 +131,29 @@ export async function runTick(opts: { force?: boolean } = {}): Promise<TickResul
     const trades = await normalizeTradeIdeas(briefing, today);
     const briefingId = await persistBriefing(tickId, briefing, trades, briefing.prompt ?? null);
 
-    // ── 5. Filter out trades we already hold (dedupe by structural trade key).
-    const [openSummary, heldKeys] = await Promise.all([
+    // ── 5. Filter out trades we already hold (dedupe by structural trade key)
+    // and trades that would collide with any existing Alpaca position at the
+    // OCC-symbol level (otherwise Alpaca rejects with 422 "position intent
+    // mismatch" because it infers we're closing a position we want to open).
+    const [openSummary, heldKeys, livePositions] = await Promise.all([
       summarizeOpenPositionsForRisk(),
       getOpenTradeKeys(),
+      (await import('./alpaca.js')).listPositions(),
     ]);
+    const heldOccSymbols = new Set(livePositions.map((p) => p.symbol));
     const fresh = trades.filter((t) => {
       if (heldKeys.has(t.key)) {
         log.info('skipping duplicate of open position', { trade: t.key });
+        return false;
+      }
+      const conflicts = t.legs
+        .map((leg) => buildOccSymbol(leg))
+        .filter((occ) => heldOccSymbols.has(occ));
+      if (conflicts.length > 0) {
+        log.info('skipping trade — leg conflicts with existing Alpaca position', {
+          trade: t.key,
+          conflicting_legs: conflicts,
+        });
         return false;
       }
       return true;
