@@ -90,7 +90,12 @@ const TradeNormalization = z.object({
           z.object({
             right: z.enum(['call', 'put']),
             strike: z.number().positive(),
-            expiration: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+            // Accept any string starting with YYYY-MM-DD and trim the rest
+            // (Claude sometimes adds " (7 DTE)" or trailing whitespace).
+            expiration: z
+              .string()
+              .regex(/^\d{4}-\d{2}-\d{2}/, 'must start with YYYY-MM-DD')
+              .transform((s) => s.slice(0, 10)),
             side: z.enum(['long', 'short']),
             ratio: z.number().int().positive().default(1),
           }),
@@ -135,7 +140,7 @@ const NORMALIZER_TOOL = {
                   expiration: {
                     type: 'string',
                     description:
-                      'YYYY-MM-DD. MUST be one of the per-idea expiration fields: nearestExp, weeklyExp, or monthlyExp. NEVER invent a date — those three fields are the only expirations the briefing has verified for this ticker. If "30-45 DTE" is mentioned, use monthlyExp. If "weekly", use weeklyExp. If "0DTE", use nearestExp.',
+                      'EXACT format: YYYY-MM-DD as a literal date string. NO trailing text, NO parenthetical (NOT "2026-05-15 (7 DTE)"), NO field names (NOT "monthlyExp"). The VALUE you copy must be the actual date string from the idea\'s nearestExp, weeklyExp, or monthlyExp field — pick whichever matches the strategy: monthlyExp for 30-45 DTE setups, weeklyExp for 5-10 DTE, nearestExp for 0-2 DTE. Example output: "2026-05-15".',
                   },
                   side: { type: 'string', enum: ['long', 'short'] },
                   ratio: { type: 'integer', minimum: 1, default: 1 },
