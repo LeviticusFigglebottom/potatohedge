@@ -77,6 +77,159 @@ async function main() {
     return { positions: rows };
   });
 
+  // Spread-level P/L snapshot. Same math the manager uses for exits, exposed
+  // on demand so you can see WHY a spread is or isn't triggering a close
+  // without waiting for the next tick.
+  app.get('/pnl', async () => {
+    const { getPool } = await import('./db.js');
+    const { listPositions } = await import('./alpaca.js');
+    const { getOptionQuoteForLeg, resetQuoteCache } = await import('./quotes.js');
+    const { dteFromExpiration } = await import('./market.js');
+    const cfgLocal = loadConfig();
+
+    type Row = {
+      id: number;
+      occ_symbol: string;
+      underlying: string;
+      right: 'call' | 'put';
+      strike: string;
+      expiration: string | Date;
+      side: 'long' | 'short';
+      direction: 'bullish' | 'bearish' | 'neutral';
+      qty: number;
+      entry_price: string | null;
+      exit_target_pct: string | null;
+      exit_stop_pct: string | null;
+      trade_key: string | null;
+    };
+    const { rows } = await getPool().query<Row>(
+      `SELECT id, occ_symbol, underlying, "right", strike, expiration, side, direction,
+              qty, entry_price, exit_target_pct, exit_stop_pct, trade_key
+       FROM positions
+       WHERE status = 'open'
+       ORDER BY trade_key, id`,
+    );
+
+    resetQuoteCache();
+    const live = await listPositions();
+    const liveBy = new Map(live.map((p) => [p.symbol, p]));
+
+    const groups = new Map<string, Row[]>();
+    for (const r of rows) {
+      const key = r.trade_key ?? `legacy:${r.id}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push(r);
+    }
+
+    const expToString = (e: string | Date) =>
+      e instanceof Date ? e.toISOString().slice(0, 10) : e.slice(0, 10);
+
+    const out: unknown[] = [];
+    for (const [tradeKey, legs] of groups) {
+      let initialNet = 0;
+      let closeNet = 0;
+      let priceableAll = true;
+      const legDetails: unknown[] = [];
+
+      for (const leg of legs) {
+        const lp = liveBy.get(leg.occ_symbol);
+        const e = parseFloat(leg.entry_price ?? '0');
+        const sign = leg.side === 'long' ? +1 : -1;
+        initialNet += sign * e;
+
+        const expStr = expToString(leg.expiration);
+        const q = await getOptionQuoteForLeg({
+          underlying: leg.underlying,
+          right: leg.right,
+          strike: parseFloat(leg.strike),
+          expiration: expStr,
+          side: leg.side,
+          ratio: 1,
+        });
+        let closingPx: number | null = null;
+        let priceSrc = '';
+        if (q) {
+          closingPx = leg.side === 'long' ? q.bid : q.ask;
+          priceSrc = 'tradier';
+        } else if (lp?.currentPrice && lp.currentPrice > 0) {
+          closingPx = lp.currentPrice;
+          priceSrc = 'alpaca-mark';
+        } else {
+          priceableAll = false;
+        }
+        if (closingPx !== null) closeNet += sign * closingPx;
+
+        legDetails.push({
+          occ_symbol: leg.occ_symbol,
+          side: leg.side,
+          qty: leg.qty,
+          entry: e,
+          closing_px: closingPx,
+          price_source: priceSrc,
+          alpaca_mark: lp?.currentPrice ?? null,
+          alpaca_market_value: lp?.marketValue ?? null,
+        });
+      }
+
+      const targetPct = legs[0]?.exit_target_pct ? parseFloat(legs[0].exit_target_pct) : null;
+      const stopPct = legs[0]?.exit_stop_pct ? parseFloat(legs[0].exit_stop_pct) : null;
+      const plRatio = priceableAll ? (closeNet - initialNet) / Math.abs(initialNet) : null;
+
+      // Per-spread $ P/L (use the smallest leg qty as spread-units count;
+      // every leg of an MLEG-opened spread should have the same qty anyway).
+      const spreadUnits = Math.min(...legs.map((l) => Math.abs(l.qty)));
+      const dollarPnL =
+        priceableAll ? (closeNet - initialNet) * 100 * spreadUnits : null;
+
+      const wouldTriggerStop =
+        plRatio !== null && stopPct !== null && plRatio <= -stopPct;
+      const wouldTriggerTarget =
+        plRatio !== null && targetPct !== null && plRatio >= targetPct;
+
+      let assignmentRisk: string | null = null;
+      for (const leg of legs) {
+        if (leg.side !== 'short') continue;
+        try {
+          const dte = dteFromExpiration(expToString(leg.expiration));
+          if (dte <= cfgLocal.ASSIGNMENT_CLOSE_DTE) {
+            assignmentRisk = `${leg.occ_symbol} DTE ${dte}`;
+            break;
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+
+      out.push({
+        trade_key: tradeKey,
+        underlying: legs[0]?.underlying,
+        direction: legs[0]?.direction,
+        legs_count: legs.length,
+        spread_units: spreadUnits,
+        initial_net: initialNet.toFixed(2),
+        close_net: priceableAll ? closeNet.toFixed(2) : null,
+        spread_type: initialNet > 0 ? 'debit' : 'credit',
+        pl_ratio_pct: plRatio !== null ? (plRatio * 100).toFixed(1) : null,
+        dollar_pnl: dollarPnL !== null ? dollarPnL.toFixed(2) : null,
+        target_pct: targetPct,
+        stop_pct: stopPct,
+        would_trigger_stop: wouldTriggerStop,
+        would_trigger_target: wouldTriggerTarget,
+        would_trigger_assignment: assignmentRisk,
+        legs: legDetails,
+      });
+    }
+
+    // Sort by largest $ loss first so the bleeders are at the top.
+    out.sort((a, b) => {
+      const av = parseFloat((a as { dollar_pnl: string | null }).dollar_pnl ?? '0');
+      const bv = parseFloat((b as { dollar_pnl: string | null }).dollar_pnl ?? '0');
+      return av - bv;
+    });
+
+    return { snapshot_at: new Date().toISOString(), spreads: out };
+  });
+
   // Inspect the most recent AI briefing — full prompt sent to Claude,
   // analysis text returned, and the normalized trades the worker derived.
   // Use ?id=N to fetch a specific briefing instead of the latest.
