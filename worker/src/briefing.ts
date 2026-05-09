@@ -122,7 +122,15 @@ const NORMALIZER_TOOL = {
         type: 'array',
         items: {
           type: 'object',
-          required: ['underlying', 'direction', 'strategy_label', 'legs', 'estimated_debit_per_spread'],
+          required: [
+            'underlying',
+            'direction',
+            'strategy_label',
+            'legs',
+            'estimated_debit_per_spread',
+            'exit_target_pct',
+            'exit_stop_pct',
+          ],
           properties: {
             underlying: { type: 'string', description: 'Stock ticker, uppercase.' },
             direction: { type: 'string', enum: ['bullish', 'bearish', 'neutral'] },
@@ -154,12 +162,13 @@ const NORMALIZER_TOOL = {
             },
             exit_target_pct: {
               type: 'number',
-              description: 'Profit target as a fraction of max profit, e.g. 0.5 for "50% of max credit".',
+              description:
+                'REQUIRED. Profit target as a positive decimal fraction. For debit spreads = fraction of debit gained (e.g. 0.5 = "close at 50% gain"). For credit spreads = fraction of credit captured (e.g. 0.5 = "close after capturing 50% of the credit"). Default to 0.5 if the idea doesn\'t specify.',
             },
             exit_stop_pct: {
               type: 'number',
               description:
-                'Stop loss as a fraction of premium paid (debit) or premium collected (credit). e.g. 2.0 means cut at 2× credit collected.',
+                'REQUIRED. Stop loss as a positive decimal fraction. For debit spreads = fraction of debit lost (e.g. 0.5 = "close at 50% loss"). For credit spreads = ratio of cost-to-close to credit (e.g. 1.0 = "close when paying back the full credit"). Default to 0.5 for debit spreads and 1.0 for credit spreads if the idea doesn\'t specify. The system will additionally cap this to the structural max-loss ratio so unreachable stops cannot be set.',
             },
             invalidation: { type: 'string' },
             thesis: { type: 'string' },
@@ -216,8 +225,14 @@ Convert every idea into one entry in the trades array. Rules:
 - estimated_debit_per_spread: dollars per share per spread. POSITIVE = debit
   (you pay to open), NEGATIVE = credit (you collect). Use the briefing's
   entry/credit numbers; if absent, estimate.
-- exit_target_pct / exit_stop_pct: extract from the target/stopMaxLoss fields
-  as decimal fractions. If "50% of max credit" → 0.5. If absent, omit.
+- exit_target_pct / exit_stop_pct: REQUIRED — extract from the target/
+  stopMaxLoss fields as decimal fractions. If "50% of max credit" → 0.5.
+  If "200% of credit" or "2× credit" → 2.0. If the idea doesn't specify a
+  stop, infer a sensible one from the strategy: 0.5 for debit spreads
+  (50% loss), 1.0 for credit spreads (lose 1× credit collected). If the
+  idea doesn't specify a target, use 0.5 for debits (50% gain) and 0.5
+  for credits (50% of credit captured). Never omit either field — the
+  automation will refuse to open a trade without both.
 - Skip any idea where strikes or expiration cannot be resolved from the
   three valid expirations above.
 
@@ -258,7 +273,8 @@ Call submit_normalized_trades with the converted trades.`;
       side: l.side as OptionSide,
       ratio: l.ratio ?? 1,
     }));
-    out.push({
+
+    const candidate: NormalizedTrade = {
       key: tradeKey(t.underlying, legs),
       underlying: t.underlying,
       direction: t.direction as Direction,
@@ -270,8 +286,80 @@ Call submit_normalized_trades with the converted trades.`;
       invalidation: t.invalidation,
       thesis: t.thesis,
       rawIdea: t,
-    });
+    };
+
+    // Refuse trades without both exit pcts. The whole automation depends on
+    // them — a trade without target and stop becomes an un-managed orphan
+    // (see META, IWM, TSLA 5/15 from May 7 batch). Better to skip the
+    // opportunity than create another orphan.
+    if (
+      candidate.exitTargetPct === undefined ||
+      candidate.exitStopPct === undefined
+    ) {
+      log.warn('rejecting trade — missing exit pcts', {
+        trade: candidate.key,
+        target_pct: candidate.exitTargetPct,
+        stop_pct: candidate.exitStopPct,
+      });
+      continue;
+    }
+
+    // Cap stop_pct to the spread's structural max-loss-to-basis ratio.
+    // Otherwise Claude can produce e.g. stop_pct=2.33 on a credit spread
+    // whose actual max loss is only 1.04× credit — making the stop
+    // literally unreachable. Same disease as the QQQ position currently
+    // riding without a usable stop.
+    const cappedStop = capStopPctToStructure(candidate);
+    if (cappedStop !== null && cappedStop < candidate.exitStopPct) {
+      log.warn('capping stop_pct to structural max-loss ratio', {
+        trade: candidate.key,
+        original: candidate.exitStopPct,
+        capped: cappedStop,
+      });
+      candidate.exitStopPct = cappedStop;
+    }
+
+    out.push(candidate);
   }
   log.info('normalized trades', { count: out.length });
   return out;
+}
+
+// Compute the maximum stop_pct that is structurally reachable for this trade.
+// Returns null for shapes we can't reason about cleanly (calendars, naked
+// shorts, weird custom structures) — caller leaves the value unchanged.
+//
+// For debit spreads (initialBasis = debit paid):
+//   max loss = debit, so max stop_pct = 1.0
+// For credit spreads (initialBasis = credit received):
+//   max loss = spread_width - credit
+//   max stop_pct = (spread_width - credit) / credit
+function capStopPctToStructure(trade: NormalizedTrade): number | null {
+  const debit = trade.estimatedDebitPerSpread;
+  if (!Number.isFinite(debit) || debit === 0) return null;
+
+  // All legs must share an expiration (no calendars).
+  const expirations = new Set(trade.legs.map((l) => l.expiration));
+  if (expirations.size > 1) return null;
+
+  if (debit > 0) {
+    // Debit. You can't lose more than 100% of what you paid.
+    return 1.0;
+  }
+
+  // Credit. Find the widest vertical width (calls or puts).
+  const credit = -debit;
+  const calls = trade.legs.filter((l) => l.right === 'call');
+  const puts = trade.legs.filter((l) => l.right === 'put');
+  let maxWidth = 0;
+  if (calls.length === 2) {
+    maxWidth = Math.max(maxWidth, Math.abs(calls[0]!.strike - calls[1]!.strike));
+  }
+  if (puts.length === 2) {
+    maxWidth = Math.max(maxWidth, Math.abs(puts[0]!.strike - puts[1]!.strike));
+  }
+  if (maxWidth === 0) return null; // not a recognizable defined-risk credit
+  const maxLoss = maxWidth - credit;
+  if (maxLoss <= 0) return null; // free money or weird (shouldn't happen)
+  return maxLoss / credit;
 }
