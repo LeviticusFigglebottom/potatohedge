@@ -403,6 +403,16 @@ async function main() {
     },
   );
 
+  // Browser-friendly admin page. Lists every open spread with one-click
+  // close buttons, a global "cancel all working orders" button, and a
+  // manual "run tick" trigger. Avoids needing PowerShell/curl for routine
+  // ops. No auth — the worker's public URL is the only protection, so
+  // keep that URL private.
+  app.get('/admin', async (_req, reply) => {
+    reply.type('text/html; charset=utf-8');
+    return ADMIN_HTML;
+  });
+
   app.get('/runs', async () => {
     const { getPool } = await import('./db.js');
     const { rows } = await getPool().query(
@@ -455,3 +465,145 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     setTimeout(() => process.exit(0), 2_000);
   });
 }
+
+const ADMIN_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>potatohedge worker — admin</title>
+<style>
+  body { font: 14px/1.5 system-ui, -apple-system, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px; color: #222; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 24px 0 8px; text-transform: uppercase; letter-spacing: 0.5px; color: #555; }
+  button { font: inherit; padding: 6px 12px; border: 1px solid #888; background: #f7f7f7; cursor: pointer; border-radius: 4px; }
+  button:hover { background: #eee; }
+  button.danger { background: #fee; border-color: #d44; color: #a00; }
+  button.danger:hover { background: #fdd; }
+  button.primary { background: #def; border-color: #48c; color: #036; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid #eee; text-align: left; }
+  th { font-weight: 600; background: #fafafa; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .gain { color: #060; }
+  .loss { color: #a00; }
+  .small { font-size: 12px; color: #666; }
+  #log { background: #f4f4f4; border: 1px solid #ddd; padding: 8px 12px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; max-height: 240px; overflow: auto; white-space: pre-wrap; }
+  .row-actions button { margin-right: 4px; }
+</style>
+</head>
+<body>
+<h1>potatohedge worker — admin</h1>
+<div class="small" id="health">checking…</div>
+
+<h2>Quick actions</h2>
+<button class="primary" id="refresh">Refresh /pnl</button>
+<button id="runTick">Force run tick (force=true)</button>
+<button class="danger" id="cancelAll">Cancel all working option orders</button>
+
+<h2>Open spreads</h2>
+<table id="spreads">
+  <thead><tr>
+    <th>Underlying</th><th>Dir</th><th>Legs</th><th>Type</th>
+    <th class="num">Initial</th><th class="num">Close</th><th class="num">P/L %</th><th class="num">$ P/L</th>
+    <th class="num">Stop %</th><th>Triggers</th><th>Actions</th>
+  </tr></thead>
+  <tbody></tbody>
+</table>
+
+<h2>Activity</h2>
+<div id="log">(idle)</div>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+const log = (msg) => {
+  const t = new Date().toISOString().slice(11, 19);
+  const el = $("#log");
+  el.textContent = (el.textContent === "(idle)" ? "" : el.textContent + "\\n") + t + "  " + msg;
+  el.scrollTop = el.scrollHeight;
+};
+
+async function post(path) {
+  log("POST " + path);
+  try {
+    const res = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const txt = await res.text();
+    log("  → " + res.status + " " + txt.slice(0, 500));
+    return { ok: res.ok, body: txt };
+  } catch (e) {
+    log("  → ERROR " + e.message);
+    return { ok: false, body: e.message };
+  }
+}
+
+async function loadPnl() {
+  log("GET /pnl");
+  const res = await fetch("/pnl");
+  const j = await res.json();
+  const tbody = $("#spreads tbody");
+  tbody.innerHTML = "";
+  if (!j.spreads || j.spreads.length === 0) {
+    tbody.innerHTML = "<tr><td colspan=11 style=\\"text-align:center;color:#666;padding:24px\\">no open spreads</td></tr>";
+    log("  → 0 open spreads");
+    return;
+  }
+  let totalPnl = 0;
+  for (const s of j.spreads) {
+    const pnl = parseFloat(s.dollar_pnl ?? "0");
+    if (Number.isFinite(pnl)) totalPnl += pnl;
+    const triggers = [];
+    if (s.would_trigger_stop) triggers.push("STOP");
+    if (s.would_trigger_target) triggers.push("TARGET");
+    if (s.would_trigger_assignment) triggers.push("ASSIGN");
+    const cls = pnl >= 0 ? "gain" : "loss";
+    const tk = encodeURIComponent(s.trade_key);
+    const tr = document.createElement("tr");
+    tr.innerHTML = \`
+      <td><b>\${s.underlying}</b></td>
+      <td>\${s.direction}</td>
+      <td>\${s.legs_count} × \${s.spread_units}</td>
+      <td>\${s.spread_type}</td>
+      <td class="num">\${s.initial_net}</td>
+      <td class="num">\${s.close_net ?? "—"}</td>
+      <td class="num \${cls}">\${s.pl_ratio_pct ?? "—"}%</td>
+      <td class="num \${cls}">$\${s.dollar_pnl ?? "—"}</td>
+      <td class="num">\${s.stop_pct ?? "—"}</td>
+      <td>\${triggers.join(" ") || "—"}</td>
+      <td class="row-actions">
+        <button class="danger" data-tk="\${tk}">Close (MLEG)</button>
+      </td>\`;
+    tbody.appendChild(tr);
+  }
+  log("  → " + j.spreads.length + " spreads, total P/L $" + totalPnl.toFixed(0));
+  for (const btn of document.querySelectorAll(".row-actions button")) {
+    btn.addEventListener("click", async () => {
+      if (!confirm("Close this spread via MLEG? This is irreversible.")) return;
+      btn.disabled = true;
+      await post("/admin/close-trade?trade_key=" + btn.dataset.tk);
+      setTimeout(loadPnl, 1500);
+    });
+  }
+}
+
+async function loadHealth() {
+  const res = await fetch("/health");
+  const j = await res.json();
+  $("#health").textContent = "service: " + (j.ok ? "up" : "down") + " · dryRun=" + j.dryRun + " · ts " + new Date(j.ts).toISOString();
+}
+
+$("#refresh").addEventListener("click", loadPnl);
+$("#runTick").addEventListener("click", async () => {
+  if (!confirm("Force a tick now? (force=true, bypasses market-hours check)")) return;
+  await post("/run?force=true");
+});
+$("#cancelAll").addEventListener("click", async () => {
+  if (!confirm("Cancel ALL working option orders at Alpaca?")) return;
+  await post("/admin/cancel-options-orders");
+  setTimeout(loadPnl, 1500);
+});
+
+loadHealth();
+loadPnl();
+</script>
+</body>
+</html>`;
