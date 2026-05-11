@@ -1,6 +1,7 @@
 import { loadConfig } from './config.js';
 import { log } from './log.js';
 import { buildOccSymbol } from './alpaca.js';
+import { dteFromExpiration } from './market.js';
 import { getOptionQuoteForLeg, resetQuoteCache, type OptionQuote } from './quotes.js';
 import type { Direction, NormalizedTrade } from './types.js';
 
@@ -61,6 +62,26 @@ export async function sizeAndFilter(
     }
     if (bucketCount(liveOpen, trade.direction) >= cfg.MAX_PER_DIRECTION) {
       out.push(reject(`directional cap reached for ${trade.direction} (${cfg.MAX_PER_DIRECTION})`));
+      continue;
+    }
+
+    // Never open a trade whose short leg is already within the
+    // assignment-close window — we'd just submit it and immediately have
+    // the manager submit a close in the same tick, wasting capital and
+    // creating stuck working orders. Min DTE across short legs must be
+    // strictly greater than ASSIGNMENT_CLOSE_DTE.
+    let minShortDte = Number.POSITIVE_INFINITY;
+    for (const leg of trade.legs) {
+      if (leg.side !== 'short') continue;
+      try {
+        const d = dteFromExpiration(leg.expiration);
+        if (d < minShortDte) minShortDte = d;
+      } catch {
+        /* unparseable expiration handled elsewhere */
+      }
+    }
+    if (Number.isFinite(minShortDte) && minShortDte <= cfg.ASSIGNMENT_CLOSE_DTE) {
+      out.push(reject(`short leg DTE ${minShortDte} <= ASSIGNMENT_CLOSE_DTE (${cfg.ASSIGNMENT_CLOSE_DTE}) — would close on next tick`));
       continue;
     }
 

@@ -294,6 +294,35 @@ export async function executeExits(decisions: ExitDecision[], dryRun: boolean): 
         continue;
       }
 
+      // Cancel any existing working orders that touch these legs before
+      // submitting another close. Without this we accumulate stuck orders
+      // (Alpaca refuses new orders against legs that already have working
+      // ones) — that's what produced the 'closing' rows that couldn't be
+      // liquidated even from the Alpaca UI.
+      try {
+        const occSet = new Set(siblings.map((s) => s.occ_symbol));
+        const { listOpenOptionOrders, cancelOrder } = await import('./alpaca.js');
+        const openOrders = await listOpenOptionOrders();
+        for (const o of openOrders) {
+          if (o.occSymbols.some((s) => occSet.has(s))) {
+            try {
+              await cancelOrder(o.id);
+              log.info('cancelled stale working order before re-close', {
+                order_id: o.id,
+                occ_symbols: o.occSymbols,
+              });
+            } catch (err) {
+              log.warn('failed to cancel stale order', {
+                order_id: o.id,
+                error: (err as Error).message,
+              });
+            }
+          }
+        }
+      } catch (err) {
+        log.warn('pre-close order cancellation failed', { error: (err as Error).message });
+      }
+
       if (siblings.length === 1) {
         const sib = siblings[0]!;
         const liveSingle = (await listPositions()).find((p) => p.symbol === sib.occ_symbol);

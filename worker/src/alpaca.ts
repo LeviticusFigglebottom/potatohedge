@@ -177,6 +177,49 @@ export async function submitMlegOrder(args: SubmitMlegArgs): Promise<{ id: strin
   return { id: j.id };
 }
 
+// List all currently-working orders. Filter to options-only since equities
+// aren't routed through this worker. Returns enough detail to identify
+// orders against specific OCC symbols (including the legs of MLEG orders).
+export interface OpenOrder {
+  id: string;
+  symbol: string | null;
+  orderClass: string;
+  occSymbols: string[]; // every option contract this order touches
+}
+
+export async function listOpenOptionOrders(): Promise<OpenOrder[]> {
+  const rows = (await alpacaFetch(
+    'trading',
+    '/v2/orders?status=open&nested=true&limit=500',
+  )) as Array<{
+    id: string;
+    symbol: string | null;
+    asset_class: string;
+    order_class: string;
+    legs?: Array<{ symbol: string; asset_class: string }>;
+  }>;
+  const out: OpenOrder[] = [];
+  for (const r of rows) {
+    const occ: string[] = [];
+    if (r.asset_class === 'us_option' && r.symbol) occ.push(r.symbol);
+    for (const leg of r.legs ?? []) {
+      if (leg.asset_class === 'us_option') occ.push(leg.symbol);
+    }
+    if (occ.length === 0) continue;
+    out.push({
+      id: r.id,
+      symbol: r.symbol,
+      orderClass: r.order_class,
+      occSymbols: occ,
+    });
+  }
+  return out;
+}
+
+export async function cancelOrder(orderId: string): Promise<void> {
+  await alpacaFetch('trading', `/v2/orders/${orderId}`, { method: 'DELETE' });
+}
+
 export async function closeOptionPosition(
   occSymbol: string,
   qty: number,

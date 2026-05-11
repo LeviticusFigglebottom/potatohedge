@@ -260,6 +260,28 @@ async function main() {
     };
   });
 
+  // Emergency: cancel every open options order at the broker. Used to
+  // unstick the state when previous close orders are still working and
+  // blocking new submissions / manual closes from the Alpaca UI.
+  app.post('/admin/cancel-options-orders', async () => {
+    const { listOpenOptionOrders, cancelOrder } = await import('./alpaca.js');
+    const open = await listOpenOptionOrders();
+    const results: { id: string; ok: boolean; error?: string }[] = [];
+    for (const o of open) {
+      try {
+        await cancelOrder(o.id);
+        results.push({ id: o.id, ok: true });
+      } catch (e) {
+        results.push({ id: o.id, ok: false, error: (e as Error).message });
+      }
+    }
+    log.warn('admin cancel-options-orders invoked', {
+      attempted: open.length,
+      cancelled: results.filter((r) => r.ok).length,
+    });
+    return { attempted: open.length, results };
+  });
+
   app.get('/runs', async () => {
     const { getPool } = await import('./db.js');
     const { rows } = await getPool().query(
