@@ -339,6 +339,70 @@ async function main() {
     },
   );
 
+  // Force-close a position via the worker's MLEG close path. Use this when
+  // /admin/liquidate fails with "uncovered" or "insufficient buying power"
+  // errors — those come from Alpaca closing legs one at a time and seeing
+  // a momentary naked position. MLEG submits one atomic order that closes
+  // every leg of the spread simultaneously, so the account never holds an
+  // uncovered position and BP is netted.
+  //
+  // Use either:
+  //   ?trade_key=<exact trade_key string>   — close one spread
+  //   ?underlying=TSLA                       — close every open spread for ticker
+  app.post<{ Querystring: { trade_key?: string; underlying?: string } }>(
+    '/admin/close-trade',
+    async (req) => {
+      const tradeKey = req.query.trade_key;
+      const underlying = req.query.underlying;
+      if (!tradeKey && !underlying) {
+        return { error: 'pass ?trade_key=... or ?underlying=...' };
+      }
+
+      const { getPool } = await import('./db.js');
+      const { executeExits } = await import('./manager.js');
+
+      let tradeKeys: string[];
+      if (tradeKey) {
+        tradeKeys = [tradeKey];
+      } else {
+        const r = await getPool().query<{ trade_key: string }>(
+          `SELECT DISTINCT trade_key FROM positions
+           WHERE status = 'open' AND trade_key IS NOT NULL AND underlying = $1`,
+          [underlying!.toUpperCase()],
+        );
+        tradeKeys = r.rows.map((row) => row.trade_key);
+      }
+
+      if (tradeKeys.length === 0) {
+        return { error: 'no open trades found for that key/underlying' };
+      }
+
+      const results: { trade_key: string; closed: number }[] = [];
+      for (const tk of tradeKeys) {
+        const r = await getPool().query(
+          `SELECT * FROM positions WHERE trade_key = $1 AND status = 'open' LIMIT 1`,
+          [tk],
+        );
+        if (r.rows.length === 0) continue;
+        const row = r.rows[0]!;
+        const closed = await executeExits(
+          [
+            {
+              position: row,
+              occSymbol: row.occ_symbol,
+              qty: Math.abs(row.qty),
+              reason: 'manual /admin/close-trade',
+            },
+          ],
+          false,
+        );
+        results.push({ trade_key: tk, closed });
+      }
+      log.warn('admin close-trade invoked', { tradeKey, underlying, count: results.length });
+      return { results };
+    },
+  );
+
   app.get('/runs', async () => {
     const { getPool } = await import('./db.js');
     const { rows } = await getPool().query(
