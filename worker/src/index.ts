@@ -282,6 +282,63 @@ async function main() {
     return { attempted: open.length, results };
   });
 
+  // Force-close a single position (or all positions for an underlying) via
+  // Alpaca's public DELETE /v2/positions API. Useful when the Alpaca UI is
+  // 403'ing for unclear reasons — the public API typically goes through
+  // even when the dashboard's internal API doesn't.
+  app.post<{ Querystring: { occ_symbol?: string; underlying?: string } }>(
+    '/admin/liquidate',
+    async (req) => {
+      const { occ_symbol, underlying } = req.query;
+      if (!occ_symbol && !underlying) {
+        return { error: 'pass ?occ_symbol=... or ?underlying=...' };
+      }
+      const { listPositions } = await import('./alpaca.js');
+      const live = await listPositions();
+      const targets = occ_symbol
+        ? live.filter((p) => p.symbol === occ_symbol)
+        : live.filter((p) => p.symbol.startsWith(underlying!.toUpperCase()));
+      if (targets.length === 0) {
+        return { error: 'no matching open positions at Alpaca', live_count: live.length };
+      }
+
+      const cfg = loadConfig();
+      const results: { occ_symbol: string; ok: boolean; status?: number; body?: string }[] = [];
+      for (const t of targets) {
+        try {
+          const res = await fetch(
+            `${cfg.ALPACA_TRADING_BASE}/v2/positions/${encodeURIComponent(t.symbol)}?cancel_orders=true`,
+            {
+              method: 'DELETE',
+              headers: {
+                'APCA-API-KEY-ID': cfg.ALPACA_KEY_ID,
+                'APCA-API-SECRET-KEY': cfg.ALPACA_SECRET_KEY,
+                Accept: 'application/json',
+              },
+              signal: AbortSignal.timeout(15_000),
+            },
+          );
+          const body = await res.text().catch(() => '');
+          results.push({
+            occ_symbol: t.symbol,
+            ok: res.ok,
+            status: res.status,
+            body: body.slice(0, 300),
+          });
+        } catch (e) {
+          results.push({ occ_symbol: t.symbol, ok: false, body: (e as Error).message });
+        }
+      }
+      log.warn('admin liquidate invoked', {
+        occ_symbol,
+        underlying,
+        attempted: targets.length,
+        ok: results.filter((r) => r.ok).length,
+      });
+      return { attempted: targets.length, results };
+    },
+  );
+
   app.get('/runs', async () => {
     const { getPool } = await import('./db.js');
     const { rows } = await getPool().query(
