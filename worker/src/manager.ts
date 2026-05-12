@@ -119,10 +119,14 @@ export async function planExits(): Promise<ExitDecision[]> {
   // synthetic single-row group keyed by their id.
   const groups = new Map<string, DbPositionRow[]>();
   for (const row of dbRows) {
-    if (row.status !== 'open') {
-      log.info('skipping exit-check — row not open', {
+    // 'closing' means a previous tick submitted a close that didn't fill —
+    // the position is STILL OPEN at the broker. Treat it identically to
+    // 'open' so we re-evaluate and re-submit each tick. The auto-cancel
+    // logic inside executeExits handles cleaning up the stale working
+    // order before submitting the new one. Only 'closed' is skipped.
+    if (row.status === 'closed') {
+      log.info('skipping exit-check — row closed', {
         occ_symbol: row.occ_symbol,
-        status: row.status,
       });
       continue;
     }
@@ -413,7 +417,7 @@ export async function executeExits(decisions: ExitDecision[], dryRun: boolean): 
 
 async function loadOpenLegsByTradeKey(tradeKey: string): Promise<DbPositionRow[]> {
   const { rows } = await getPool().query<DbPositionRow>(
-    `SELECT * FROM positions WHERE trade_key = $1 AND status = 'open' ORDER BY id`,
+    `SELECT * FROM positions WHERE trade_key = $1 AND status IN ('open','closing') ORDER BY id`,
     [tradeKey],
   );
   return rows;
@@ -433,7 +437,7 @@ async function markGroupClosing(
   }
   await getPool().query(
     `UPDATE positions SET status='closing', close_reason=$2
-     WHERE trade_key = $1 AND status = 'open'`,
+     WHERE trade_key = $1 AND status IN ('open','closing')`,
     [tradeKey, reason],
   );
 }
