@@ -106,7 +106,7 @@ async function main() {
       `SELECT id, occ_symbol, underlying, "right", strike, expiration, side, direction,
               qty, entry_price, exit_target_pct, exit_stop_pct, trade_key
        FROM positions
-       WHERE status = 'open'
+       WHERE status IN ('open','closing')
        ORDER BY trade_key, id`,
     );
 
@@ -367,7 +367,7 @@ async function main() {
       } else {
         const r = await getPool().query<{ trade_key: string }>(
           `SELECT DISTINCT trade_key FROM positions
-           WHERE status = 'open' AND trade_key IS NOT NULL AND underlying = $1`,
+           WHERE status IN ('open','closing') AND trade_key IS NOT NULL AND underlying = $1`,
           [underlying!.toUpperCase()],
         );
         tradeKeys = r.rows.map((row) => row.trade_key);
@@ -380,7 +380,7 @@ async function main() {
       const results: { trade_key: string; closed: number }[] = [];
       for (const tk of tradeKeys) {
         const r = await getPool().query(
-          `SELECT * FROM positions WHERE trade_key = $1 AND status = 'open' LIMIT 1`,
+          `SELECT * FROM positions WHERE trade_key = $1 AND status IN ('open','closing') LIMIT 1`,
           [tk],
         );
         if (r.rows.length === 0) continue;
