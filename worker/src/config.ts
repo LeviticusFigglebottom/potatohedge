@@ -22,6 +22,10 @@ const schema = z.object({
   MAX_CONCURRENT_POSITIONS: z.coerce.number().int().positive().default(10),
   MAX_PER_DIRECTION: z.coerce.number().int().positive().default(5),
   ASSIGNMENT_CLOSE_DTE: z.coerce.number().int().nonnegative().default(2),
+  // Refuse to OPEN any trade where any leg's DTE is below this value.
+  // Catches long-only straddles/strangles too short to amortize theta —
+  // those slip past ASSIGNMENT_CLOSE_DTE which only checks short legs.
+  MIN_OPEN_DTE: z.coerce.number().int().nonnegative().default(5),
 
   DRY_RUN: z
     .union([z.string(), z.boolean()])
