@@ -148,7 +148,7 @@ const NORMALIZER_TOOL = {
                   expiration: {
                     type: 'string',
                     description:
-                      'EXACT format: YYYY-MM-DD as a literal date string. NO trailing text, NO parenthetical (NOT "2026-05-15 (7 DTE)"), NO field names (NOT "monthlyExp"). The VALUE you copy must be the actual date string from the idea\'s nearestExp, weeklyExp, or monthlyExp field — pick whichever matches the strategy: monthlyExp for 30-45 DTE setups, weeklyExp for 5-10 DTE, nearestExp for 0-2 DTE. Example output: "2026-05-15".',
+                      'EXACT format: YYYY-MM-DD as a literal date string. NO trailing text, NO parenthetical (NOT "2026-05-15 (7 DTE)"), NO field names (NOT "monthlyExp"). The VALUE you copy must be the actual date string from the idea\'s nearestExp, weeklyExp, or monthlyExp field — pick whichever matches the strategy: monthlyExp for 30-45 DTE setups, weeklyExp for 5-10 DTE. NEVER pick nearestExp if its DTE is below 5 — the automation rejects any trade with a leg DTE < 5. Example output: "2026-05-15".',
                   },
                   side: { type: 'string', enum: ['long', 'short'] },
                   ratio: { type: 'integer', minimum: 1, default: 1 },
@@ -213,9 +213,11 @@ Each idea ALSO carries three pre-computed valid expirations for that ticker:
 CRITICAL EXPIRATION RULE: the "expiration" field on every leg you emit MUST
 be exactly one of those three values from the same idea. Do not invent a
 date. Do not pick a date because it sounds right. If the idea says "30-45
-DTE", use monthlyExp verbatim. If "weekly" or "7 DTE", use weeklyExp. If
-"0DTE" or "today", use nearestExp. If none of the three fields is suitable
-for the strategy, skip the idea entirely.
+DTE", use monthlyExp verbatim. If "weekly" or "7 DTE", use weeklyExp. The
+automation REFUSES any trade with any leg DTE below 5, so NEVER pick
+nearestExp if its DTE is below 5. For 0-4 DTE ideas, SKIP THE IDEA — do
+not normalize it. If none of the three fields produces a DTE ≥ 5 for the
+strategy, skip the idea entirely.
 
 Convert every idea into one entry in the trades array. Rules:
 - Resolve every expiration to one of nearestExp/weeklyExp/monthlyExp (above).
