@@ -65,20 +65,28 @@ export async function sizeAndFilter(
       continue;
     }
 
-    // Never open a trade whose short leg is already within the
-    // assignment-close window — we'd just submit it and immediately have
-    // the manager submit a close in the same tick, wasting capital and
-    // creating stuck working orders. Min DTE across short legs must be
-    // strictly greater than ASSIGNMENT_CLOSE_DTE.
+    // DTE gates. Two separate checks:
+    //   1. Any leg below MIN_OPEN_DTE is too short to amortize theta or
+    //      give the manager a meaningful window to react. Catches
+    //      long-only straddles (0–2 DTE bets) that the short-leg check
+    //      below doesn't see.
+    //   2. Any short leg already inside ASSIGNMENT_CLOSE_DTE would be
+    //      flagged for close on the very next planExits — opening it
+    //      just wastes capital and creates stuck working orders.
+    let minLegDte = Number.POSITIVE_INFINITY;
     let minShortDte = Number.POSITIVE_INFINITY;
     for (const leg of trade.legs) {
-      if (leg.side !== 'short') continue;
       try {
         const d = dteFromExpiration(leg.expiration);
-        if (d < minShortDte) minShortDte = d;
+        if (d < minLegDte) minLegDte = d;
+        if (leg.side === 'short' && d < minShortDte) minShortDte = d;
       } catch {
         /* unparseable expiration handled elsewhere */
       }
+    }
+    if (Number.isFinite(minLegDte) && minLegDte < cfg.MIN_OPEN_DTE) {
+      out.push(reject(`leg DTE ${minLegDte} < MIN_OPEN_DTE (${cfg.MIN_OPEN_DTE}) — too short to manage`));
+      continue;
     }
     if (Number.isFinite(minShortDte) && minShortDte <= cfg.ASSIGNMENT_CLOSE_DTE) {
       out.push(reject(`short leg DTE ${minShortDte} <= ASSIGNMENT_CLOSE_DTE (${cfg.ASSIGNMENT_CLOSE_DTE}) — would close on next tick`));

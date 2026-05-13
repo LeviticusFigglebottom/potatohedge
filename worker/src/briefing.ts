@@ -319,6 +319,25 @@ Call submit_normalized_trades with the converted trades.`;
       candidate.exitStopPct = cappedStop;
     }
 
+    // Structural -EV reject: for debit trades, the total debit paid must
+    // not exceed the maximum profit achievable on any single component
+    // spread. Otherwise the trade is guaranteed to lose money even in the
+    // best-case price outcome at expiration (the TSLA double-debit-spread
+    // bug). This is the basic sanity check the system should always pass.
+    const maxProfit = computeMaxProfitPerShare(candidate);
+    if (
+      maxProfit !== null &&
+      candidate.estimatedDebitPerSpread > 0 &&
+      candidate.estimatedDebitPerSpread > maxProfit
+    ) {
+      log.warn('rejecting trade — structurally -EV (debit exceeds max payoff)', {
+        trade: candidate.key,
+        debit: candidate.estimatedDebitPerSpread,
+        max_profit_per_share: maxProfit,
+      });
+      continue;
+    }
+
     out.push(candidate);
   }
   log.info('normalized trades', { count: out.length });
@@ -334,6 +353,38 @@ Call submit_normalized_trades with the converted trades.`;
 // For credit spreads (initialBasis = credit received):
 //   max loss = spread_width - credit
 //   max stop_pct = (spread_width - credit) / credit
+// Maximum profit per share at expiration, conservatively computed across
+// every vertical sub-spread in the trade. For composite "best of either
+// direction" trades (long call spread + long put spread = inverted iron
+// butterfly), the result is the WIDEST single vertical's payoff — because
+// at expiration only one side can be ITM. If the trade's debit exceeds
+// this, no terminal SPY price produces a profit.
+function computeMaxProfitPerShare(trade: NormalizedTrade): number | null {
+  // Calendars and unusual structures are excluded; we don't reason about
+  // them safely.
+  const expirations = new Set(trade.legs.map((l) => l.expiration));
+  if (expirations.size > 1) return null;
+
+  const calls = trade.legs.filter((l) => l.right === 'call');
+  const puts = trade.legs.filter((l) => l.right === 'put');
+
+  let maxComponentWidth = 0;
+  if (calls.length === 2) {
+    maxComponentWidth = Math.max(maxComponentWidth, Math.abs(calls[0]!.strike - calls[1]!.strike));
+  }
+  if (puts.length === 2) {
+    maxComponentWidth = Math.max(maxComponentWidth, Math.abs(puts[0]!.strike - puts[1]!.strike));
+  }
+  if (maxComponentWidth === 0) return null;
+
+  // For a single-direction debit spread: max profit = width - debit.
+  // For a composite (call vert + put vert): only one side can reach max
+  // at expiration; the other contributes its full debit as a loss. So
+  // best-case profit = max_component_width - total_debit. We return
+  // max_component_width and let the caller compare against total debit.
+  return maxComponentWidth;
+}
+
 function capStopPctToStructure(trade: NormalizedTrade): number | null {
   const debit = trade.estimatedDebitPerSpread;
   if (!Number.isFinite(debit) || debit === 0) return null;
