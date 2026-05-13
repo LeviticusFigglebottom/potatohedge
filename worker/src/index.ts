@@ -188,11 +188,14 @@ async function main() {
 
       let assignmentRisk: string | null = null;
       for (const leg of legs) {
-        if (leg.side !== 'short') continue;
         try {
           const dte = dteFromExpiration(expToString(leg.expiration));
-          if (dte <= cfgLocal.ASSIGNMENT_CLOSE_DTE) {
-            assignmentRisk = `${leg.occ_symbol} DTE ${dte}`;
+          if (leg.side === 'short' && dte <= cfgLocal.ASSIGNMENT_CLOSE_DTE) {
+            assignmentRisk = `assignment ${leg.occ_symbol} DTE ${dte}`;
+            break;
+          }
+          if (dte <= cfgLocal.FORCE_CLOSE_DTE) {
+            assignmentRisk = `force-close ${leg.occ_symbol} ${leg.side} DTE ${dte}`;
             break;
           }
         } catch {

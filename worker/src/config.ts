@@ -26,6 +26,11 @@ const schema = z.object({
   // Catches long-only straddles/strangles too short to amortize theta —
   // those slip past ASSIGNMENT_CLOSE_DTE which only checks short legs.
   MIN_OPEN_DTE: z.coerce.number().int().nonnegative().default(5),
+  // Force-close ANY open position (regardless of side) when its earliest
+  // leg reaches this DTE. Backstop for the assignment-risk rule, which
+  // only fires on short legs — a long-only straddle/strangle has no short
+  // legs and would otherwise ride into expiration with no close trigger.
+  FORCE_CLOSE_DTE: z.coerce.number().int().nonnegative().default(1),
 
   DRY_RUN: z
     .union([z.string(), z.boolean()])

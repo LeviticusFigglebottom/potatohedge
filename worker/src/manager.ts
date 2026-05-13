@@ -202,14 +202,26 @@ export async function planExits(): Promise<ExitDecision[]> {
     const stopPct = legs[0].exit_stop_pct ? parseFloat(legs[0].exit_stop_pct) : null;
     const plRatio = (closeNet - initialNet) / Math.abs(initialNet);
 
-    // 1. Assignment risk on any short leg.
+    // 1. DTE-based force close. Two complementary rules:
+    //   a. Assignment risk on any SHORT leg with DTE <= ASSIGNMENT_CLOSE_DTE
+    //      — avoids assignment / pin risk for the short side.
+    //   b. Generic time-decay close on ANY leg (long or short) with DTE
+    //      <= FORCE_CLOSE_DTE — backstop for long-only positions
+    //      (straddles, strangles, naked longs) that have no short legs
+    //      and would otherwise slip past the assignment rule entirely.
+    //      Without this, a long straddle aged to 0 DTE rides into
+    //      expiration with target/stop as the only triggers, and if
+    //      neither hits, decays to whatever intrinsic SPY pins at.
     let assignmentReason: string | null = null;
     for (const leg of legs) {
-      if (leg.side !== 'short') continue;
       try {
         const dte = dteFromExpiration(leg.expiration);
-        if (dte <= cfg.ASSIGNMENT_CLOSE_DTE) {
+        if (leg.side === 'short' && dte <= cfg.ASSIGNMENT_CLOSE_DTE) {
           assignmentReason = `assignment-risk: ${leg.occ_symbol} short DTE ${dte} <= ${cfg.ASSIGNMENT_CLOSE_DTE}`;
+          break;
+        }
+        if (dte <= cfg.FORCE_CLOSE_DTE) {
+          assignmentReason = `force-close-dte: ${leg.occ_symbol} ${leg.side} DTE ${dte} <= ${cfg.FORCE_CLOSE_DTE}`;
           break;
         }
       } catch (e) {
