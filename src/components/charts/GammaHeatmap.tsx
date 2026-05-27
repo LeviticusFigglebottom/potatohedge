@@ -23,9 +23,34 @@ const PANELS: PanelConfig[] = [
 ];
 
 interface GridData {
-  grid: number[][]; // [expIdx][strikeIdx]
-  maxAbs: number;
+  grid: number[][];      // [expIdx][strikeIdx] — raw values, clipped for absolute mode
+  gridNorm: number[][];  // [expIdx][strikeIdx] — per-column normalized to [-1, 1]
+  maxAbs: number;        // ramp scale for absolute mode (post-clip)
 }
+
+// ─── Color normalization mode ────────────────────────────────────────
+//
+// 'absolute'   — single color scale across the whole grid. Good for
+//                "where's the literal biggest GEX". Pin-day 0DTE columns
+//                can blow out the ramp; we clip outliers to OUTLIER_CLIP_K×
+//                the median column-max so other columns stay visible.
+// 'per-column' — each expiry column normalized to its own [-1, 1]. Good
+//                for "where's the wall structure at this expiry" and is
+//                what you want for pocket detection. Loses cross-expiry
+//                magnitude comparability.
+
+export type ColorMode = 'absolute' | 'per-column';
+
+const COLOR_MODE_OPTIONS: { mode: ColorMode; label: string }[] = [
+  { mode: 'absolute', label: 'absolute' },
+  { mode: 'per-column', label: 'per-col' },
+];
+
+/** Outlier-clip factor for the absolute ramp: column maxes >K× the median
+ *  of all column maxes get clipped so a single 0DTE pin column doesn't
+ *  dominate the entire colormap. 5× is empirically conservative — a real
+ *  outlier still saturates the ramp, but other columns stay readable. */
+const OUTLIER_CLIP_K = 5;
 
 // ─── X-axis scale transforms ─────────────────────────────────────────
 //
@@ -156,6 +181,7 @@ interface HeatPanelProps {
   strikes: number[];
   expirations: { date: string; dte: number }[];
   xMode: XScaleMode;
+  colorMode: ColorMode;
   spot: number;
   gammaFlip: number | null;
   callWall: number | null;
@@ -167,7 +193,7 @@ interface HeatPanelProps {
 }
 
 function HeatPanel({
-  config, gridData, strikes, expirations, xMode, spot,
+  config, gridData, strikes, expirations, xMode, colorMode, spot,
   gammaFlip, callWall, putWall,
   hoveredStrike, onHoverStrike, showYAxis, showXAxis,
 }: HeatPanelProps) {
@@ -175,17 +201,22 @@ function HeatPanel({
   const containerRef = useRef<HTMLDivElement>(null);
   const imageCache = useRef<HTMLCanvasElement | null>(null);
 
-  // Pre-render the interpolated surface image
+  // Pre-render the interpolated surface image.
+  // In per-column mode the input grid is already normalized to [-1, 1]
+  // per column, so we pass maxAbs=1; in absolute mode the grid carries
+  // raw (outlier-clipped) values and the ramp scale is gridData.maxAbs.
   useEffect(() => {
-    if (!gridData.grid.length || !gridData.grid[0]?.length) return;
+    const sourceGrid = colorMode === 'per-column' ? gridData.gridNorm : gridData.grid;
+    if (!sourceGrid.length || !sourceGrid[0]?.length) return;
     const upW = 256, upH = 256;
-    const imgData = renderSmoothSurface(gridData.grid, expirations, xMode, gridData.maxAbs, upW, upH);
+    const rampMaxAbs = colorMode === 'per-column' ? 1 : gridData.maxAbs;
+    const imgData = renderSmoothSurface(sourceGrid, expirations, xMode, rampMaxAbs, upW, upH);
     const off = document.createElement('canvas');
     off.width = upW;
     off.height = upH;
     off.getContext('2d')!.putImageData(imgData, 0, 0);
     imageCache.current = off;
-  }, [gridData, expirations, xMode]);
+  }, [gridData, expirations, xMode, colorMode]);
 
   // Draw to visible canvas
   useEffect(() => {
@@ -362,8 +393,14 @@ function HeatPanel({
       ctx.fillStyle = '#6b7280';
       ctx.font = '7px "JetBrains Mono"';
       ctx.textAlign = 'left';
-      ctx.fillText(`+${abbreviate(gridData.maxAbs)}`, legX + legW + 2, legY + 6);
-      ctx.fillText(`-${abbreviate(gridData.maxAbs)}`, legX + legW + 2, legY + legH);
+      if (colorMode === 'per-column') {
+        // Per-column ramp is unitless; labels show z-direction not magnitude.
+        ctx.fillText('+col max', legX + legW + 2, legY + 6);
+        ctx.fillText('-col max', legX + legW + 2, legY + legH);
+      } else {
+        ctx.fillText(`+${abbreviate(gridData.maxAbs)}`, legX + legW + 2, legY + 6);
+        ctx.fillText(`-${abbreviate(gridData.maxAbs)}`, legX + legW + 2, legY + legH);
+      }
     };
 
     draw();
@@ -371,7 +408,7 @@ function HeatPanel({
     const obs = new ResizeObserver(draw);
     obs.observe(container);
     return () => obs.disconnect();
-  }, [gridData, strikes, expirations, xMode, spot, gammaFlip, callWall, putWall,
+  }, [gridData, strikes, expirations, xMode, colorMode, spot, gammaFlip, callWall, putWall,
       hoveredStrike, config, showYAxis, showXAxis]);
 
   // Mouse handler
@@ -582,11 +619,16 @@ export default function GammaHeatmap() {
   // Default to sqrt(DTE) per the extended-surface spec — near-dated detail
   // gets ~32% of the canvas, 7-30d gets ~50%, 30-45d the tail ~18%.
   const [xMode, setXMode] = useState<XScaleMode>('sqrt');
+  // Default to per-column for the pocket-detection use case: structure
+  // per expiry is the actionable signal; absolute mode is the toggle for
+  // "where's the literal biggest GEX" overall positioning checks.
+  const [colorMode, setColorMode] = useState<ColorMode>('per-column');
 
   // Pre-compute shared data
   const { strikes, grids, expirations } = useMemo(() => {
     if (!multiGEX?.perExpiration?.length) {
       return { strikes: [] as number[], grids: {} as Record<MetricKey, GridData>, expirations: [] as { date: string; dte: number }[] };
+      // (return early when no data; below returns the populated tensor)
     }
 
     const spot = multiGEX.spotPrice;
@@ -624,27 +666,60 @@ export default function GammaHeatmap() {
     const strikeIndex = new Map<number, number>();
     sortedStrikes.forEach((s, i) => strikeIndex.set(s, i));
 
-    // Build grids for each metric
+    // Build grids for each metric. For each metric we produce TWO grids:
+    //   `grid`     — raw values with outlier-clip applied (absolute mode)
+    //   `gridNorm` — each column normalized to [-1, 1] (per-column mode)
+    // and `maxAbs` is the post-clip global max for the absolute ramp.
     const metrics: MetricKey[] = ['netGEX', 'netDEX', 'netVanna', 'netCharm'];
     const result: Record<string, GridData> = {};
 
-    for (const metric of metrics) {
-      const grid: number[][] = [];
-      let maxAbs = 0;
+    const median = (arr: number[]): number => {
+      if (arr.length === 0) return 0;
+      const sorted = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+    };
 
+    for (const metric of metrics) {
+      // First pass — collect raw values and per-column maxes
+      const raw: number[][] = [];
+      const colMaxes: number[] = [];
       for (const exp of exps) {
         const row = new Array(sortedStrikes.length).fill(0);
+        let colMax = 0;
         for (const e of exp.exposures) {
           const idx = strikeIndex.get(e.strike);
           if (idx !== undefined) {
             row[idx] = e[metric];
-            maxAbs = Math.max(maxAbs, Math.abs(e[metric]));
+            colMax = Math.max(colMax, Math.abs(e[metric]));
           }
         }
-        grid.push(row);
+        raw.push(row);
+        colMaxes.push(colMax);
       }
 
-      result[metric] = { grid, maxAbs: maxAbs || 1 };
+      // Outlier clip for absolute mode: any column whose max exceeds
+      // OUTLIER_CLIP_K × median(colMaxes) gets its cell magnitudes clamped
+      // so 0DTE pin columns don't dominate the colormap. Only applied to
+      // `grid` (absolute); `gridNorm` is unaffected because per-column
+      // normalization already isolates each column's dynamic range.
+      const medianCol = median(colMaxes.filter((m) => m > 0));
+      const ceiling = medianCol > 0 ? medianCol * OUTLIER_CLIP_K : Infinity;
+      const grid: number[][] = raw.map((row) =>
+        row.map((v) => (Math.abs(v) > ceiling ? Math.sign(v) * ceiling : v)),
+      );
+      const maxAbs = grid.reduce(
+        (m, row) => row.reduce((mm, v) => Math.max(mm, Math.abs(v)), m),
+        0,
+      ) || 1;
+
+      // Per-column normalization for per-column mode.
+      const gridNorm: number[][] = raw.map((row, ci) => {
+        const cm = colMaxes[ci];
+        return cm > 0 ? row.map((v) => v / cm) : row.map(() => 0);
+      });
+
+      result[metric] = { grid, gridNorm, maxAbs };
     }
 
     const expInfo = exps.map(e => ({ date: e.expiration, dte: e.dte }));
@@ -686,6 +761,22 @@ export default function GammaHeatmap() {
               </button>
             ))}
           </div>
+          <div className="flex items-center gap-1 text-[10px] font-mono">
+            <span className="text-text-muted/60">color:</span>
+            {COLOR_MODE_OPTIONS.map((opt) => (
+              <button
+                key={opt.mode}
+                onClick={() => setColorMode(opt.mode)}
+                className={`px-1.5 py-0.5 rounded transition-colors ${
+                  colorMode === opt.mode
+                    ? 'bg-accent-cyan/15 text-accent-cyan border border-accent-cyan/30'
+                    : 'text-text-muted hover:text-text-secondary border border-transparent'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
           <span className="text-[10px] font-mono text-text-muted">
             {expirations.length} exp × {strikes.length} strikes | ${strikes[0]?.toFixed(0)}–${strikes[strikes.length - 1]?.toFixed(0)} (spot ${formatCurrency(spot)})
           </span>
@@ -702,6 +793,7 @@ export default function GammaHeatmap() {
             strikes={strikes}
             expirations={expirations}
             xMode={xMode}
+            colorMode={colorMode}
             spot={spot}
             gammaFlip={gammaFlip}
             callWall={callWall}
