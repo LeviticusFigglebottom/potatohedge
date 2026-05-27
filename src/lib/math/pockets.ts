@@ -65,27 +65,67 @@ export interface PocketDetectorOptions {
    *  anomalies, wide enough to be statistically meaningful (10 samples
    *  for mean/std/median). */
   window: number;
-  /** Minimum |z-score| for a sign-flip pocket to register. 1.5 is the
-   *  conventional 87th-percentile cutoff under normal-ish neighbor
-   *  distributions; tightens to fewer false positives at 2.0, loosens
-   *  to more at 1.0. Empirically calibrated against the SPY surface
-   *  during PR2 spec. */
+  /** Minimum |z-score| for a sign-flip pocket to register. Tightened
+   *  from the initial 1.5 to 2.0 after the first overlay deploy
+   *  produced ~50 false positives ('christmas-tree' density). 2.0 is
+   *  the 98th-percentile cutoff under normal-ish neighbor
+   *  distributions — pairs with the minMagnitudeRatio gate below to
+   *  filter "microscopic opposite-sign value next to huge positive
+   *  band" artifacts. */
   flipZ: number;
-  /** Maximum |gex| / median(|gex_neighbors|) for a void pocket. 0.25 =
-   *  "this strike has less than a quarter of the typical neighbor
-   *  magnitude" — captures genuine air pockets without flagging every
-   *  slightly-below-average strike. */
+  /** Maximum |gex| / median(|gex_neighbors|) for a void pocket.
+   *  Tightened from 0.25 to 0.15 — at 0.25 every slightly-below-
+   *  average strike in a busy band registered as a "void". 0.15
+   *  requires the strike to have less than 15% of the typical neighbor
+   *  magnitude before it counts as genuine air. */
   voidRatio: number;
+  /** Minimum |gex_K| / median(|gex_neighbors|) for a sign-flip pocket
+   *  to be CONSIDERED. Without this gate, a strike with gex=-50 next
+   *  to neighbors at +5M registers as a sign-flip with z=-10 — true
+   *  z-score, but the absolute magnitude is rounding-error island, not
+   *  a real structural reversal. The 0.20 default requires the
+   *  opposite-sign value to be at least 20% of typical magnitude before
+   *  the z-score gate is even consulted. NEW in pocket-detector v2. */
+  minMagnitudeRatio: number;
+  /** Absolute |gex| floor for the candidacy gate. A strike doesn't
+   *  qualify as a pocket unless either its own |gex| (sign-flip case)
+   *  or its neighbor median (void case) exceeds this floor. Filters
+   *  out deep-OTM wing artifacts where every strike has tiny |gex| —
+   *  a "void" in the wing is just the wing, not a pocket.
+   *
+   *  When detectPocketsForExpiry is called directly, set this to the
+   *  absolute value desired (or 0 to disable). When using the
+   *  detectPocketsAcrossExpirations wrapper, this is auto-computed
+   *  from `surfaceFloorPercentile`. NEW in v2. */
+  surfaceFloor: number;
 }
 
-/** Twin-recommended defaults. Tune `voidRatio` first if the canonical
- *  $760-770 mid-term SPY void doesn't trigger on the first overlay
- *  render (acceptance test at PR 2 commit 5). */
+/** Twin-recommended defaults, calibrated from the first PR2 deploy.
+ *  Initial defaults (voidRatio=0.25, flipZ=1.5) produced ~50 pockets
+ *  on the live SPY surface — christmas-tree density, not a signal
+ *  layer. Tightened to the values below + the new candidacy gates
+ *  (minMagnitudeRatio, surfaceFloor) for ~10-15 pockets per typical
+ *  session. Tune voidRatio first if the canonical $760-770 mid-term
+ *  SPY void stops triggering. */
 export const DEFAULT_POCKET_OPTIONS: PocketDetectorOptions = {
   window: 5,
-  flipZ: 1.5,
-  voidRatio: 0.25,
+  flipZ: 2.0,
+  voidRatio: 0.15,
+  minMagnitudeRatio: 0.20,
+  surfaceFloor: 0,
 };
+
+/** Default surface-floor percentile used by detectPocketsAcrossExpirations
+ *  to compute the absolute floor from the full surface's |GEX|
+ *  distribution. P25 means "the bottom quartile of strikes is too thin
+ *  to even count as candidate-eligible" — filters out the wing region
+ *  systematically. */
+export const DEFAULT_SURFACE_FLOOR_PERCENTILE = 25;
+
+/** Strikes within this dollar buffer of an excluded level (typically
+ *  the labeled call wall / put wall) are skipped entirely by the
+ *  multi-expiry wrapper. The wall is structure, not a pocket near it. */
+export const WALL_EXCLUSION_BUFFER = 0.50;
 
 // ── Internal stats helpers (no external dep on lodash/d3) ──────────
 
@@ -149,7 +189,10 @@ export function detectPocketsForExpiry(
   dte: number,
   opts: Partial<PocketDetectorOptions> = {},
 ): Pocket[] {
-  const { window, flipZ, voidRatio } = { ...DEFAULT_POCKET_OPTIONS, ...opts };
+  const { window, flipZ, voidRatio, minMagnitudeRatio, surfaceFloor } = {
+    ...DEFAULT_POCKET_OPTIONS,
+    ...opts,
+  };
 
   const strikes = [...gexByStrike.keys()].sort((a, b) => a - b);
   if (strikes.length < 3) return []; // not enough context to scan
@@ -177,24 +220,47 @@ export function detectPocketsForExpiry(
     const nMean = mean(neighborValues);
     const nStd = stdev(neighborValues) || 1e-9;
     const nAbsMed = median(neighborValues.map(Math.abs));
+    const absK = Math.abs(gexK);
     const z = (gexK - nMean) / nStd;
     const distPct = spot > 0 ? (K - spot) / spot : 0;
 
-    // Sign-flip takes precedence over void: a strike with opposite-sign
-    // significant magnitude isn't "thin", it's actively dealer-positioned
-    // the other way.
-    if (sgn(gexK) !== 0 && sgn(nMean) !== 0 && sgn(gexK) !== sgn(nMean) && Math.abs(z) > flipZ) {
+    // ── Sign-flip candidacy (precedence over void) ────────────────
+    // All four conditions must hold for a sign-flip to register:
+    //   1. K and neighbors are both signed (not zero on either side)
+    //   2. signs disagree
+    //   3. |z| > flipZ (statistical significance)
+    //   4. |gex_K| >= minMagnitudeRatio × nAbsMed (relative magnitude)
+    //   5. |gex_K| >= surfaceFloor (absolute magnitude — filters wings)
+    // Gate (4) prevents the "microscopic negative inside huge positive
+    // band" artifact that produced spurious |z|~8 flips at the call
+    // wall strike on the first overlay deploy. Gate (5) keeps the deep
+    // OTM wing region from registering rounding-error sign reversals.
+    if (
+      sgn(gexK) !== 0 &&
+      sgn(nMean) !== 0 &&
+      sgn(gexK) !== sgn(nMean) &&
+      Math.abs(z) > flipZ &&
+      absK >= minMagnitudeRatio * nAbsMed &&
+      absK >= surfaceFloor
+    ) {
       out.push({ expiry, dte, strike: K, type: 'sign_flip', z, distPct });
       continue;
     }
 
-    // Void: small absolute value vs typical neighbor magnitude. Guard
-    // against all-zero neighbor windows (nAbsMed === 0) where the ratio
-    // comparison would be trivially false anyway.
-    if (nAbsMed > 0 && Math.abs(gexK) < voidRatio * nAbsMed) {
+    // ── Void candidacy ────────────────────────────────────────────
+    // All three conditions must hold:
+    //   1. nAbsMed > 0 (some neighbors have non-zero gex)
+    //   2. |gex_K| < voidRatio × nAbsMed (locally thin vs neighbors)
+    //   3. nAbsMed >= surfaceFloor (neighbor band is meaningfully
+    //      sized — filters wings where everything is naturally tiny)
+    if (
+      nAbsMed > 0 &&
+      absK < voidRatio * nAbsMed &&
+      nAbsMed >= surfaceFloor
+    ) {
       out.push({
         expiry, dte, strike: K, type: 'void',
-        thinness: Math.abs(gexK) / nAbsMed,
+        thinness: absK / nAbsMed,
         distPct,
       });
     }
@@ -214,10 +280,36 @@ export interface ExpiryExposureSlice {
   exposures: Array<{ strike: number; netGEX: number }>;
 }
 
+export interface AcrossExpirationsOptions extends Partial<PocketDetectorOptions> {
+  /** Percentile of the across-surface |GEX| distribution that becomes
+   *  the absolute candidacy floor for every per-expiry scan. Defaults
+   *  to DEFAULT_SURFACE_FLOOR_PERCENTILE (25). Ignored if `surfaceFloor`
+   *  is also passed explicitly — then the explicit value wins. */
+  surfaceFloorPercentile?: number;
+  /** Strikes to exclude from the final pocket list. Typically populated
+   *  with the labeled call wall and put wall — those strikes are
+   *  structure, not pockets near it. Any pocket within
+   *  WALL_EXCLUSION_BUFFER ($0.50 by default) of an entry here is
+   *  dropped. Empty/undefined = no exclusion. */
+  excludeStrikes?: number[];
+}
+
 /**
  * Run the single-expiry detector across every expiration in a multi-gex
  * response. Each pocket inherits its `expiry` and `dte` from the column
  * that produced it.
+ *
+ * Two additional gates beyond the per-expiry detector:
+ *
+ *   - **Surface floor**. The full across-expirations |GEX| distribution
+ *     is collected and the P25 (default) value becomes the absolute
+ *     candidacy floor. This filters wing strikes where every value is
+ *     tiny, so "void" doesn't register on a naturally thin band.
+ *   - **Wall exclusion**. Strikes within ±$0.50 of the labeled call/put
+ *     wall are dropped — those strikes ARE the wall structure, not
+ *     pockets near it. A future refactor could push this filter into
+ *     the per-expiry detector, but keeping it at the wrapper avoids
+ *     plumbing global-aggregate knowledge into the per-column scan.
  *
  * Output is flat (one array of all pockets across all expirations) so
  * the persistence detector — which groups pockets by (strike, type)
@@ -228,13 +320,44 @@ export interface ExpiryExposureSlice {
 export function detectPocketsAcrossExpirations(
   perExpiration: ExpiryExposureSlice[],
   spot: number,
-  opts: Partial<PocketDetectorOptions> = {},
+  opts: AcrossExpirationsOptions = {},
 ): Pocket[] {
+  // Compute the absolute surface floor from this run's data — unless
+  // the caller passed an explicit floor in opts.surfaceFloor.
+  let surfaceFloor = opts.surfaceFloor ?? 0;
+  if (opts.surfaceFloor === undefined) {
+    const allAbs: number[] = [];
+    for (const exp of perExpiration) {
+      for (const e of exp.exposures) {
+        const v = Math.abs(e.netGEX);
+        if (v > 0) allAbs.push(v);
+      }
+    }
+    if (allAbs.length > 0) {
+      allAbs.sort((a, b) => a - b);
+      const p = opts.surfaceFloorPercentile ?? DEFAULT_SURFACE_FLOOR_PERCENTILE;
+      const idx = Math.floor((p / 100) * (allAbs.length - 1));
+      surfaceFloor = allAbs[idx];
+    }
+  }
+
+  const perExpiryOpts: Partial<PocketDetectorOptions> = { ...opts, surfaceFloor };
+  delete (perExpiryOpts as AcrossExpirationsOptions).surfaceFloorPercentile;
+  delete (perExpiryOpts as AcrossExpirationsOptions).excludeStrikes;
+
   const out: Pocket[] = [];
   for (const exp of perExpiration) {
     const gexByStrike = new Map<number, number>();
     for (const e of exp.exposures) gexByStrike.set(e.strike, e.netGEX);
-    out.push(...detectPocketsForExpiry(gexByStrike, spot, exp.expiration, exp.dte, opts));
+    out.push(...detectPocketsForExpiry(gexByStrike, spot, exp.expiration, exp.dte, perExpiryOpts));
+  }
+
+  // Wall exclusion — drop any pocket within WALL_EXCLUSION_BUFFER of
+  // an excluded strike. Done as a post-filter rather than inside the
+  // per-expiry detector so the detector stays pure.
+  const excl = opts.excludeStrikes?.filter((s): s is number => typeof s === 'number');
+  if (excl && excl.length > 0) {
+    return out.filter((p) => !excl.some((w) => Math.abs(p.strike - w) <= WALL_EXCLUSION_BUFFER));
   }
   return out;
 }

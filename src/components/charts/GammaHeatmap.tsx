@@ -1095,28 +1095,68 @@ export default function GammaHeatmap() {
     return { strikes: sortedStrikes, grids: result as Record<MetricKey, GridData>, expirations: expInfo };
   }, [multiGEX]);
 
+  /** Pockets beyond this signed-distance threshold from spot are
+   *  computed (and still feed the persistence detector in commit 6)
+   *  but NOT rendered as overlay ticks. Pockets that far OTM aren't
+   *  actionable scalp levels — they're structural artifacts. Matches
+   *  the metric-card ±2% alpha zone with a small buffer. */
+  const POCKET_OVERLAY_MAX_DIST_PCT = 0.03;
+
   // Run pocket detection across all expirations. Uses the FULL per-
   // expiration exposures from multiGEX rather than the strike-thinned
   // grid above — pocket semantics work best on the densest available
   // chain data, and the heatmap thinning is a presentation concern.
-  // Empirical-validation gate (PR2 commit 5 acceptance): the SPY
-  // $760-770 mid-term void should appear here on first render. If it
-  // doesn't, tune voidRatio at DEFAULT_POCKET_OPTIONS in pockets.ts.
+  //
+  // Wall exclusion: the labeled callWall / putWall strikes are passed
+  // to the detector wrapper which drops any pocket within ±$0.50 of
+  // those strikes. The wall IS structure; pockets near it are
+  // wall-shoulder math artifacts, not exceptions to wall structure.
   const pockets = useMemo<Pocket[]>(() => {
     if (!multiGEX?.perExpiration?.length) return [];
+    const exclude: number[] = [];
+    if (multiGEX.aggregated.callWall != null) exclude.push(multiGEX.aggregated.callWall);
+    if (multiGEX.aggregated.putWall != null) exclude.push(multiGEX.aggregated.putWall);
+
     const detected = detectPocketsAcrossExpirations(
       multiGEX.perExpiration,
       multiGEX.spotPrice,
+      { excludeStrikes: exclude },
     );
-    // Diagnostic dump (non-prod): emit a summary so the dev can confirm
-    // detection on the live surface without opening the React DevTools.
+
     if (process.env.NODE_ENV !== 'production' && detected.length > 0) {
       const voids = detected.filter((p) => p.type === 'void').length;
       const flips = detected.filter((p) => p.type === 'sign_flip').length;
       console.log(`[GammaHeatmap] detected ${detected.length} pockets (${voids} void, ${flips} sign_flip):`, detected);
+
+      // Diagnostic: any sign-flip with |z| > 5 is suspicious — twin's
+      // canonical artifact case ($755 wall, z=-8.54). Dump the strike's
+      // ±2 flanks so artifact-vs-real-anomaly can be eyeballed without
+      // opening DevTools. With the v2 gates this should never trigger
+      // on a wall-adjacent strike; if it does, investigate.
+      const suspicious = detected.filter((p) => p.type === 'sign_flip' && Math.abs(p.z ?? 0) > 5);
+      if (suspicious.length > 0) {
+        console.warn(`[GammaHeatmap] ${suspicious.length} suspicious sign-flip(s) with |z| > 5:`);
+        for (const p of suspicious) {
+          const slice = multiGEX.perExpiration.find((e) => e.expiration === p.expiry);
+          if (!slice) continue;
+          const flanks = slice.exposures
+            .filter((e) => Math.abs(e.strike - p.strike) <= 2.5)
+            .sort((a, b) => a.strike - b.strike)
+            .map((e) => `${e.strike}:${e.netGEX.toFixed(0)}`);
+          console.warn(`  sign_flip ${p.strike} (${p.expiry}, ${p.dte}d, z=${p.z?.toFixed(2)}): flanks ${flanks.join(' ')}`);
+        }
+      }
     }
     return detected;
   }, [multiGEX]);
+
+  /** Subset rendered as overlay ticks — clipped to ±POCKET_OVERLAY_MAX_DIST_PCT
+   *  of spot. The full `pockets` array still feeds the click popover lookup
+   *  and (in commit 6) the persistence detector. */
+  const pocketsForOverlay = useMemo<Pocket[]>(
+    () => pockets.filter((p) => Math.abs(p.distPct) <= POCKET_OVERLAY_MAX_DIST_PCT),
+    [pockets],
+  );
 
   const onHoverStrike = useCallback((s: number | null) => setHoveredStrike(s), []);
   const onHoverPocket = useCallback((p: Pocket | null) => setHoveredPocket(p), []);
@@ -1195,7 +1235,12 @@ export default function GammaHeatmap() {
             onHoverStrike={onHoverStrike}
             // Pockets only matter on the GEX panel — other panels get
             // an empty array (HeatPanel's draw skips overlay work too).
-            pockets={config.metric === 'netGEX' ? pockets : []}
+            // Note: pass the OVERLAY-filtered subset (within ±3% of
+            // spot); the full pocket list is retained for persistence
+            // detection and the click-popover strike lookup, but
+            // rendering and hit-testing operate on the visible subset
+            // only.
+            pockets={config.metric === 'netGEX' ? pocketsForOverlay : []}
             onHoverPocket={onHoverPocket}
             onClickPocket={onClickPocket}
             showYAxis={i % 2 === 0}  // left panels
