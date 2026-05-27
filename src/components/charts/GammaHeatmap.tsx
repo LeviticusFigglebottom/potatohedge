@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import { formatNumber, formatCurrency } from '@/lib/utils/format';
 import type { StrikeExposure } from '@/lib/math/blackScholes';
+import { detectPocketsAcrossExpirations, type Pocket } from '@/lib/math/pockets';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -188,6 +189,13 @@ interface HeatPanelProps {
   putWall: number | null;
   hoveredStrike: number | null;
   onHoverStrike: (strike: number | null) => void;
+  /** Detected pockets across all expirations. Only rendered on the
+   *  netGEX panel — pocket semantics are gamma-specific (see
+   *  pockets.ts module header for rationale). Pass empty array on
+   *  other panels. */
+  pockets: Pocket[];
+  onHoverPocket: (pocket: Pocket | null) => void;
+  onClickPocket: (pocket: Pocket | null) => void;
   showYAxis: boolean; // only left panels show Y-axis
   showXAxis: boolean; // only bottom panels show X-axis
 }
@@ -195,11 +203,16 @@ interface HeatPanelProps {
 function HeatPanel({
   config, gridData, strikes, expirations, xMode, colorMode, spot,
   gammaFlip, callWall, putWall,
-  hoveredStrike, onHoverStrike, showYAxis, showXAxis,
+  hoveredStrike, onHoverStrike, pockets, onHoverPocket, onClickPocket,
+  showYAxis, showXAxis,
 }: HeatPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const imageCache = useRef<HTMLCanvasElement | null>(null);
+  // Pocket pixel positions are populated during draw() and consumed by
+  // the mouse handlers for hit-testing. Stored as a ref because the
+  // values depend on canvas dimensions which change on resize.
+  const pocketPositionsRef = useRef<Array<{ pocket: Pocket; x: number; y: number }>>([]);
 
   // Pre-render the interpolated surface image.
   // In per-column mode the input grid is already normalized to [-1, 1]
@@ -328,6 +341,46 @@ function HeatPanel({
         ctx.setLineDash([]);
       }
 
+      // ── Pocket overlay (GEX panel only) ───────────────────────────
+      // Void   → open amber circle (r=4)
+      // Sign-flip → filled amber diamond (~5px)
+      // Pocket pixel positions cached in ref for mouse hit-testing.
+      const positions: Array<{ pocket: Pocket; x: number; y: number }> = [];
+      if (config.metric === 'netGEX' && pockets.length > 0 && expirations.length > 0) {
+        const expIndexByDate = new Map<string, number>();
+        expirations.forEach((e, i) => expIndexByDate.set(e.date, i));
+
+        for (const p of pockets) {
+          if (p.strike < minS || p.strike > maxS) continue;
+          const expIdx = expIndexByDate.get(p.expiry);
+          if (expIdx === undefined) continue;
+          const x = toX(expIdx);
+          const y = toY(p.strike);
+          positions.push({ pocket: p, x, y });
+
+          ctx.save();
+          if (p.type === 'void') {
+            ctx.strokeStyle = '#ffaa00';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.arc(x, y, 4, 0, Math.PI * 2);
+            ctx.stroke();
+          } else {
+            // sign_flip → filled diamond
+            ctx.fillStyle = '#ffaa00';
+            ctx.beginPath();
+            ctx.moveTo(x, y - 5);
+            ctx.lineTo(x + 5, y);
+            ctx.lineTo(x, y + 5);
+            ctx.lineTo(x - 5, y);
+            ctx.closePath();
+            ctx.fill();
+          }
+          ctx.restore();
+        }
+      }
+      pocketPositionsRef.current = positions;
+
       // Y-axis: strike price labels — show ~6 evenly spaced
       if (showYAxis) {
         const numLabels = 6;
@@ -440,21 +493,29 @@ function HeatPanel({
     obs.observe(container);
     return () => obs.disconnect();
   }, [gridData, strikes, expirations, xMode, colorMode, spot, gammaFlip, callWall, putWall,
-      hoveredStrike, config, showYAxis, showXAxis]);
+      hoveredStrike, config, showYAxis, showXAxis, pockets]);
 
-  // Mouse handler
+  // ── Mouse handlers ───────────────────────────────────────────────
+  // Two concerns sharing the same canvas:
+  //   1. Strike crosshair — fires on every panel, snaps to nearest strike
+  //   2. Pocket hit-testing — netGEX panel only, ~10-12px radius
+  // Pocket positions live in pocketPositionsRef (populated by draw()).
+
+  const POCKET_HOVER_RADIUS = 10;
+  const POCKET_CLICK_RADIUS = 12;
+
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     const container = containerRef.current;
     if (!canvas || !container) return;
     const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
     const my = e.clientY - rect.top;
     const pad = { top: 22, bottom: showXAxis ? 42 : 8 };
     const ch = rect.height - pad.top - pad.bottom;
     const frac = 1 - (my - pad.top) / ch;
     const minS = strikes[0], maxS = strikes[strikes.length - 1];
     const strike = minS + frac * (maxS - minS);
-    // Snap to nearest strike
     let closest = strikes[0];
     let minDist = Infinity;
     for (const s of strikes) {
@@ -462,9 +523,49 @@ function HeatPanel({
       if (d < minDist) { minDist = d; closest = s; }
     }
     onHoverStrike(closest);
-  }, [strikes, onHoverStrike, showXAxis]);
 
-  const handleMouseLeave = useCallback(() => onHoverStrike(null), [onHoverStrike]);
+    // Pocket hit-test (netGEX panel only — empty positions on others)
+    if (config.metric === 'netGEX' && pocketPositionsRef.current.length > 0) {
+      let nearest: Pocket | null = null;
+      let nearestDist = POCKET_HOVER_RADIUS;
+      for (const p of pocketPositionsRef.current) {
+        const dx = mx - p.x;
+        const dy = my - p.y;
+        const d = Math.sqrt(dx * dx + dy * dy);
+        if (d < nearestDist) {
+          nearestDist = d;
+          nearest = p.pocket;
+        }
+      }
+      onHoverPocket(nearest);
+    }
+  }, [strikes, onHoverStrike, showXAxis, config.metric, onHoverPocket]);
+
+  const handleMouseLeave = useCallback(() => {
+    onHoverStrike(null);
+    if (config.metric === 'netGEX') onHoverPocket(null);
+  }, [onHoverStrike, onHoverPocket, config.metric]);
+
+  const handleClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (config.metric !== 'netGEX') return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    let nearest: Pocket | null = null;
+    let nearestDist = POCKET_CLICK_RADIUS;
+    for (const p of pocketPositionsRef.current) {
+      const dx = mx - p.x;
+      const dy = my - p.y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d < nearestDist) {
+        nearestDist = d;
+        nearest = p.pocket;
+      }
+    }
+    if (nearest) onClickPocket(nearest);
+  }, [config.metric, onClickPocket]);
 
   return (
     <div ref={containerRef} className="relative min-h-[200px]">
@@ -473,6 +574,7 @@ function HeatPanel({
         className="w-full h-full cursor-crosshair"
         onMouseMove={handleMouseMove}
         onMouseLeave={handleMouseLeave}
+        onClick={handleClick}
       />
     </div>
   );
@@ -642,6 +744,239 @@ function PositioningInsights({
   );
 }
 
+// ─── Pocket overlays ─────────────────────────────────────────────────
+
+/** Small read-only tooltip rendered on hover. Pinned to the top-right
+ *  of the heatmap grid (absolute position) so it doesn't follow the
+ *  cursor — feedback from twin review on AVWAP work was that
+ *  cursor-following tooltips on dense canvases feel jittery. The user
+ *  scans down to read the badge once they spot a tick. */
+function PocketHoverTooltip({ pocket, spot }: { pocket: Pocket; spot: number }) {
+  const distLabel = pocket.distPct >= 0
+    ? `+${(pocket.distPct * 100).toFixed(2)}%`
+    : `${(pocket.distPct * 100).toFixed(2)}%`;
+  const detail = pocket.type === 'void'
+    ? `thinness ${pocket.thinness?.toFixed(3) ?? '—'}`
+    : `z ${pocket.z?.toFixed(2) ?? '—'}`;
+  // void = amber-300, sign_flip = amber-400 — match the canvas tick fill
+  const tone = 'text-amber-300';
+  return (
+    <div className="pointer-events-none absolute top-2 right-2 z-10 bg-bg-primary/90 border border-amber-500/40 rounded px-2.5 py-1.5 backdrop-blur-sm shadow-lg">
+      <div className="flex items-center gap-2 text-[10px] font-mono">
+        <span className={`font-bold uppercase ${tone}`}>{pocket.type.replace('_', ' ')}</span>
+        <span className="text-text-primary">${pocket.strike}</span>
+        <span className="text-text-muted">({distLabel} from ${spot.toFixed(0)})</span>
+      </div>
+      <div className="text-[9px] font-mono text-text-muted mt-0.5">
+        {pocket.expiry} · {pocket.dte}d · {detail}
+      </div>
+    </div>
+  );
+}
+
+/** Click-triggered chain-detail popover. Renders over the entire
+ *  heatmap surface. Closes on outside-click and Escape.
+ *
+ *  Content:
+ *   - top row: pocket type, strike, expiry/DTE, distPct, GEX (signed)
+ *   - exposure breakdown from multiGEX.perExpiration: callGEX/putGEX,
+ *     callDEX/putDEX, callVanna/putVanna, callCharm/putCharm
+ *   - secondary section: async fetch of /api/market/chain for this
+ *     expiry, then pull the strike's call + put contracts to show OI,
+ *     IV, last delta, last gamma per side. Renders a "Loading chain
+ *     detail..." state until the fetch resolves.
+ */
+interface MinimalContract {
+  strike: number;
+  openInterest?: number;
+  impliedVolatility?: number;
+  delta?: number;
+  gamma?: number;
+}
+interface MinimalChain {
+  calls?: MinimalContract[];
+  puts?: MinimalContract[];
+}
+
+function PocketDetailPopover({
+  pocket, symbol, spot, perExpiration, onClose,
+}: {
+  pocket: Pocket;
+  symbol: string;
+  spot: number;
+  perExpiration: Array<{ expiration: string; exposures: StrikeExposure[] }>;
+  onClose: () => void;
+}) {
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const [chain, setChain] = useState<MinimalChain | null>(null);
+  const [chainLoading, setChainLoading] = useState(false);
+  const [chainError, setChainError] = useState<string | null>(null);
+
+  // Find the exposure data we already have in multiGEX
+  const exposure = useMemo<StrikeExposure | null>(() => {
+    const expSlice = perExpiration.find((e) => e.expiration === pocket.expiry);
+    if (!expSlice) return null;
+    return expSlice.exposures.find((x) => x.strike === pocket.strike) ?? null;
+  }, [perExpiration, pocket]);
+
+  // Async chain fetch on mount / pocket change
+  useEffect(() => {
+    let cancelled = false;
+    setChainLoading(true);
+    setChainError(null);
+    setChain(null);
+    fetch(`/api/market/chain?symbol=${symbol}&expiration=${pocket.expiry}`)
+      .then(async (r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((data) => {
+        if (cancelled) return;
+        setChain(data);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setChainError(err instanceof Error ? err.message : 'chain fetch failed');
+      })
+      .finally(() => {
+        if (!cancelled) setChainLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [symbol, pocket]);
+
+  // Outside-click + Escape to dismiss
+  useEffect(() => {
+    const onDocClick = (e: MouseEvent) => {
+      if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) onClose();
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('mousedown', onDocClick);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDocClick);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [onClose]);
+
+  const callMatch = chain?.calls?.find((c) => Math.abs(c.strike - pocket.strike) < 1e-6);
+  const putMatch = chain?.puts?.find((p) => Math.abs(p.strike - pocket.strike) < 1e-6);
+  const distLabel = pocket.distPct >= 0
+    ? `+${(pocket.distPct * 100).toFixed(2)}%`
+    : `${(pocket.distPct * 100).toFixed(2)}%`;
+  const detail = pocket.type === 'void'
+    ? `thinness ${pocket.thinness?.toFixed(3) ?? '—'}`
+    : `z ${pocket.z?.toFixed(2) ?? '—'}`;
+
+  return (
+    <div className="absolute inset-0 z-20 flex items-center justify-center p-6 pointer-events-none">
+      <div
+        ref={popoverRef}
+        className="pointer-events-auto bg-bg-primary border border-amber-500/50 rounded-lg shadow-2xl max-w-md w-full"
+      >
+        {/* Header */}
+        <div className="flex items-start justify-between px-3 py-2 border-b border-border/40">
+          <div className="flex flex-col gap-0.5">
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-mono font-bold uppercase text-amber-300">
+                {pocket.type.replace('_', ' ')}
+              </span>
+              <span className="text-sm font-mono font-bold text-text-primary">
+                ${pocket.strike}
+              </span>
+              <span className="text-[10px] font-mono text-text-muted">
+                {distLabel} from ${spot.toFixed(0)}
+              </span>
+            </div>
+            <div className="text-[10px] font-mono text-text-muted">
+              {pocket.expiry} · {pocket.dte}d · {detail}
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-text-muted hover:text-text-primary text-base leading-none px-1"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+
+        {/* Exposure section — from multiGEX (no fetch required) */}
+        {exposure && (
+          <div className="px-3 py-2 border-b border-border/40">
+            <div className="text-[9px] font-mono text-text-muted uppercase tracking-wider mb-1">
+              Dealer exposure at strike
+            </div>
+            <div className="grid grid-cols-4 gap-2 text-[10px] font-mono">
+              <ExposureCell label="GEX" net={exposure.netGEX} call={exposure.callGEX} put={exposure.putGEX} />
+              <ExposureCell label="DEX" net={exposure.netDEX} call={exposure.callDEX} put={exposure.putDEX} />
+              <ExposureCell label="Vanna" net={exposure.netVanna} call={exposure.callVanna} put={exposure.putVanna} />
+              <ExposureCell label="Charm" net={exposure.netCharm} call={exposure.callCharm} put={exposure.putCharm} />
+            </div>
+          </div>
+        )}
+
+        {/* Chain detail section — async */}
+        <div className="px-3 py-2">
+          <div className="text-[9px] font-mono text-text-muted uppercase tracking-wider mb-1">
+            Chain detail (per side)
+          </div>
+          {chainLoading && (
+            <div className="text-[10px] font-mono text-text-muted animate-pulse">Loading chain detail...</div>
+          )}
+          {chainError && (
+            <div className="text-[10px] font-mono text-amber-400">Failed to load: {chainError}</div>
+          )}
+          {!chainLoading && !chainError && (callMatch || putMatch) && (
+            <div className="grid grid-cols-5 gap-2 text-[10px] font-mono">
+              <div className="col-span-1" />
+              <div className="text-text-muted">OI</div>
+              <div className="text-text-muted">IV</div>
+              <div className="text-text-muted">Δ</div>
+              <div className="text-text-muted">Γ</div>
+              {callMatch && (
+                <>
+                  <div className="text-green-400">Call</div>
+                  <div className="text-text-secondary">{callMatch.openInterest ?? '—'}</div>
+                  <div className="text-text-secondary">{callMatch.impliedVolatility != null ? (callMatch.impliedVolatility * 100).toFixed(1) + '%' : '—'}</div>
+                  <div className="text-text-secondary">{callMatch.delta?.toFixed(3) ?? '—'}</div>
+                  <div className="text-text-secondary">{callMatch.gamma?.toFixed(4) ?? '—'}</div>
+                </>
+              )}
+              {putMatch && (
+                <>
+                  <div className="text-red-400">Put</div>
+                  <div className="text-text-secondary">{putMatch.openInterest ?? '—'}</div>
+                  <div className="text-text-secondary">{putMatch.impliedVolatility != null ? (putMatch.impliedVolatility * 100).toFixed(1) + '%' : '—'}</div>
+                  <div className="text-text-secondary">{putMatch.delta?.toFixed(3) ?? '—'}</div>
+                  <div className="text-text-secondary">{putMatch.gamma?.toFixed(4) ?? '—'}</div>
+                </>
+              )}
+            </div>
+          )}
+          {!chainLoading && !chainError && !callMatch && !putMatch && (
+            <div className="text-[10px] font-mono text-text-muted">
+              No contracts at ${pocket.strike} in the chain response.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ExposureCell({ label, net, call, put }: { label: string; net: number; call: number; put: number }) {
+  const sign = (n: number) => (n >= 0 ? '+' : '');
+  const tone = (n: number) => (n >= 0 ? 'text-blue-400' : 'text-red-400');
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className="text-text-muted text-[9px]">{label}</span>
+      <span className={`${tone(net)} font-semibold`}>{sign(net)}{formatNumber(net)}</span>
+      <span className="text-green-400 text-[9px]">c {sign(call)}{formatNumber(call)}</span>
+      <span className="text-red-400 text-[9px]">p {sign(put)}{formatNumber(put)}</span>
+    </div>
+  );
+}
+
 // ─── Main component ──────────────────────────────────────────────────
 
 export default function GammaHeatmap() {
@@ -654,6 +989,8 @@ export default function GammaHeatmap() {
   // per expiry is the actionable signal; absolute mode is the toggle for
   // "where's the literal biggest GEX" overall positioning checks.
   const [colorMode, setColorMode] = useState<ColorMode>('per-column');
+  const [hoveredPocket, setHoveredPocket] = useState<Pocket | null>(null);
+  const [clickedPocket, setClickedPocket] = useState<Pocket | null>(null);
 
   // Pre-compute shared data
   const { strikes, grids, expirations } = useMemo(() => {
@@ -758,7 +1095,32 @@ export default function GammaHeatmap() {
     return { strikes: sortedStrikes, grids: result as Record<MetricKey, GridData>, expirations: expInfo };
   }, [multiGEX]);
 
+  // Run pocket detection across all expirations. Uses the FULL per-
+  // expiration exposures from multiGEX rather than the strike-thinned
+  // grid above — pocket semantics work best on the densest available
+  // chain data, and the heatmap thinning is a presentation concern.
+  // Empirical-validation gate (PR2 commit 5 acceptance): the SPY
+  // $760-770 mid-term void should appear here on first render. If it
+  // doesn't, tune voidRatio at DEFAULT_POCKET_OPTIONS in pockets.ts.
+  const pockets = useMemo<Pocket[]>(() => {
+    if (!multiGEX?.perExpiration?.length) return [];
+    const detected = detectPocketsAcrossExpirations(
+      multiGEX.perExpiration,
+      multiGEX.spotPrice,
+    );
+    // Diagnostic dump (non-prod): emit a summary so the dev can confirm
+    // detection on the live surface without opening the React DevTools.
+    if (process.env.NODE_ENV !== 'production' && detected.length > 0) {
+      const voids = detected.filter((p) => p.type === 'void').length;
+      const flips = detected.filter((p) => p.type === 'sign_flip').length;
+      console.log(`[GammaHeatmap] detected ${detected.length} pockets (${voids} void, ${flips} sign_flip):`, detected);
+    }
+    return detected;
+  }, [multiGEX]);
+
   const onHoverStrike = useCallback((s: number | null) => setHoveredStrike(s), []);
+  const onHoverPocket = useCallback((p: Pocket | null) => setHoveredPocket(p), []);
+  const onClickPocket = useCallback((p: Pocket | null) => setClickedPocket(p), []);
 
   if (!multiGEX?.perExpiration?.length || strikes.length === 0) {
     return (
@@ -814,8 +1176,8 @@ export default function GammaHeatmap() {
         </div>
       </div>
 
-      {/* 2×2 heatmap grid */}
-      <div className="grid grid-cols-2 gap-px bg-border/20">
+      {/* 2×2 heatmap grid with pocket overlay (GEX panel only) */}
+      <div className="relative grid grid-cols-2 gap-px bg-border/20">
         {PANELS.map((config, i) => (
           <HeatPanel
             key={config.metric}
@@ -831,11 +1193,35 @@ export default function GammaHeatmap() {
             putWall={putWall}
             hoveredStrike={hoveredStrike}
             onHoverStrike={onHoverStrike}
+            // Pockets only matter on the GEX panel — other panels get
+            // an empty array (HeatPanel's draw skips overlay work too).
+            pockets={config.metric === 'netGEX' ? pockets : []}
+            onHoverPocket={onHoverPocket}
+            onClickPocket={onClickPocket}
             showYAxis={i % 2 === 0}  // left panels
             showXAxis={i >= 2}        // bottom panels
           />
         ))}
+
+        {/* Hover tooltip — small, follows pocket position. Suppressed
+            when the click popover is open so the two don't overlap. */}
+        {hoveredPocket && !clickedPocket && (
+          <PocketHoverTooltip pocket={hoveredPocket} spot={spot} />
+        )}
       </div>
+
+      {/* Click popover — strike chain detail. Renders outside the
+          panel grid so it can absolutely-position over the entire
+          heatmap surface. */}
+      {clickedPocket && (
+        <PocketDetailPopover
+          pocket={clickedPocket}
+          symbol={symbol}
+          spot={spot}
+          perExpiration={multiGEX.perExpiration}
+          onClose={() => setClickedPocket(null)}
+        />
+      )}
 
       {/* Positioning insights */}
       <PositioningInsights
