@@ -233,7 +233,7 @@ export const useDashboardStore = create<DashboardStore>((set, get) => ({
   fetchMultiGEX: async () => {
     set(s => ({ loading: { ...s.loading, multiGEX: true } }));
     try {
-      const multiGEX = await api(`/api/market/multi-gex?symbol=${get().symbol}&max=4`);
+      const multiGEX = await api(`/api/market/multi-gex?symbol=${get().symbol}&maxDTE=45`);
       set(s => ({ multiGEX, loading: { ...s.loading, multiGEX: false } }));
     } catch (e) { set(s => ({ loading: { ...s.loading, multiGEX: false }, error: (e as Error).message, errors: [...s.errors, (e as Error).message] })); }
   },
