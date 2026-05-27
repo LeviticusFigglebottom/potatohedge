@@ -51,17 +51,15 @@ export interface Pocket {
    *  band. Compare against `voidRatio` from the detector options to
    *  understand whether the void is borderline or extreme. */
   thinness?: number;
-  /** Dead-zone deadness: |gex_here| / perExpiryPeakAbsGex, in [0, 1].
-   *  Populated for dead_zone pockets only. Closer to 0 = deader. Use
-   *  this when distinguishing "modestly thin beyond the walls" from
-   *  "structurally empty terrain." Sits alongside thinness (void) and
-   *  z (sign_flip) — same Pocket shape, type discriminator selects
-   *  which secondary metric is populated. */
+  /** Dead-zone deadness: |gex_here| / globalPeakAbsGex, in [0, 1].
+   *  Populated for dead_zone pockets only. Closer to 0 = deader.
+   *  Reference frame is the GLOBAL peak across all expirations —
+   *  using per-expiry peak (an earlier draft) produced the failure
+   *  mode where mid-term expirations had their own much-smaller peak
+   *  and every non-peak strike fired as dead. Global reference makes
+   *  "dead" mean "absolutely thin relative to where positioning
+   *  actually exists on the surface." */
   deadness?: number;
-  /** Maximum |GEX| within this pocket's expiration. Populated for
-   *  dead_zone pockets so the click popover and tooltip can show the
-   *  comparison baseline ("$760 deadness 0.04 vs $755 peak 8.2M"). */
-  perExpiryPeak?: number;
   /** Signed distance from spot as a fraction. `(strike - spot) / spot`.
    *  Positive = above spot, negative = below. Used by the metrics row
    *  for the "nearest void" card. */
@@ -142,28 +140,25 @@ export const WALL_EXCLUSION_BUFFER = 0.50;
 
 export interface DeadZoneOptions {
   /** Strike-level deadness gate: a candidate must have
-   *      |gex_K| < absoluteFloorRatio × expiryPeakAbsGex
-   *  to register. 0.05 = "less than 5% of this expiry's heaviest
-   *  strike" — structurally absent rather than locally diminished. */
+   *      |gex_K| < absoluteFloorRatio × globalPeakAbsGex
+   *  to register. Reference frame is the global peak (across all
+   *  expirations), not the per-expiry peak. With global reference,
+   *  "dead" means "structurally thin relative to where positioning
+   *  actually exists on the surface" — a mid-term expiry whose local
+   *  peak is much smaller than the near-term peak no longer floods
+   *  with dead-zones because every non-peak strike trips the gate.
+   *  2% of global peak is the calibrated default. */
   absoluteFloorRatio: number;
-  /** Expiry-relevance gate: the expiry's own peak |GEX| must be
-   *      expiryPeakAbsGex >= expiryRelevanceRatio × globalPeakAbsGex
-   *  for any of its strikes to qualify as dead zones. Without this
-   *  gate, a structurally quiet 35d column (peak 100× smaller than
-   *  the 0DTE pin) would trip dead-zone on every strike — being thin
-   *  inside a thin expiry is meaningless. */
-  expiryRelevanceRatio: number;
 }
 
-// TUNE-ME — calibrated empirically after first dead-zone observation.
-// If the live render shows >20 dead-zones, tighten absoluteFloorRatio
-// to 0.03. If 0-1 dead-zones, loosen to 0.08.
-export const DEFAULT_ABSOLUTE_FLOOR_RATIO = 0.05;
-export const DEFAULT_EXPIRY_RELEVANCE_RATIO = 0.10;
+// TUNE-ME — calibrated empirically from the first live deploy.
+// Reference frame changed from per-expiry peak to global peak in the
+// re-fit; ratio tightened from 0.05 to 0.02 because global peak is
+// larger than any single expiry's local peak.
+export const DEFAULT_ABSOLUTE_FLOOR_RATIO = 0.02;
 
 export const DEFAULT_DEAD_ZONE_OPTIONS: DeadZoneOptions = {
   absoluteFloorRatio: DEFAULT_ABSOLUTE_FLOOR_RATIO,
-  expiryRelevanceRatio: DEFAULT_EXPIRY_RELEVANCE_RATIO,
 };
 
 /**
@@ -172,53 +167,42 @@ export const DEFAULT_DEAD_ZONE_OPTIONS: DeadZoneOptions = {
  * Dead zones differ from voids semantically. A void is a strike that's
  * locally thin RELATIVE to its immediate neighbors (a dent in an
  * otherwise busy band). A dead zone is a strike that's ABSOLUTELY thin
- * relative to the expiry's own peak — structurally absent rather than
- * locally diminished. Trading semantic: voids are "the price might
- * slip through here within the defended terrain"; dead zones are
- * "this is unopposed terrain beyond the walls, a momentum target if
- * the wall breaks."
+ * relative to where positioning exists on the surface — structurally
+ * absent rather than locally diminished.
  *
- * Two gates (both must pass):
- *   1. Strike-level deadness: |gex_K| < absoluteFloorRatio × expiryPeak
- *   2. Expiry relevance: expiryPeak >= expiryRelevanceRatio × globalPeak
+ *   strike-level gate: |gex_K| < absoluteFloorRatio × globalPeakAbsGex
  *
- * Two scope restrictions (dead-zone-specific; void/sign_flip ignore
- * these):
- *   1. Outside the wall corridor: strike > callWall + WALL_EXCLUSION_BUFFER
- *      OR strike < putWall - WALL_EXCLUSION_BUFFER. Between-wall dead
- *      zones are conceptually redundant with relative voids and add
- *      marker noise. The dead-zone semantic is specifically "beyond
- *      the defended terrain."
- *   2. (Caller's responsibility) within actionable distance from spot
- *      — typically applied at the overlay-render layer, not here.
+ * Plus one scope restriction (dead-zone-specific):
+ *   - Outside the wall corridor: strike > callWall + WALL_EXCLUSION_BUFFER
+ *     OR strike < putWall - WALL_EXCLUSION_BUFFER. Between-wall dead
+ *     zones are redundant with relative voids and add marker noise.
  *
- * If both walls are null, the corridor restriction is skipped — the
- * detector can't filter for "beyond walls" if no walls are identified.
+ * If both walls are null, the corridor restriction is skipped.
+ *
+ * The earlier expiry-relevance gate was removed: with global reference
+ * frame, an entire quiet expiry firing as dead-zones IS the correct
+ * answer (that expiry has no meaningful positioning, every strike is
+ * dead). The render layer's band-merge consolidates this into a single
+ * bracket marker rather than visual noise.
  */
 export function detectDeadZones(
   gexByStrike: Map<number, number>,
   spot: number,
   expiry: string,
   dte: number,
-  expiryPeakAbsGex: number,
   globalPeakAbsGex: number,
   callWall: number | null,
   putWall: number | null,
   opts: Partial<DeadZoneOptions> = {},
 ): Pocket[] {
   // Use nullish-coalescing rather than spread defaults, because the
-  // wrapper may pass {absoluteFloorRatio: undefined, ...} and the
+  // wrapper may pass `{absoluteFloorRatio: undefined, ...}` and the
   // spread would CLOBBER the default with the explicit undefined.
   const absoluteFloorRatio = opts.absoluteFloorRatio ?? DEFAULT_DEAD_ZONE_OPTIONS.absoluteFloorRatio;
-  const expiryRelevanceRatio = opts.expiryRelevanceRatio ?? DEFAULT_DEAD_ZONE_OPTIONS.expiryRelevanceRatio;
 
-  // Gate 2: expiry relevance. If the whole column is thin relative
-  // to the surface peak, none of its strikes are meaningful dead
-  // zones (they're just a quiet expiry).
-  if (expiryPeakAbsGex <= 0) return [];
-  if (globalPeakAbsGex > 0 && expiryPeakAbsGex < expiryRelevanceRatio * globalPeakAbsGex) return [];
+  if (globalPeakAbsGex <= 0) return [];
 
-  const absoluteFloor = absoluteFloorRatio * expiryPeakAbsGex;
+  const absoluteFloor = absoluteFloorRatio * globalPeakAbsGex;
   const hasCorridor = callWall != null || putWall != null;
   const corridorLo = putWall != null ? putWall - WALL_EXCLUSION_BUFFER : -Infinity;
   const corridorHi = callWall != null ? callWall + WALL_EXCLUSION_BUFFER : Infinity;
@@ -229,7 +213,7 @@ export function detectDeadZones(
     // terrain — voids cover that semantic, not dead zones).
     if (hasCorridor && K >= corridorLo && K <= corridorHi) continue;
 
-    // Gate 1: strike-level deadness.
+    // Strike-level deadness.
     const absK = Math.abs(gexK);
     if (absK >= absoluteFloor) continue;
 
@@ -239,10 +223,97 @@ export function detectDeadZones(
       dte,
       strike: K,
       type: 'dead_zone',
-      deadness: absK / expiryPeakAbsGex,
-      perExpiryPeak: expiryPeakAbsGex,
+      deadness: absK / globalPeakAbsGex,
       distPct,
     });
+  }
+  return out;
+}
+
+// ── Dead-zone band-merge (render-layer helper) ───────────────────
+
+/** Render-layer marker representing either a single dead-zone strike
+ *  (run length 1-2 or non-consecutive) or a consolidated band (run
+ *  length ≥3 consecutive strikes within the chain). Bands describe a
+ *  contiguous range of undefended terrain; the bracket marker is the
+ *  correct visual semantic for them. */
+export interface DeadZoneBand {
+  kind: 'band';
+  expiry: string;
+  dte: number;
+  topStrike: number;
+  bottomStrike: number;
+  strikes: number[];
+  minDeadness: number;
+  maxDeadness: number;
+  distPctTop: number;
+  distPctBottom: number;
+}
+
+export type DeadZoneMarker =
+  | { kind: 'point'; pocket: Pocket }
+  | DeadZoneBand;
+
+/** Default minimum run length to consolidate into a band marker. */
+export const DEFAULT_BAND_MIN_LENGTH = 3;
+
+/**
+ * Group an expiry's dead-zone pockets into bands and points.
+ *
+ * Two strikes are "consecutive" if they're separated by at most one
+ * intervening chain strike (1-strike-gap tolerance handles chains
+ * with missing intermediate strikes). The chain index gap threshold
+ * is 2; gap > 2 ends the current run.
+ *
+ * Runs of length >= bandMinLength (default 3) emit a `band` marker
+ * spanning the run's strike range; shorter runs emit individual
+ * `point` markers per strike.
+ */
+export function bandMergeDeadZones(
+  deadZones: Pocket[],
+  chainStrikes: number[],
+  bandMinLength: number = DEFAULT_BAND_MIN_LENGTH,
+): DeadZoneMarker[] {
+  if (deadZones.length === 0) return [];
+
+  // Index of each chain strike for consecutive-detection lookup.
+  const chainIdx = new Map<number, number>();
+  for (let i = 0; i < chainStrikes.length; i++) chainIdx.set(chainStrikes[i], i);
+
+  const sorted = [...deadZones].sort((a, b) => a.strike - b.strike);
+  const groups: Pocket[][] = [[sorted[0]]];
+  for (let i = 1; i < sorted.length; i++) {
+    const prevIdx = chainIdx.get(sorted[i - 1].strike);
+    const currIdx = chainIdx.get(sorted[i].strike);
+    if (prevIdx !== undefined && currIdx !== undefined && currIdx - prevIdx <= 2) {
+      groups[groups.length - 1].push(sorted[i]);
+    } else {
+      groups.push([sorted[i]]);
+    }
+  }
+
+  const out: DeadZoneMarker[] = [];
+  for (const g of groups) {
+    if (g.length >= bandMinLength) {
+      const strikes = g.map((p) => p.strike);
+      const top = strikes[strikes.length - 1];
+      const bottom = strikes[0];
+      const deadnesses = g.map((p) => p.deadness ?? 0);
+      out.push({
+        kind: 'band',
+        expiry: g[0].expiry,
+        dte: g[0].dte,
+        topStrike: top,
+        bottomStrike: bottom,
+        strikes,
+        minDeadness: Math.min(...deadnesses),
+        maxDeadness: Math.max(...deadnesses),
+        distPctTop: g[g.length - 1].distPct,
+        distPctBottom: g[0].distPct,
+      });
+    } else {
+      for (const p of g) out.push({ kind: 'point', pocket: p });
+    }
   }
   return out;
 }
@@ -481,30 +552,25 @@ export function detectPocketsAcrossExpirations(
   delete (perExpiryOpts as AcrossExpirationsOptions).callWall;
   delete (perExpiryOpts as AcrossExpirationsOptions).putWall;
   delete (perExpiryOpts as AcrossExpirationsOptions).absoluteFloorRatio;
-  delete (perExpiryOpts as AcrossExpirationsOptions).expiryRelevanceRatio;
 
   const callWall = opts.callWall ?? null;
   const putWall = opts.putWall ?? null;
   const dzOpts: Partial<DeadZoneOptions> = {
     absoluteFloorRatio: opts.absoluteFloorRatio,
-    expiryRelevanceRatio: opts.expiryRelevanceRatio,
   };
 
   const voidsAndFlips: Pocket[] = [];
   const deadZones: Pocket[] = [];
   for (const exp of perExpiration) {
     const gexByStrike = new Map<number, number>();
-    let expiryPeakAbsGex = 0;
     for (const e of exp.exposures) {
       gexByStrike.set(e.strike, e.netGEX);
-      const a = Math.abs(e.netGEX);
-      if (a > expiryPeakAbsGex) expiryPeakAbsGex = a;
     }
     voidsAndFlips.push(
       ...detectPocketsForExpiry(gexByStrike, spot, exp.expiration, exp.dte, perExpiryOpts),
     );
     deadZones.push(
-      ...detectDeadZones(gexByStrike, spot, exp.expiration, exp.dte, expiryPeakAbsGex, globalPeakAbsGex, callWall, putWall, dzOpts),
+      ...detectDeadZones(gexByStrike, spot, exp.expiration, exp.dte, globalPeakAbsGex, callWall, putWall, dzOpts),
     );
   }
 

@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useDashboardStore } from '@/hooks/useDashboardStore';
 import { formatNumber, formatCurrency } from '@/lib/utils/format';
 import type { StrikeExposure } from '@/lib/math/blackScholes';
-import { detectPocketsAcrossExpirations, type Pocket } from '@/lib/math/pockets';
+import { detectPocketsAcrossExpirations, bandMergeDeadZones, type Pocket, type DeadZoneMarker, type DeadZoneBand } from '@/lib/math/pockets';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -189,13 +189,19 @@ interface HeatPanelProps {
   putWall: number | null;
   hoveredStrike: number | null;
   onHoverStrike: (strike: number | null) => void;
-  /** Detected pockets across all expirations. Only rendered on the
-   *  netGEX panel — pocket semantics are gamma-specific (see
-   *  pockets.ts module header for rationale). Pass empty array on
-   *  other panels. */
+  /** Individual pockets (void, sign_flip, and any non-banded
+   *  dead_zone points). Only rendered on the netGEX panel — pocket
+   *  semantics are gamma-specific. Pass empty array on other panels. */
   pockets: Pocket[];
+  /** Dead-zone markers from band-merge: includes band variants only
+   *  (point variants are already in `pockets` after the parent
+   *  splits the band-merge output). Only rendered on the netGEX
+   *  panel. Empty array on other panels. */
+  deadZoneBands: DeadZoneBand[];
   onHoverPocket: (pocket: Pocket | null) => void;
   onClickPocket: (pocket: Pocket | null) => void;
+  onHoverBand: (band: DeadZoneBand | null) => void;
+  onClickBand: (band: DeadZoneBand | null) => void;
   showYAxis: boolean; // only left panels show Y-axis
   showXAxis: boolean; // only bottom panels show X-axis
 }
@@ -203,7 +209,8 @@ interface HeatPanelProps {
 function HeatPanel({
   config, gridData, strikes, expirations, xMode, colorMode, spot,
   gammaFlip, callWall, putWall,
-  hoveredStrike, onHoverStrike, pockets, onHoverPocket, onClickPocket,
+  hoveredStrike, onHoverStrike,
+  pockets, deadZoneBands, onHoverPocket, onClickPocket, onHoverBand, onClickBand,
   showYAxis, showXAxis,
 }: HeatPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -213,6 +220,9 @@ function HeatPanel({
   // the mouse handlers for hit-testing. Stored as a ref because the
   // values depend on canvas dimensions which change on resize.
   const pocketPositionsRef = useRef<Array<{ pocket: Pocket; x: number; y: number }>>([]);
+  /** Band hit-test rects: x position + top/bottom y from yScale.
+   *  Bands hit-test as bounding rect rather than point distance. */
+  const bandPositionsRef = useRef<Array<{ band: DeadZoneBand; x: number; yTop: number; yBottom: number }>>([]);
 
   // Pre-render the interpolated surface image.
   // In per-column mode the input grid is already normalized to [-1, 1]
@@ -390,6 +400,51 @@ function HeatPanel({
       }
       pocketPositionsRef.current = positions;
 
+      // ── Dead-zone band brackets (GEX panel only) ──────────────────
+      // Vertical line + caps spanning the band's strike range at the
+      // expiry's x position. Slightly oranger amber (#EF9F27) matches
+      // the dead-zone-point square stroke.
+      const bandPositions: Array<{ band: DeadZoneBand; x: number; yTop: number; yBottom: number }> = [];
+      if (config.metric === 'netGEX' && deadZoneBands.length > 0 && expirations.length > 0) {
+        const expIndexByDate = new Map<string, number>();
+        expirations.forEach((e, i) => expIndexByDate.set(e.date, i));
+
+        for (const b of deadZoneBands) {
+          const expIdx = expIndexByDate.get(b.expiry);
+          if (expIdx === undefined) continue;
+          const x = toX(expIdx);
+          // Render the band even if part of it falls outside the
+          // strike axis — clamp top/bottom to plot bounds.
+          const clampTop = Math.min(maxS, b.topStrike);
+          const clampBot = Math.max(minS, b.bottomStrike);
+          if (clampTop < minS || clampBot > maxS) continue;
+          const yTopRaw = toY(clampTop);
+          const yBotRaw = toY(clampBot);
+          // 4px exterior padding on each end per spec.
+          const yTop = yTopRaw - 4;
+          const yBottom = yBotRaw + 4;
+          bandPositions.push({ band: b, x, yTop, yBottom });
+
+          ctx.save();
+          ctx.strokeStyle = '#EF9F27';
+          ctx.lineWidth = 1.5;
+          // Vertical bracket
+          ctx.beginPath();
+          ctx.moveTo(x, yTop);
+          ctx.lineTo(x, yBottom);
+          ctx.stroke();
+          // Horizontal caps (6px wide each)
+          ctx.beginPath();
+          ctx.moveTo(x - 3, yTop);
+          ctx.lineTo(x + 3, yTop);
+          ctx.moveTo(x - 3, yBottom);
+          ctx.lineTo(x + 3, yBottom);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+      bandPositionsRef.current = bandPositions;
+
       // Y-axis: strike price labels — show ~6 evenly spaced
       if (showYAxis) {
         const numLabels = 6;
@@ -502,7 +557,7 @@ function HeatPanel({
     obs.observe(container);
     return () => obs.disconnect();
   }, [gridData, strikes, expirations, xMode, colorMode, spot, gammaFlip, callWall, putWall,
-      hoveredStrike, config, showYAxis, showXAxis, pockets]);
+      hoveredStrike, config, showYAxis, showXAxis, pockets, deadZoneBands]);
 
   // ── Mouse handlers ───────────────────────────────────────────────
   // Two concerns sharing the same canvas:
@@ -533,27 +588,42 @@ function HeatPanel({
     }
     onHoverStrike(closest);
 
-    // Pocket hit-test (netGEX panel only — empty positions on others)
-    if (config.metric === 'netGEX' && pocketPositionsRef.current.length > 0) {
-      let nearest: Pocket | null = null;
-      let nearestDist = POCKET_HOVER_RADIUS;
-      for (const p of pocketPositionsRef.current) {
-        const dx = mx - p.x;
-        const dy = my - p.y;
-        const d = Math.sqrt(dx * dx + dy * dy);
-        if (d < nearestDist) {
-          nearestDist = d;
-          nearest = p.pocket;
-        }
+    if (config.metric !== 'netGEX') return;
+
+    // Pocket hit-test (point markers)
+    let nearestPocket: Pocket | null = null;
+    let nearestPocketDist = POCKET_HOVER_RADIUS;
+    for (const p of pocketPositionsRef.current) {
+      const dx = mx - p.x;
+      const dy = my - p.y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d < nearestPocketDist) {
+        nearestPocketDist = d;
+        nearestPocket = p.pocket;
       }
-      onHoverPocket(nearest);
     }
-  }, [strikes, onHoverStrike, showXAxis, config.metric, onHoverPocket]);
+    onHoverPocket(nearestPocket);
+
+    // Band hit-test (bounding rect with ±4px horizontal padding)
+    let nearestBand: DeadZoneBand | null = null;
+    const BAND_HIT_PAD = 4;
+    for (const b of bandPositionsRef.current) {
+      if (mx >= b.x - BAND_HIT_PAD && mx <= b.x + BAND_HIT_PAD &&
+          my >= b.yTop && my <= b.yBottom) {
+        nearestBand = b.band;
+        break;
+      }
+    }
+    onHoverBand(nearestBand);
+  }, [strikes, onHoverStrike, showXAxis, config.metric, onHoverPocket, onHoverBand]);
 
   const handleMouseLeave = useCallback(() => {
     onHoverStrike(null);
-    if (config.metric === 'netGEX') onHoverPocket(null);
-  }, [onHoverStrike, onHoverPocket, config.metric]);
+    if (config.metric === 'netGEX') {
+      onHoverPocket(null);
+      onHoverBand(null);
+    }
+  }, [onHoverStrike, onHoverPocket, onHoverBand, config.metric]);
 
   const handleClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (config.metric !== 'netGEX') return;
@@ -562,6 +632,18 @@ function HeatPanel({
     const rect = canvas.getBoundingClientRect();
     const mx = e.clientX - rect.left;
     const my = e.clientY - rect.top;
+
+    // Bands take precedence over points — bracket boundaries are
+    // larger and a click inside one is unambiguously a band click.
+    const BAND_HIT_PAD = 6; // slightly larger than hover for forgiving click
+    for (const b of bandPositionsRef.current) {
+      if (mx >= b.x - BAND_HIT_PAD && mx <= b.x + BAND_HIT_PAD &&
+          my >= b.yTop && my <= b.yBottom) {
+        onClickBand(b.band);
+        return;
+      }
+    }
+
     let nearest: Pocket | null = null;
     let nearestDist = POCKET_CLICK_RADIUS;
     for (const p of pocketPositionsRef.current) {
@@ -574,7 +656,7 @@ function HeatPanel({
       }
     }
     if (nearest) onClickPocket(nearest);
-  }, [config.metric, onClickPocket]);
+  }, [config.metric, onClickPocket, onClickBand]);
 
   return (
     <div ref={containerRef} className="relative min-h-[200px]">
@@ -753,6 +835,98 @@ function PositioningInsights({
   );
 }
 
+// ─── Dead-zone band overlays ─────────────────────────────────────────
+
+/** Hover tooltip for a dead-zone band marker. Same corner-pinned
+ *  treatment as PocketHoverTooltip; content shows the band's range
+ *  rather than a single strike. */
+function BandHoverTooltip({ band, spot }: { band: DeadZoneBand; spot: number }) {
+  const topPct = band.distPctTop * 100;
+  const botPct = band.distPctBottom * 100;
+  const fmt = (p: number) => (p >= 0 ? `+${p.toFixed(2)}%` : `${p.toFixed(2)}%`);
+  return (
+    <div className="pointer-events-none absolute top-2 right-2 z-10 bg-bg-primary/90 border border-amber-500/40 rounded px-2.5 py-1.5 backdrop-blur-sm shadow-lg">
+      <div className="flex items-center gap-2 text-[10px] font-mono">
+        <span className="font-bold uppercase text-amber-400">dead zone band</span>
+        <span className="text-text-primary">${band.bottomStrike}–${band.topStrike}</span>
+        <span className="text-text-muted">({fmt(botPct)} to {fmt(topPct)} from ${spot.toFixed(0)})</span>
+      </div>
+      <div className="text-[9px] font-mono text-text-muted mt-0.5">
+        {band.expiry} · {band.dte}d · {band.strikes.length} strikes · deadness {band.minDeadness.toFixed(3)}–{band.maxDeadness.toFixed(3)}
+      </div>
+    </div>
+  );
+}
+
+/** Click popover for a dead-zone band marker. Simpler than the per-
+ *  pocket popover: no per-strike chain detail (the band spans
+ *  multiple strikes and per-strike OI/IV/Δ/Γ would be a wall of
+ *  numbers). Just the band metadata + closeable. */
+function BandDetailPopover({
+  band, spot, onClose,
+}: {
+  band: DeadZoneBand;
+  spot: number;
+  onClose: () => void;
+}) {
+  const popoverRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const onDocClick = (e: MouseEvent) => {
+      if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) onClose();
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('mousedown', onDocClick);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDocClick);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [onClose]);
+
+  const topPct = band.distPctTop * 100;
+  const botPct = band.distPctBottom * 100;
+  const fmt = (p: number) => (p >= 0 ? `+${p.toFixed(2)}%` : `${p.toFixed(2)}%`);
+
+  return (
+    <div className="absolute inset-0 z-20 flex items-center justify-center p-6 pointer-events-none">
+      <div
+        ref={popoverRef}
+        className="pointer-events-auto bg-bg-primary border border-amber-500/50 rounded-lg shadow-2xl max-w-md w-full"
+      >
+        <div className="flex items-start justify-between px-3 py-2 border-b border-border/40">
+          <div className="flex flex-col gap-0.5">
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] font-mono font-bold uppercase text-amber-400">dead zone band</span>
+              <span className="text-sm font-mono font-bold text-text-primary">
+                ${band.bottomStrike}–${band.topStrike}
+              </span>
+            </div>
+            <div className="text-[10px] font-mono text-text-muted">
+              {fmt(botPct)} to {fmt(topPct)} from ${spot.toFixed(0)} · {band.expiry} · {band.dte}d
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-text-muted hover:text-text-primary text-base leading-none px-1"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+        <div className="px-3 py-2 text-[10px] font-mono">
+          <div className="text-text-muted mb-1">{band.strikes.length} strikes flagged in this band:</div>
+          <div className="text-text-secondary mb-2">{band.strikes.map((s) => `$${s}`).join(', ')}</div>
+          <div className="text-text-muted">deadness range:</div>
+          <div className="text-text-secondary">
+            {band.minDeadness.toFixed(3)} – {band.maxDeadness.toFixed(3)}
+            <span className="text-text-muted ml-1">(closer to 0 = deader, relative to global peak)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Pocket overlays ─────────────────────────────────────────────────
 
 /** Small read-only tooltip rendered on hover. Pinned to the top-right
@@ -879,7 +1053,7 @@ function PocketDetailPopover({
     ? `thinness ${pocket.thinness?.toFixed(3) ?? '—'}`
     : pocket.type === 'sign_flip'
       ? `z ${pocket.z?.toFixed(2) ?? '—'}`
-      : `deadness ${pocket.deadness?.toFixed(3) ?? '—'}${pocket.perExpiryPeak ? ` (vs peak ${formatNumber(pocket.perExpiryPeak)})` : ''}`;
+      : `deadness ${pocket.deadness?.toFixed(3) ?? '—'}`;
 
   return (
     <div className="absolute inset-0 z-20 flex items-center justify-center p-6 pointer-events-none">
@@ -1005,6 +1179,8 @@ export default function GammaHeatmap() {
   const [colorMode, setColorMode] = useState<ColorMode>('per-column');
   const [hoveredPocket, setHoveredPocket] = useState<Pocket | null>(null);
   const [clickedPocket, setClickedPocket] = useState<Pocket | null>(null);
+  const [hoveredBand, setHoveredBand] = useState<DeadZoneBand | null>(null);
+  const [clickedBand, setClickedBand] = useState<DeadZoneBand | null>(null);
 
   // Pre-compute shared data
   const { strikes, grids, expirations } = useMemo(() => {
@@ -1160,11 +1336,17 @@ export default function GammaHeatmap() {
         }
       }
 
-      // Suspicious dead-zone diagnostic: any single expiry producing
-      // more than 6 dead-zones is likely a tuning issue (expiry-
-      // relevance ratio too loose for that expiry's structure, or
-      // absoluteFloorRatio needs tightening). Dump the strike list +
-      // per-expiry peak so the calibration can be adjusted.
+      // Suspicious dead-zone diagnostic: per-expiry marker count
+      // (bands + points) > 3 bands OR > 5 total markers suggests
+      // calibration drift. Bands are the natural unit; raw strike
+      // counts are misleading because band-merge consolidates large
+      // runs into a single marker.
+      const markersByExpiry = new Map<string, { bands: number; points: number }>();
+      // Reuse the wrapper's band-merge for the diagnostic so the
+      // numbers match what's rendered. Walk pockets-by-expiry through
+      // bandMergeDeadZones with the same chain-strike list.
+      const expMap = new Map<string, { strike: number }[]>();
+      for (const exp of multiGEX.perExpiration) expMap.set(exp.expiration, exp.exposures);
       const dzByExpiry = new Map<string, Pocket[]>();
       for (const p of detected) {
         if (p.type !== 'dead_zone') continue;
@@ -1172,27 +1354,64 @@ export default function GammaHeatmap() {
         dzByExpiry.get(p.expiry)!.push(p);
       }
       for (const [exp, list] of dzByExpiry) {
-        if (list.length > 6) {
-          const strikes = list.map((p) => `$${p.strike}`).join(', ');
-          const peak = list[0].perExpiryPeak;
-          console.warn(`[GammaHeatmap] ${list.length} dead_zones in ${exp} (peak ${peak ? formatNumber(peak) : '—'}): ${strikes}`);
+        const cs = (expMap.get(exp) ?? []).map((e) => e.strike).sort((a, b) => a - b);
+        const ms = bandMergeDeadZones(list, cs);
+        const bands = ms.filter((m) => m.kind === 'band').length;
+        const points = ms.filter((m) => m.kind === 'point').length;
+        markersByExpiry.set(exp, { bands, points });
+        if (bands > 3 || bands + points > 5) {
+          console.warn(`[GammaHeatmap] expiry ${exp} dead-zone marker count (bands=${bands}, points=${points}) — tuning may need attention`);
         }
       }
     }
     return detected;
   }, [multiGEX]);
 
-  /** Subset rendered as overlay ticks — clipped to ±POCKET_OVERLAY_MAX_DIST_PCT
-   *  of spot. The full `pockets` array still feeds the click popover lookup
-   *  and (in commit 6) the persistence detector. */
-  const pocketsForOverlay = useMemo<Pocket[]>(
-    () => pockets.filter((p) => Math.abs(p.distPct) <= POCKET_OVERLAY_MAX_DIST_PCT),
-    [pockets],
-  );
+  /** Pockets rendered as point markers on the overlay. Includes:
+   *    - voids and sign_flips within ±3% of spot
+   *    - dead-zone POINT markers (band-merge solo/isolated cases)
+   *      within ±3% of spot
+   *  Bands are rendered separately via `deadZoneBands`. */
+  const { pocketsForOverlay, deadZoneBands } = useMemo<{
+    pocketsForOverlay: Pocket[];
+    deadZoneBands: DeadZoneBand[];
+  }>(() => {
+    const inRange = pockets.filter((p) => Math.abs(p.distPct) <= POCKET_OVERLAY_MAX_DIST_PCT);
+    const dzInRange = inRange.filter((p) => p.type === 'dead_zone');
+    const nonDz = inRange.filter((p) => p.type !== 'dead_zone');
+
+    // Per-expiry band-merge over the dead-zone subset. Chain strikes
+    // come from multiGEX.perExpiration[].exposures so consecutive-
+    // strike detection respects the actual chain spacing.
+    const dzPoints: Pocket[] = [];
+    const bands: DeadZoneBand[] = [];
+    const expirationMap = new Map<string, { strike: number }[]>();
+    if (multiGEX?.perExpiration) {
+      for (const exp of multiGEX.perExpiration) expirationMap.set(exp.expiration, exp.exposures);
+    }
+    const dzByExpiry = new Map<string, Pocket[]>();
+    for (const p of dzInRange) {
+      if (!dzByExpiry.has(p.expiry)) dzByExpiry.set(p.expiry, []);
+      dzByExpiry.get(p.expiry)!.push(p);
+    }
+    for (const [exp, list] of dzByExpiry) {
+      const exposures = expirationMap.get(exp) ?? [];
+      const chainStrikes = exposures.map((e) => e.strike).sort((a, b) => a - b);
+      const markers = bandMergeDeadZones(list, chainStrikes);
+      for (const m of markers) {
+        if (m.kind === 'band') bands.push(m);
+        else dzPoints.push(m.pocket);
+      }
+    }
+
+    return { pocketsForOverlay: [...nonDz, ...dzPoints], deadZoneBands: bands };
+  }, [pockets, multiGEX]);
 
   const onHoverStrike = useCallback((s: number | null) => setHoveredStrike(s), []);
   const onHoverPocket = useCallback((p: Pocket | null) => setHoveredPocket(p), []);
   const onClickPocket = useCallback((p: Pocket | null) => setClickedPocket(p), []);
+  const onHoverBand = useCallback((b: DeadZoneBand | null) => setHoveredBand(b), []);
+  const onClickBand = useCallback((b: DeadZoneBand | null) => setClickedBand(b), []);
 
   if (!multiGEX?.perExpiration?.length || strikes.length === 0) {
     return (
@@ -1275,29 +1494,37 @@ export default function GammaHeatmap() {
             onHoverStrike={onHoverStrike}
             // Pockets only matter on the GEX panel — other panels get
             // an empty array (HeatPanel's draw skips overlay work too).
-            // Note: pass the OVERLAY-filtered subset (within ±3% of
-            // spot); the full pocket list is retained for persistence
-            // detection and the click-popover strike lookup, but
-            // rendering and hit-testing operate on the visible subset
-            // only.
+            // Pass the OVERLAY-filtered subset (within ±3% of spot) for
+            // rendering and hit-testing; the full pocket list is
+            // retained for persistence detection (commit 7) and click-
+            // popover strike lookup.
             pockets={config.metric === 'netGEX' ? pocketsForOverlay : []}
+            deadZoneBands={config.metric === 'netGEX' ? deadZoneBands : []}
             onHoverPocket={onHoverPocket}
             onClickPocket={onClickPocket}
+            onHoverBand={onHoverBand}
+            onClickBand={onClickBand}
             showYAxis={i % 2 === 0}  // left panels
             showXAxis={i >= 2}        // bottom panels
           />
         ))}
 
-        {/* Hover tooltip — small, follows pocket position. Suppressed
-            when the click popover is open so the two don't overlap. */}
-        {hoveredPocket && !clickedPocket && (
+        {/* Hover tooltip — top-right corner pinned. Pocket tooltip
+            wins precedence over band tooltip when both are active
+            (point markers sit visually inside band brackets and the
+            point is usually what the user is targeting). Suppressed
+            entirely when a click popover is open. */}
+        {!clickedPocket && !clickedBand && hoveredPocket && (
           <PocketHoverTooltip pocket={hoveredPocket} spot={spot} />
+        )}
+        {!clickedPocket && !clickedBand && !hoveredPocket && hoveredBand && (
+          <BandHoverTooltip band={hoveredBand} spot={spot} />
         )}
       </div>
 
-      {/* Click popover — strike chain detail. Renders outside the
-          panel grid so it can absolutely-position over the entire
-          heatmap surface. */}
+      {/* Click popovers — single-pocket gets chain detail, band gets
+          range metadata only. Both render outside the panel grid so
+          they can absolutely-position over the entire heatmap. */}
       {clickedPocket && (
         <PocketDetailPopover
           pocket={clickedPocket}
@@ -1305,6 +1532,13 @@ export default function GammaHeatmap() {
           spot={spot}
           perExpiration={multiGEX.perExpiration}
           onClose={() => setClickedPocket(null)}
+        />
+      )}
+      {clickedBand && !clickedPocket && (
+        <BandDetailPopover
+          band={clickedBand}
+          spot={spot}
+          onClose={() => setClickedBand(null)}
         />
       )}
 

@@ -23,6 +23,7 @@
 import {
   detectPocketsForExpiry,
   detectPocketsAcrossExpirations,
+  bandMergeDeadZones,
   DEFAULT_POCKET_OPTIONS,
   DEFAULT_DEAD_ZONE_OPTIONS,
   DEFAULT_SURFACE_FLOOR_PERCENTILE,
@@ -117,53 +118,86 @@ console.log();
 console.log('Surface floor percentile default:', DEFAULT_SURFACE_FLOOR_PERCENTILE);
 
 // ════════════════════════════════════════════════════════════════════
-// Dead-zone tests (commit 6 of PR2)
+// Dead-zone tests (commit 6a — global reference frame, band merge)
 // ════════════════════════════════════════════════════════════════════
 
 console.log();
 console.log('Dead-zone defaults:', DEFAULT_DEAD_ZONE_OPTIONS);
 
-// Test 1: canonical dead zone above the wall.
-// Build a single-expiry surface with:
-//   - Call wall at $755, peak |GEX| = 1e7
-//   - In-corridor strikes $745-755 with moderate GEX (0.3 * peak)
-//   - Above-wall strikes $760-770 at uniform 3e5 (3% of peak,
-//     below the 5% absoluteFloorRatio)
-// Expected: every above-wall strike $760-770 flagged as dead_zone.
+// Test 1: canonical above-wall band → 5 strikes individually flagged,
+// consolidated into ONE band marker by band-merge.
+// Surface: call wall at $755 (|GEX| = 1e7 = global peak), above-wall
+// strikes $760-770 in $2.5 steps all at 1.5e5 = 1.5% of global peak
+// (well below the 2% absoluteFloorRatio default).
 {
   const peakGex = 1e7;
   const exposures: Array<{ strike: number; netGEX: number }> = [];
   for (let k = 745; k <= 754; k++) exposures.push({ strike: k, netGEX: peakGex * 0.3 });
   exposures.push({ strike: 755, netGEX: peakGex });
-  for (let k = 760; k <= 770; k += 2.5) exposures.push({ strike: k, netGEX: 3e5 });
+  for (let k = 760; k <= 770; k += 2.5) exposures.push({ strike: k, netGEX: 1.5e5 });
 
   const out = detectPocketsAcrossExpirations(
     [{ expiration: '2026-07-17', dte: 14, exposures }],
     750,
     { callWall: 755, putWall: 745 },
   );
-  const dzAboveWall = out.filter((p) => p.type === 'dead_zone' && p.strike > 755.5);
+  const dz = out.filter((p) => p.type === 'dead_zone');
   const expectedStrikes = [760, 762.5, 765, 767.5, 770];
-  const allFlagged = expectedStrikes.every((s) => dzAboveWall.some((p) => Math.abs(p.strike - s) < 1e-6));
+  const allFlagged = expectedStrikes.every((s) => dz.some((p) => Math.abs(p.strike - s) < 1e-6));
+
+  // Band-merge: pass chain strikes for consecutiveness detection.
+  const chainStrikes = exposures.map((e) => e.strike).sort((a, b) => a - b);
+  const markers = bandMergeDeadZones(dz, chainStrikes);
+  const bands = markers.filter((m) => m.kind === 'band');
+  const points = markers.filter((m) => m.kind === 'point');
+
   console.log();
-  console.log('Test 1 — canonical dead zone above wall:');
-  console.log(`  expected ${expectedStrikes.length} dead_zones at $760-770, got ${dzAboveWall.length}:`, allFlagged ? 'OK' : 'FAIL');
-  if (!allFlagged) {
-    console.log('  detected dead_zones above wall:', dzAboveWall.map((p) => `$${p.strike} deadness=${p.deadness?.toFixed(4)}`));
+  console.log('Test 1 — canonical above-wall band:');
+  console.log(`  5 strikes flagged as dead_zone: ${dz.length}`, allFlagged && dz.length === 5 ? 'OK' : 'FAIL');
+  console.log(`  band-merge → 1 band, 0 points:`, bands.length === 1 && points.length === 0 ? 'OK' : `FAIL (bands=${bands.length}, points=${points.length})`);
+  if (bands.length === 1 && bands[0].kind === 'band') {
+    console.log(`  band span: $${bands[0].bottomStrike}–$${bands[0].topStrike} (${bands[0].strikes.length} strikes)`);
   }
 }
 
-// Test 2: quiet-expiry rejection.
-// Two expiries: a busy one (peak 1e7) and a quiet one (peak 5% of busy peak).
-// Even though every strike in the quiet expiry is "thin" by its own
-// expiryPeak, the expiry-relevance gate (default 10% of global peak)
-// rejects all of them.
+// Test 2: isolated solo dead strike → 1 point marker, not a band.
+// One thin strike at $735, surrounded by non-thin neighbors.
+{
+  const exposures: Array<{ strike: number; netGEX: number }> = [];
+  exposures.push({ strike: 732.5, netGEX: 1e6 });
+  exposures.push({ strike: 735, netGEX: 1e5 }); // thin (1% of global)
+  exposures.push({ strike: 737.5, netGEX: 1e6 });
+  for (let k = 745; k <= 754; k++) exposures.push({ strike: k, netGEX: 1e6 });
+  exposures.push({ strike: 755, netGEX: 1e7 }); // global peak
+
+  const out = detectPocketsAcrossExpirations(
+    [{ expiration: '2026-07-17', dte: 14, exposures }],
+    750,
+    { callWall: 755, putWall: 745 },
+  );
+  const dz = out.filter((p) => p.type === 'dead_zone');
+  const chainStrikes = exposures.map((e) => e.strike).sort((a, b) => a - b);
+  const markers = bandMergeDeadZones(dz, chainStrikes);
+  const points = markers.filter((m) => m.kind === 'point');
+  const bands = markers.filter((m) => m.kind === 'band');
+
+  console.log();
+  console.log('Test 2 — isolated solo dead strike:');
+  console.log(`  1 dead_zone at $735, 0 bands, 1 point:`,
+    dz.length === 1 && dz[0].strike === 735 && points.length === 1 && bands.length === 0 ? 'OK' : `FAIL (dz=${dz.length}, points=${points.length}, bands=${bands.length})`);
+}
+
+// Test 3: whole quiet expiry → consolidates into one or more bands,
+// not 20+ individual square markers. Detector behavior is permissive
+// (every strike fires), band-merge is what keeps the marker count
+// manageable.
 {
   const busyExposures: Array<{ strike: number; netGEX: number }> = [];
-  for (let k = 745; k <= 770; k++) busyExposures.push({ strike: k, netGEX: 1e7 * (k === 755 ? 1 : 0.3) });
+  for (let k = 745; k <= 770; k++) busyExposures.push({ strike: k, netGEX: 1e7 * (k === 755 ? 1 : 0.5) });
+
+  // Quiet expiry: every strike < 1% of global peak
   const quietExposures: Array<{ strike: number; netGEX: number }> = [];
-  // Quiet expiry: peak 5% of busy peak (5e5). All other strikes way below.
-  for (let k = 745; k <= 770; k++) quietExposures.push({ strike: k, netGEX: k === 755 ? 5e5 : 1e3 });
+  for (let k = 745; k <= 770; k++) quietExposures.push({ strike: k, netGEX: 5e4 }); // 0.5% of global
 
   const out = detectPocketsAcrossExpirations(
     [
@@ -174,22 +208,32 @@ console.log('Dead-zone defaults:', DEFAULT_DEAD_ZONE_OPTIONS);
     { callWall: 755, putWall: 745 },
   );
   const dzQuiet = out.filter((p) => p.type === 'dead_zone' && p.expiry === '2026-08-21');
+  const chainStrikes = quietExposures.map((e) => e.strike).sort((a, b) => a - b);
+  const markers = bandMergeDeadZones(dzQuiet, chainStrikes);
+  const bands = markers.filter((m) => m.kind === 'band');
+  const points = markers.filter((m) => m.kind === 'point');
+  const totalMarkers = bands.length + points.length;
+
   console.log();
-  console.log('Test 2 — quiet-expiry rejection:');
-  console.log(`  quiet-expiry dead_zones (expect 0): ${dzQuiet.length}`, dzQuiet.length === 0 ? 'OK' : 'FAIL');
+  console.log('Test 3 — whole quiet expiry → bands, not 20+ squares:');
+  console.log(`  individual dead_zone strikes (expect ~20+, scope-excluded inside corridor): ${dzQuiet.length}`);
+  console.log(`  band-merge → total markers: ${totalMarkers}, bands: ${bands.length}, points: ${points.length}`);
+  console.log(`  total markers ≤ 6:`, totalMarkers <= 6 ? 'OK' : 'FAIL');
 }
 
-// Test 3: in-corridor strike rejection.
-// A strike between the walls with absolutely tiny |GEX| should be a
-// void (existing detector catches relative thinness) but NOT a
-// dead_zone (scope restriction excludes in-corridor strikes).
+// Test 4: in-corridor strike rejection.
+// Strike $750 (in-corridor) at 3% of global peak — above the 2% floor.
+// Should NOT fire as dead_zone (and not as void either, since 3% is
+// not "locally thin" against neighbors at 50%).
 {
   const exposures: Array<{ strike: number; netGEX: number }> = [];
   for (let k = 745; k <= 770; k++) {
     if (k === 750) {
-      exposures.push({ strike: k, netGEX: 1e4 }); // thin in-corridor strike
+      exposures.push({ strike: k, netGEX: 3e5 }); // 3% of global peak
+    } else if (k === 755) {
+      exposures.push({ strike: k, netGEX: 1e7 }); // global peak
     } else {
-      exposures.push({ strike: k, netGEX: 1e7 * (k === 755 ? 1 : 0.5) });
+      exposures.push({ strike: k, netGEX: 5e6 });
     }
   }
   const out = detectPocketsAcrossExpirations(
@@ -198,10 +242,8 @@ console.log('Dead-zone defaults:', DEFAULT_DEAD_ZONE_OPTIONS);
     { callWall: 755, putWall: 745 },
   );
   const k750 = out.filter((p) => Math.abs(p.strike - 750) < 1e-6);
-  const isVoid = k750.some((p) => p.type === 'void');
   const isDeadZone = k750.some((p) => p.type === 'dead_zone');
   console.log();
-  console.log('Test 3 — in-corridor strike rejection:');
-  console.log(`  $750 fires as void (in-corridor thin):`, isVoid ? 'OK' : 'FAIL');
+  console.log('Test 4 — in-corridor strike (3% of global) rejection:');
   console.log(`  $750 NOT classified as dead_zone:`, !isDeadZone ? 'OK' : 'FAIL');
 }
