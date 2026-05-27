@@ -27,6 +27,32 @@ interface GridData {
   maxAbs: number;
 }
 
+// ─── X-axis scale transforms ─────────────────────────────────────────
+//
+// Linear DTE compresses the 0-7d region you actually trade and balloons
+// the 30d region you want as context. sqrt(DTE) maps cleanly:
+//   DTE  0  →  0,   1 → 1.00,   3 → 1.73,   7 → 2.65,
+//        14 → 3.74, 30 → 5.48, 45 → 6.71
+// log(1+DTE) is even more aggressive on the near end if you want to
+// inspect 0DTE/1DTE structure separately from the rest.
+
+export type XScaleMode = 'linear' | 'sqrt' | 'log';
+
+const X_SCALE_OPTIONS: { mode: XScaleMode; label: string }[] = [
+  { mode: 'linear', label: 'DTE' },
+  { mode: 'sqrt', label: '√DTE' },
+  { mode: 'log', label: 'log(1+DTE)' },
+];
+
+/** Map a DTE value to its position on the canvas (0..1). */
+function xTransform(mode: XScaleMode, dte: number, maxDTE: number): number {
+  const d = Math.max(0, dte);
+  const m = Math.max(1, maxDTE);
+  if (mode === 'sqrt') return Math.sqrt(d) / Math.sqrt(m);
+  if (mode === 'log') return Math.log(1 + d) / Math.log(1 + m);
+  return d / m;
+}
+
 // ─── Diverging colormap (blue ← dark → red) ─────────────────────────
 
 function surfaceColor(t: number): [number, number, number] {
@@ -55,6 +81,8 @@ function surfaceColor(t: number): [number, number, number] {
 
 function renderSmoothSurface(
   grid: number[][],
+  expirations: { dte: number }[],
+  xMode: XScaleMode,
   maxAbs: number,
   upW: number,
   upH: number,
@@ -65,6 +93,31 @@ function renderSmoothSurface(
 
   if (numExps === 0 || numStrikes === 0) return imageData;
 
+  // Precompute each column's transformed canvas position [0,1] using the
+  // chosen x-axis scale. When xMode='linear' this falls back to evenly
+  // spaced columns (the previous behavior) IF all expirations are evenly
+  // DTE-spaced — for actual SPY chains they aren't, so even 'linear' here
+  // is now strictly DTE-proportional rather than index-proportional. That
+  // intentionally fixes a subtle bug where the previous renderer treated
+  // a 3-day gap between two expiries as visually identical to a 7-day gap.
+  const maxDTE = Math.max(1, expirations[numExps - 1]?.dte ?? 1);
+  const colT: number[] = expirations.map((e) => xTransform(xMode, e.dte, maxDTE));
+
+  // Binary-search-style bracketing helper. Returns [i0, i1, fx] such that
+  // colT[i0] <= t <= colT[i1] and fx is the fractional position within
+  // that span. Linear scan is fine here — numExps is at most ~15.
+  const bracket = (t: number): [number, number, number] => {
+    if (t <= colT[0]) return [0, 0, 0];
+    if (t >= colT[numExps - 1]) return [numExps - 1, numExps - 1, 0];
+    let i0 = 0;
+    for (let i = 0; i < numExps - 1; i++) {
+      if (colT[i] <= t && t <= colT[i + 1]) { i0 = i; break; }
+    }
+    const i1 = i0 + 1;
+    const span = colT[i1] - colT[i0] || 1e-9;
+    return [i0, i1, (t - colT[i0]) / span];
+  };
+
   for (let py = 0; py < upH; py++) {
     // Y-axis: top = highest strike, bottom = lowest strike
     const gy = (1 - py / (upH - 1)) * (numStrikes - 1);
@@ -72,9 +125,8 @@ function renderSmoothSurface(
     const fy = gy - y0;
 
     for (let px = 0; px < upW; px++) {
-      const gx = (px / (upW - 1)) * (numExps - 1);
-      const x0 = Math.floor(gx), x1 = Math.min(x0 + 1, numExps - 1);
-      const fx = gx - x0;
+      const t = px / (upW - 1);
+      const [x0, x1, fx] = bracket(t);
 
       // Bilinear interpolation
       const v00 = grid[x0][y0], v10 = grid[x1][y0];
@@ -103,6 +155,7 @@ interface HeatPanelProps {
   gridData: GridData;
   strikes: number[];
   expirations: { date: string; dte: number }[];
+  xMode: XScaleMode;
   spot: number;
   gammaFlip: number | null;
   callWall: number | null;
@@ -114,7 +167,7 @@ interface HeatPanelProps {
 }
 
 function HeatPanel({
-  config, gridData, strikes, expirations, spot,
+  config, gridData, strikes, expirations, xMode, spot,
   gammaFlip, callWall, putWall,
   hoveredStrike, onHoverStrike, showYAxis, showXAxis,
 }: HeatPanelProps) {
@@ -126,13 +179,13 @@ function HeatPanel({
   useEffect(() => {
     if (!gridData.grid.length || !gridData.grid[0]?.length) return;
     const upW = 256, upH = 256;
-    const imgData = renderSmoothSurface(gridData.grid, gridData.maxAbs, upW, upH);
+    const imgData = renderSmoothSurface(gridData.grid, expirations, xMode, gridData.maxAbs, upW, upH);
     const off = document.createElement('canvas');
     off.width = upW;
     off.height = upH;
     off.getContext('2d')!.putImageData(imgData, 0, 0);
     imageCache.current = off;
-  }, [gridData]);
+  }, [gridData, expirations, xMode]);
 
   // Draw to visible canvas
   useEffect(() => {
@@ -179,7 +232,11 @@ function HeatPanel({
       const minS = strikes[0], maxS = strikes[strikes.length - 1];
       const sRange = maxS - minS || 1;
       const toY = (strike: number) => pad.top + ch - ((strike - minS) / sRange) * ch;
-      const toX = (expIdx: number) => pad.left + (expIdx / Math.max(1, expirations.length - 1)) * cw;
+      // X position uses the chosen scale transform on the column's DTE, so
+      // labels and tick marks land at the same place the surface bitmap
+      // rendered them.
+      const maxDTE = Math.max(1, expirations[expirations.length - 1]?.dte ?? 1);
+      const toX = (expIdx: number) => pad.left + xTransform(xMode, expirations[expIdx]?.dte ?? 0, maxDTE) * cw;
 
       // Spot price horizontal line
       if (spot >= minS && spot <= maxS) {
@@ -314,7 +371,7 @@ function HeatPanel({
     const obs = new ResizeObserver(draw);
     obs.observe(container);
     return () => obs.disconnect();
-  }, [gridData, strikes, expirations, spot, gammaFlip, callWall, putWall,
+  }, [gridData, strikes, expirations, xMode, spot, gammaFlip, callWall, putWall,
       hoveredStrike, config, showYAxis, showXAxis]);
 
   // Mouse handler
@@ -522,6 +579,9 @@ function PositioningInsights({
 export default function GammaHeatmap() {
   const { multiGEX, symbol } = useDashboardStore();
   const [hoveredStrike, setHoveredStrike] = useState<number | null>(null);
+  // Default to sqrt(DTE) per the extended-surface spec — near-dated detail
+  // gets ~32% of the canvas, 7-30d gets ~50%, 30-45d the tail ~18%.
+  const [xMode, setXMode] = useState<XScaleMode>('sqrt');
 
   // Pre-compute shared data
   const { strikes, grids, expirations } = useMemo(() => {
@@ -609,9 +669,27 @@ export default function GammaHeatmap() {
     <div className="panel overflow-hidden">
       <div className="panel-header">
         <span className="panel-title">Exposure Surface — {symbol}</span>
-        <span className="text-[10px] font-mono text-text-muted">
-          {expirations.length} exp × {strikes.length} strikes | ${strikes[0]?.toFixed(0)}–${strikes[strikes.length - 1]?.toFixed(0)} (spot ${formatCurrency(spot)})
-        </span>
+        <div className="ml-auto flex items-center gap-3">
+          <div className="flex items-center gap-1 text-[10px] font-mono">
+            <span className="text-text-muted/60">x:</span>
+            {X_SCALE_OPTIONS.map((opt) => (
+              <button
+                key={opt.mode}
+                onClick={() => setXMode(opt.mode)}
+                className={`px-1.5 py-0.5 rounded transition-colors ${
+                  xMode === opt.mode
+                    ? 'bg-accent-cyan/15 text-accent-cyan border border-accent-cyan/30'
+                    : 'text-text-muted hover:text-text-secondary border border-transparent'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+          <span className="text-[10px] font-mono text-text-muted">
+            {expirations.length} exp × {strikes.length} strikes | ${strikes[0]?.toFixed(0)}–${strikes[strikes.length - 1]?.toFixed(0)} (spot ${formatCurrency(spot)})
+          </span>
+        </div>
       </div>
 
       {/* 2×2 heatmap grid */}
@@ -623,6 +701,7 @@ export default function GammaHeatmap() {
             gridData={grids[config.metric]}
             strikes={strikes}
             expirations={expirations}
+            xMode={xMode}
             spot={spot}
             gammaFlip={gammaFlip}
             callWall={callWall}
