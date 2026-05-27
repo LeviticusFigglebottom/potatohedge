@@ -287,7 +287,11 @@ function HeatPanel({
         ctx.fillText(`SPOT $${spot.toFixed(0)}`, pad.left + cw - 4, sy - 4);
       }
 
-      // Key levels (subtle dashed lines)
+      // Key levels (subtle dashed lines). Wall labels anchor inboard
+      // (pad.left + 60) instead of at the plot's left edge — with the
+      // densified Y-axis (~31 strikes after the chain widening in PR1
+      // commit 1) the strike-price labels in the left gutter were
+      // visually colliding with the wall callouts at pad.left + 3.
       const drawLevel = (price: number | null, color: string, label: string) => {
         if (!price || price < minS || price > maxS) return;
         const ly = toY(price);
@@ -302,7 +306,7 @@ function HeatPanel({
         ctx.fillStyle = color;
         ctx.font = '8px "JetBrains Mono"';
         ctx.textAlign = 'left';
-        ctx.fillText(label, pad.left + 3, ly - 3);
+        ctx.fillText(label, pad.left + 60, ly - 3);
       };
 
       if (config.metric === 'netGEX') {
@@ -356,11 +360,38 @@ function HeatPanel({
         ctx.fillStyle = '#6b7280';
         ctx.font = '9px "JetBrains Mono"';
         ctx.textAlign = 'center';
-        // Show a subset of labels if too many expirations
-        const maxXLabels = Math.floor(cw / 50);
-        const xStep = Math.max(1, Math.ceil(expirations.length / maxXLabels));
+        // Minimum-pixel-separation thinning. The sqrt(DTE) x-axis can
+        // place two adjacent expirations <15px apart (e.g. 7d & 9d, or
+        // 35d & 37d) — index-based xStep thinning (the old behavior)
+        // didn't account for that and produced overlapping labels like
+        // "35d37d". Walk left-to-right and drop any label whose
+        // pixel-position is within MIN_LABEL_GAP_PX of the last drawn
+        // one. Always keep first + last; if last is too close to the
+        // previous kept label, drop that previous one and keep last.
+        const MIN_LABEL_GAP_PX = 28;
+        const keep = new Set<number>();
+        let lastX = -Infinity;
+        for (let i = 0; i < expirations.length; i++) {
+          const x = toX(i);
+          if (i === 0 || x - lastX >= MIN_LABEL_GAP_PX) {
+            keep.add(i);
+            lastX = x;
+          }
+        }
+        const lastIdx = expirations.length - 1;
+        if (lastIdx >= 0 && !keep.has(lastIdx)) {
+          const lastXC = toX(lastIdx);
+          // Sweep back and remove any kept labels within the gap of the
+          // forced-last so we don't render an overlap on the right edge.
+          for (let i = lastIdx - 1; i >= 0; i--) {
+            if (!keep.has(i)) continue;
+            if (lastXC - toX(i) < MIN_LABEL_GAP_PX) keep.delete(i);
+            else break;
+          }
+          keep.add(lastIdx);
+        }
         expirations.forEach((exp, i) => {
-          if (i % xStep !== 0 && i !== expirations.length - 1) return;
+          if (!keep.has(i)) return;
           const x = toX(i);
           ctx.fillStyle = '#6b7280';
           ctx.fillText(exp.date.slice(5), x, pad.top + ch + 14);
@@ -778,7 +809,7 @@ export default function GammaHeatmap() {
             ))}
           </div>
           <span className="text-[10px] font-mono text-text-muted">
-            {expirations.length} exp × {strikes.length} strikes | ${strikes[0]?.toFixed(0)}–${strikes[strikes.length - 1]?.toFixed(0)} (spot ${formatCurrency(spot)})
+            {expirations.length} exp × {strikes.length} strikes | ${strikes[0]?.toFixed(0)}–${strikes[strikes.length - 1]?.toFixed(0)} (spot {formatCurrency(spot)})
           </span>
         </div>
       </div>
