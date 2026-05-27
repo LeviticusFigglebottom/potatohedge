@@ -342,8 +342,12 @@ function HeatPanel({
       }
 
       // ── Pocket overlay (GEX panel only) ───────────────────────────
-      // Void   → open amber circle (r=4)
-      // Sign-flip → filled amber diamond (~5px)
+      // Void      → open amber circle (r=4)        — locally thin
+      // Sign-flip → filled amber diamond (~5px)    — opposite-sign island
+      // Dead-zone → open amber square (5px side)   — absolute thin, beyond walls
+      // Dead zones use a slightly more orange amber (#EF9F27) to
+      // distinguish them visually from void/sign-flip ticks in the
+      // same color family.
       // Pocket pixel positions cached in ref for mouse hit-testing.
       const positions: Array<{ pocket: Pocket; x: number; y: number }> = [];
       if (config.metric === 'netGEX' && pockets.length > 0 && expirations.length > 0) {
@@ -365,8 +369,7 @@ function HeatPanel({
             ctx.beginPath();
             ctx.arc(x, y, 4, 0, Math.PI * 2);
             ctx.stroke();
-          } else {
-            // sign_flip → filled diamond
+          } else if (p.type === 'sign_flip') {
             ctx.fillStyle = '#ffaa00';
             ctx.beginPath();
             ctx.moveTo(x, y - 5);
@@ -375,6 +378,12 @@ function HeatPanel({
             ctx.lineTo(x - 5, y);
             ctx.closePath();
             ctx.fill();
+          } else if (p.type === 'dead_zone') {
+            // Open amber square, 5px side, slightly more-orange shade
+            // to distinguish from void/sign-flip in the same family.
+            ctx.strokeStyle = '#EF9F27';
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(x - 2.5, y - 2.5, 5, 5);
           }
           ctx.restore();
         }
@@ -757,9 +766,12 @@ function PocketHoverTooltip({ pocket, spot }: { pocket: Pocket; spot: number }) 
     : `${(pocket.distPct * 100).toFixed(2)}%`;
   const detail = pocket.type === 'void'
     ? `thinness ${pocket.thinness?.toFixed(3) ?? '—'}`
-    : `z ${pocket.z?.toFixed(2) ?? '—'}`;
-  // void = amber-300, sign_flip = amber-400 — match the canvas tick fill
-  const tone = 'text-amber-300';
+    : pocket.type === 'sign_flip'
+      ? `z ${pocket.z?.toFixed(2) ?? '—'}`
+      : `deadness ${pocket.deadness?.toFixed(3) ?? '—'}`;
+  // Dead-zones use a slightly different amber shade to mirror the
+  // marker color; voids and sign_flips share the standard amber.
+  const tone = pocket.type === 'dead_zone' ? 'text-amber-400' : 'text-amber-300';
   return (
     <div className="pointer-events-none absolute top-2 right-2 z-10 bg-bg-primary/90 border border-amber-500/40 rounded px-2.5 py-1.5 backdrop-blur-sm shadow-lg">
       <div className="flex items-center gap-2 text-[10px] font-mono">
@@ -865,7 +877,9 @@ function PocketDetailPopover({
     : `${(pocket.distPct * 100).toFixed(2)}%`;
   const detail = pocket.type === 'void'
     ? `thinness ${pocket.thinness?.toFixed(3) ?? '—'}`
-    : `z ${pocket.z?.toFixed(2) ?? '—'}`;
+    : pocket.type === 'sign_flip'
+      ? `z ${pocket.z?.toFixed(2) ?? '—'}`
+      : `deadness ${pocket.deadness?.toFixed(3) ?? '—'}${pocket.perExpiryPeak ? ` (vs peak ${formatNumber(pocket.perExpiryPeak)})` : ''}`;
 
   return (
     <div className="absolute inset-0 z-20 flex items-center justify-center p-6 pointer-events-none">
@@ -1113,30 +1127,29 @@ export default function GammaHeatmap() {
   // wall-shoulder math artifacts, not exceptions to wall structure.
   const pockets = useMemo<Pocket[]>(() => {
     if (!multiGEX?.perExpiration?.length) return [];
-    const exclude: number[] = [];
-    if (multiGEX.aggregated.callWall != null) exclude.push(multiGEX.aggregated.callWall);
-    if (multiGEX.aggregated.putWall != null) exclude.push(multiGEX.aggregated.putWall);
 
     const detected = detectPocketsAcrossExpirations(
       multiGEX.perExpiration,
       multiGEX.spotPrice,
-      { excludeStrikes: exclude },
+      {
+        callWall: multiGEX.aggregated.callWall,
+        putWall: multiGEX.aggregated.putWall,
+      },
     );
 
     if (process.env.NODE_ENV !== 'production' && detected.length > 0) {
       const voids = detected.filter((p) => p.type === 'void').length;
       const flips = detected.filter((p) => p.type === 'sign_flip').length;
-      console.log(`[GammaHeatmap] detected ${detected.length} pockets (${voids} void, ${flips} sign_flip):`, detected);
+      const dzs = detected.filter((p) => p.type === 'dead_zone').length;
+      console.log(`[GammaHeatmap] detected ${detected.length} pockets (${voids} void, ${flips} sign_flip, ${dzs} dead_zone):`, detected);
 
-      // Diagnostic: any sign-flip with |z| > 5 is suspicious — twin's
-      // canonical artifact case ($755 wall, z=-8.54). Dump the strike's
-      // ±2 flanks so artifact-vs-real-anomaly can be eyeballed without
-      // opening DevTools. With the v2 gates this should never trigger
-      // on a wall-adjacent strike; if it does, investigate.
-      const suspicious = detected.filter((p) => p.type === 'sign_flip' && Math.abs(p.z ?? 0) > 5);
-      if (suspicious.length > 0) {
-        console.warn(`[GammaHeatmap] ${suspicious.length} suspicious sign-flip(s) with |z| > 5:`);
-        for (const p of suspicious) {
+      // Suspicious sign-flip diagnostic: any sign-flip with |z| > 5
+      // gets its ±2 strike flanks dumped to console. With the v2 gates
+      // this should never trigger on a wall-adjacent strike.
+      const suspiciousFlips = detected.filter((p) => p.type === 'sign_flip' && Math.abs(p.z ?? 0) > 5);
+      if (suspiciousFlips.length > 0) {
+        console.warn(`[GammaHeatmap] ${suspiciousFlips.length} suspicious sign-flip(s) with |z| > 5:`);
+        for (const p of suspiciousFlips) {
           const slice = multiGEX.perExpiration.find((e) => e.expiration === p.expiry);
           if (!slice) continue;
           const flanks = slice.exposures
@@ -1144,6 +1157,25 @@ export default function GammaHeatmap() {
             .sort((a, b) => a.strike - b.strike)
             .map((e) => `${e.strike}:${e.netGEX.toFixed(0)}`);
           console.warn(`  sign_flip ${p.strike} (${p.expiry}, ${p.dte}d, z=${p.z?.toFixed(2)}): flanks ${flanks.join(' ')}`);
+        }
+      }
+
+      // Suspicious dead-zone diagnostic: any single expiry producing
+      // more than 6 dead-zones is likely a tuning issue (expiry-
+      // relevance ratio too loose for that expiry's structure, or
+      // absoluteFloorRatio needs tightening). Dump the strike list +
+      // per-expiry peak so the calibration can be adjusted.
+      const dzByExpiry = new Map<string, Pocket[]>();
+      for (const p of detected) {
+        if (p.type !== 'dead_zone') continue;
+        if (!dzByExpiry.has(p.expiry)) dzByExpiry.set(p.expiry, []);
+        dzByExpiry.get(p.expiry)!.push(p);
+      }
+      for (const [exp, list] of dzByExpiry) {
+        if (list.length > 6) {
+          const strikes = list.map((p) => `$${p.strike}`).join(', ');
+          const peak = list[0].perExpiryPeak;
+          console.warn(`[GammaHeatmap] ${list.length} dead_zones in ${exp} (peak ${peak ? formatNumber(peak) : '—'}): ${strikes}`);
         }
       }
     }
@@ -1210,6 +1242,14 @@ export default function GammaHeatmap() {
               </button>
             ))}
           </div>
+          {/* Pocket marker legend — inline glyphs match the canvas
+              tick shapes. Open circle = void, filled diamond = sign-
+              flip, open square = dead zone (slightly oranger amber). */}
+          <span className="flex items-center gap-2 text-[10px] font-mono text-text-muted/80 border-l border-border/40 pl-3">
+            <span className="flex items-center gap-1"><span className="text-amber-300">○</span>void</span>
+            <span className="flex items-center gap-1"><span className="text-amber-300">◆</span>sign-flip</span>
+            <span className="flex items-center gap-1"><span className="text-amber-400">□</span>dead zone</span>
+          </span>
           <span className="text-[10px] font-mono text-text-muted">
             {expirations.length} exp × {strikes.length} strikes | ${strikes[0]?.toFixed(0)}–${strikes[strikes.length - 1]?.toFixed(0)} (spot {formatCurrency(spot)})
           </span>

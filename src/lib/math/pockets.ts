@@ -27,7 +27,7 @@
  * can't accidentally point the scan at the wrong tensor.
  */
 
-export type PocketType = 'void' | 'sign_flip';
+export type PocketType = 'void' | 'sign_flip' | 'dead_zone';
 
 export interface Pocket {
   /** YYYY-MM-DD expiration date the pocket belongs to. Empty when the
@@ -51,6 +51,17 @@ export interface Pocket {
    *  band. Compare against `voidRatio` from the detector options to
    *  understand whether the void is borderline or extreme. */
   thinness?: number;
+  /** Dead-zone deadness: |gex_here| / perExpiryPeakAbsGex, in [0, 1].
+   *  Populated for dead_zone pockets only. Closer to 0 = deader. Use
+   *  this when distinguishing "modestly thin beyond the walls" from
+   *  "structurally empty terrain." Sits alongside thinness (void) and
+   *  z (sign_flip) — same Pocket shape, type discriminator selects
+   *  which secondary metric is populated. */
+  deadness?: number;
+  /** Maximum |GEX| within this pocket's expiration. Populated for
+   *  dead_zone pockets so the click popover and tooltip can show the
+   *  comparison baseline ("$760 deadness 0.04 vs $755 peak 8.2M"). */
+  perExpiryPeak?: number;
   /** Signed distance from spot as a fraction. `(strike - spot) / spot`.
    *  Positive = above spot, negative = below. Used by the metrics row
    *  for the "nearest void" card. */
@@ -126,6 +137,115 @@ export const DEFAULT_SURFACE_FLOOR_PERCENTILE = 25;
  *  the labeled call wall / put wall) are skipped entirely by the
  *  multi-expiry wrapper. The wall is structure, not a pocket near it. */
 export const WALL_EXCLUSION_BUFFER = 0.50;
+
+// ── Dead-zone detector (absolute thinness, beyond the walls) ─────
+
+export interface DeadZoneOptions {
+  /** Strike-level deadness gate: a candidate must have
+   *      |gex_K| < absoluteFloorRatio × expiryPeakAbsGex
+   *  to register. 0.05 = "less than 5% of this expiry's heaviest
+   *  strike" — structurally absent rather than locally diminished. */
+  absoluteFloorRatio: number;
+  /** Expiry-relevance gate: the expiry's own peak |GEX| must be
+   *      expiryPeakAbsGex >= expiryRelevanceRatio × globalPeakAbsGex
+   *  for any of its strikes to qualify as dead zones. Without this
+   *  gate, a structurally quiet 35d column (peak 100× smaller than
+   *  the 0DTE pin) would trip dead-zone on every strike — being thin
+   *  inside a thin expiry is meaningless. */
+  expiryRelevanceRatio: number;
+}
+
+// TUNE-ME — calibrated empirically after first dead-zone observation.
+// If the live render shows >20 dead-zones, tighten absoluteFloorRatio
+// to 0.03. If 0-1 dead-zones, loosen to 0.08.
+export const DEFAULT_ABSOLUTE_FLOOR_RATIO = 0.05;
+export const DEFAULT_EXPIRY_RELEVANCE_RATIO = 0.10;
+
+export const DEFAULT_DEAD_ZONE_OPTIONS: DeadZoneOptions = {
+  absoluteFloorRatio: DEFAULT_ABSOLUTE_FLOOR_RATIO,
+  expiryRelevanceRatio: DEFAULT_EXPIRY_RELEVANCE_RATIO,
+};
+
+/**
+ * Detect dead-zone pockets for a single expiration.
+ *
+ * Dead zones differ from voids semantically. A void is a strike that's
+ * locally thin RELATIVE to its immediate neighbors (a dent in an
+ * otherwise busy band). A dead zone is a strike that's ABSOLUTELY thin
+ * relative to the expiry's own peak — structurally absent rather than
+ * locally diminished. Trading semantic: voids are "the price might
+ * slip through here within the defended terrain"; dead zones are
+ * "this is unopposed terrain beyond the walls, a momentum target if
+ * the wall breaks."
+ *
+ * Two gates (both must pass):
+ *   1. Strike-level deadness: |gex_K| < absoluteFloorRatio × expiryPeak
+ *   2. Expiry relevance: expiryPeak >= expiryRelevanceRatio × globalPeak
+ *
+ * Two scope restrictions (dead-zone-specific; void/sign_flip ignore
+ * these):
+ *   1. Outside the wall corridor: strike > callWall + WALL_EXCLUSION_BUFFER
+ *      OR strike < putWall - WALL_EXCLUSION_BUFFER. Between-wall dead
+ *      zones are conceptually redundant with relative voids and add
+ *      marker noise. The dead-zone semantic is specifically "beyond
+ *      the defended terrain."
+ *   2. (Caller's responsibility) within actionable distance from spot
+ *      — typically applied at the overlay-render layer, not here.
+ *
+ * If both walls are null, the corridor restriction is skipped — the
+ * detector can't filter for "beyond walls" if no walls are identified.
+ */
+export function detectDeadZones(
+  gexByStrike: Map<number, number>,
+  spot: number,
+  expiry: string,
+  dte: number,
+  expiryPeakAbsGex: number,
+  globalPeakAbsGex: number,
+  callWall: number | null,
+  putWall: number | null,
+  opts: Partial<DeadZoneOptions> = {},
+): Pocket[] {
+  // Use nullish-coalescing rather than spread defaults, because the
+  // wrapper may pass {absoluteFloorRatio: undefined, ...} and the
+  // spread would CLOBBER the default with the explicit undefined.
+  const absoluteFloorRatio = opts.absoluteFloorRatio ?? DEFAULT_DEAD_ZONE_OPTIONS.absoluteFloorRatio;
+  const expiryRelevanceRatio = opts.expiryRelevanceRatio ?? DEFAULT_DEAD_ZONE_OPTIONS.expiryRelevanceRatio;
+
+  // Gate 2: expiry relevance. If the whole column is thin relative
+  // to the surface peak, none of its strikes are meaningful dead
+  // zones (they're just a quiet expiry).
+  if (expiryPeakAbsGex <= 0) return [];
+  if (globalPeakAbsGex > 0 && expiryPeakAbsGex < expiryRelevanceRatio * globalPeakAbsGex) return [];
+
+  const absoluteFloor = absoluteFloorRatio * expiryPeakAbsGex;
+  const hasCorridor = callWall != null || putWall != null;
+  const corridorLo = putWall != null ? putWall - WALL_EXCLUSION_BUFFER : -Infinity;
+  const corridorHi = callWall != null ? callWall + WALL_EXCLUSION_BUFFER : Infinity;
+
+  const out: Pocket[] = [];
+  for (const [K, gexK] of gexByStrike.entries()) {
+    // Scope restriction: skip strikes between the walls (defended
+    // terrain — voids cover that semantic, not dead zones).
+    if (hasCorridor && K >= corridorLo && K <= corridorHi) continue;
+
+    // Gate 1: strike-level deadness.
+    const absK = Math.abs(gexK);
+    if (absK >= absoluteFloor) continue;
+
+    const distPct = spot > 0 ? (K - spot) / spot : 0;
+    out.push({
+      expiry,
+      dte,
+      strike: K,
+      type: 'dead_zone',
+      deadness: absK / expiryPeakAbsGex,
+      perExpiryPeak: expiryPeakAbsGex,
+      distPct,
+    });
+  }
+  return out;
+}
 
 // ── Internal stats helpers (no external dep on lodash/d3) ──────────
 
@@ -280,17 +400,23 @@ export interface ExpiryExposureSlice {
   exposures: Array<{ strike: number; netGEX: number }>;
 }
 
-export interface AcrossExpirationsOptions extends Partial<PocketDetectorOptions> {
+export interface AcrossExpirationsOptions extends Partial<PocketDetectorOptions>, Partial<DeadZoneOptions> {
   /** Percentile of the across-surface |GEX| distribution that becomes
    *  the absolute candidacy floor for every per-expiry scan. Defaults
    *  to DEFAULT_SURFACE_FLOOR_PERCENTILE (25). Ignored if `surfaceFloor`
    *  is also passed explicitly — then the explicit value wins. */
   surfaceFloorPercentile?: number;
-  /** Strikes to exclude from the final pocket list. Typically populated
-   *  with the labeled call wall and put wall — those strikes are
-   *  structure, not pockets near it. Any pocket within
-   *  WALL_EXCLUSION_BUFFER ($0.50 by default) of an entry here is
-   *  dropped. Empty/undefined = no exclusion. */
+  /** Labeled call wall. Used by the dead-zone detector for the
+   *  beyond-corridor scope restriction, AND implicitly added to
+   *  excludeStrikes for the void/sign_flip post-filter. */
+  callWall?: number | null;
+  /** Labeled put wall. Same dual role as callWall. */
+  putWall?: number | null;
+  /** Additional strikes to exclude from the final void/sign_flip
+   *  pocket list (does NOT affect dead_zone scope — dead zones use
+   *  the explicit callWall/putWall for corridor). Any pocket within
+   *  WALL_EXCLUSION_BUFFER ($0.50) of an entry here is dropped. The
+   *  callWall + putWall values above are auto-merged in. */
   excludeStrikes?: number[];
 }
 
@@ -322,8 +448,7 @@ export function detectPocketsAcrossExpirations(
   spot: number,
   opts: AcrossExpirationsOptions = {},
 ): Pocket[] {
-  // Compute the absolute surface floor from this run's data — unless
-  // the caller passed an explicit floor in opts.surfaceFloor.
+  // ── Surface-floor for void/sign_flip candidacy ──────────────────
   let surfaceFloor = opts.surfaceFloor ?? 0;
   if (opts.surfaceFloor === undefined) {
     const allAbs: number[] = [];
@@ -341,23 +466,58 @@ export function detectPocketsAcrossExpirations(
     }
   }
 
+  // ── Global peak |GEX| for dead-zone expiry-relevance gate ───────
+  let globalPeakAbsGex = 0;
+  for (const exp of perExpiration) {
+    for (const e of exp.exposures) {
+      const a = Math.abs(e.netGEX);
+      if (a > globalPeakAbsGex) globalPeakAbsGex = a;
+    }
+  }
+
   const perExpiryOpts: Partial<PocketDetectorOptions> = { ...opts, surfaceFloor };
   delete (perExpiryOpts as AcrossExpirationsOptions).surfaceFloorPercentile;
   delete (perExpiryOpts as AcrossExpirationsOptions).excludeStrikes;
+  delete (perExpiryOpts as AcrossExpirationsOptions).callWall;
+  delete (perExpiryOpts as AcrossExpirationsOptions).putWall;
+  delete (perExpiryOpts as AcrossExpirationsOptions).absoluteFloorRatio;
+  delete (perExpiryOpts as AcrossExpirationsOptions).expiryRelevanceRatio;
 
-  const out: Pocket[] = [];
+  const callWall = opts.callWall ?? null;
+  const putWall = opts.putWall ?? null;
+  const dzOpts: Partial<DeadZoneOptions> = {
+    absoluteFloorRatio: opts.absoluteFloorRatio,
+    expiryRelevanceRatio: opts.expiryRelevanceRatio,
+  };
+
+  const voidsAndFlips: Pocket[] = [];
+  const deadZones: Pocket[] = [];
   for (const exp of perExpiration) {
     const gexByStrike = new Map<number, number>();
-    for (const e of exp.exposures) gexByStrike.set(e.strike, e.netGEX);
-    out.push(...detectPocketsForExpiry(gexByStrike, spot, exp.expiration, exp.dte, perExpiryOpts));
+    let expiryPeakAbsGex = 0;
+    for (const e of exp.exposures) {
+      gexByStrike.set(e.strike, e.netGEX);
+      const a = Math.abs(e.netGEX);
+      if (a > expiryPeakAbsGex) expiryPeakAbsGex = a;
+    }
+    voidsAndFlips.push(
+      ...detectPocketsForExpiry(gexByStrike, spot, exp.expiration, exp.dte, perExpiryOpts),
+    );
+    deadZones.push(
+      ...detectDeadZones(gexByStrike, spot, exp.expiration, exp.dte, expiryPeakAbsGex, globalPeakAbsGex, callWall, putWall, dzOpts),
+    );
   }
 
-  // Wall exclusion — drop any pocket within WALL_EXCLUSION_BUFFER of
-  // an excluded strike. Done as a post-filter rather than inside the
-  // per-expiry detector so the detector stays pure.
-  const excl = opts.excludeStrikes?.filter((s): s is number => typeof s === 'number');
-  if (excl && excl.length > 0) {
-    return out.filter((p) => !excl.some((w) => Math.abs(p.strike - w) <= WALL_EXCLUSION_BUFFER));
-  }
-  return out;
+  // ── Wall-exclusion post-filter for voids/sign_flips ─────────────
+  // Auto-includes callWall + putWall alongside any caller-supplied
+  // excludeStrikes. Dead zones are NOT subject to this filter — their
+  // own scope restriction (corridor) is the right tool for them, and
+  // post-filtering would zero out the very strikes we want to flag.
+  const wallStrikes = [callWall, putWall].filter((s): s is number => typeof s === 'number');
+  const excl = [...(opts.excludeStrikes ?? []), ...wallStrikes];
+  const filteredVoidsAndFlips = excl.length > 0
+    ? voidsAndFlips.filter((p) => !excl.some((w) => Math.abs(p.strike - w) <= WALL_EXCLUSION_BUFFER))
+    : voidsAndFlips;
+
+  return [...filteredVoidsAndFlips, ...deadZones];
 }

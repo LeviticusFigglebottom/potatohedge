@@ -24,6 +24,7 @@ import {
   detectPocketsForExpiry,
   detectPocketsAcrossExpirations,
   DEFAULT_POCKET_OPTIONS,
+  DEFAULT_DEAD_ZONE_OPTIONS,
   DEFAULT_SURFACE_FLOOR_PERCENTILE,
 } from '../src/lib/math/pockets';
 
@@ -101,6 +102,9 @@ const acrossOne = detectPocketsAcrossExpirations(
 );
 const wallExcluded = !acrossOne.find((p) => Math.abs(p.strike - 755) <= 0.5);
 console.log('  wall@$755 ±$0.50 excluded:', wallExcluded ? 'OK' : 'FAIL');
+if (!wallExcluded) {
+  console.log('  DEBUG acrossOne:', acrossOne.map((p) => `${p.type}@$${p.strike}`));
+}
 
 // Note: the surface-floor mechanism is data-shape-dependent and best
 // validated against real SPY chains. In synthetic fixtures with
@@ -111,3 +115,93 @@ console.log('  wall@$755 ±$0.50 excluded:', wallExcluded ? 'OK' : 'FAIL');
 
 console.log();
 console.log('Surface floor percentile default:', DEFAULT_SURFACE_FLOOR_PERCENTILE);
+
+// ════════════════════════════════════════════════════════════════════
+// Dead-zone tests (commit 6 of PR2)
+// ════════════════════════════════════════════════════════════════════
+
+console.log();
+console.log('Dead-zone defaults:', DEFAULT_DEAD_ZONE_OPTIONS);
+
+// Test 1: canonical dead zone above the wall.
+// Build a single-expiry surface with:
+//   - Call wall at $755, peak |GEX| = 1e7
+//   - In-corridor strikes $745-755 with moderate GEX (0.3 * peak)
+//   - Above-wall strikes $760-770 at uniform 3e5 (3% of peak,
+//     below the 5% absoluteFloorRatio)
+// Expected: every above-wall strike $760-770 flagged as dead_zone.
+{
+  const peakGex = 1e7;
+  const exposures: Array<{ strike: number; netGEX: number }> = [];
+  for (let k = 745; k <= 754; k++) exposures.push({ strike: k, netGEX: peakGex * 0.3 });
+  exposures.push({ strike: 755, netGEX: peakGex });
+  for (let k = 760; k <= 770; k += 2.5) exposures.push({ strike: k, netGEX: 3e5 });
+
+  const out = detectPocketsAcrossExpirations(
+    [{ expiration: '2026-07-17', dte: 14, exposures }],
+    750,
+    { callWall: 755, putWall: 745 },
+  );
+  const dzAboveWall = out.filter((p) => p.type === 'dead_zone' && p.strike > 755.5);
+  const expectedStrikes = [760, 762.5, 765, 767.5, 770];
+  const allFlagged = expectedStrikes.every((s) => dzAboveWall.some((p) => Math.abs(p.strike - s) < 1e-6));
+  console.log();
+  console.log('Test 1 — canonical dead zone above wall:');
+  console.log(`  expected ${expectedStrikes.length} dead_zones at $760-770, got ${dzAboveWall.length}:`, allFlagged ? 'OK' : 'FAIL');
+  if (!allFlagged) {
+    console.log('  detected dead_zones above wall:', dzAboveWall.map((p) => `$${p.strike} deadness=${p.deadness?.toFixed(4)}`));
+  }
+}
+
+// Test 2: quiet-expiry rejection.
+// Two expiries: a busy one (peak 1e7) and a quiet one (peak 5% of busy peak).
+// Even though every strike in the quiet expiry is "thin" by its own
+// expiryPeak, the expiry-relevance gate (default 10% of global peak)
+// rejects all of them.
+{
+  const busyExposures: Array<{ strike: number; netGEX: number }> = [];
+  for (let k = 745; k <= 770; k++) busyExposures.push({ strike: k, netGEX: 1e7 * (k === 755 ? 1 : 0.3) });
+  const quietExposures: Array<{ strike: number; netGEX: number }> = [];
+  // Quiet expiry: peak 5% of busy peak (5e5). All other strikes way below.
+  for (let k = 745; k <= 770; k++) quietExposures.push({ strike: k, netGEX: k === 755 ? 5e5 : 1e3 });
+
+  const out = detectPocketsAcrossExpirations(
+    [
+      { expiration: '2026-07-17', dte: 14, exposures: busyExposures },
+      { expiration: '2026-08-21', dte: 49, exposures: quietExposures },
+    ],
+    750,
+    { callWall: 755, putWall: 745 },
+  );
+  const dzQuiet = out.filter((p) => p.type === 'dead_zone' && p.expiry === '2026-08-21');
+  console.log();
+  console.log('Test 2 — quiet-expiry rejection:');
+  console.log(`  quiet-expiry dead_zones (expect 0): ${dzQuiet.length}`, dzQuiet.length === 0 ? 'OK' : 'FAIL');
+}
+
+// Test 3: in-corridor strike rejection.
+// A strike between the walls with absolutely tiny |GEX| should be a
+// void (existing detector catches relative thinness) but NOT a
+// dead_zone (scope restriction excludes in-corridor strikes).
+{
+  const exposures: Array<{ strike: number; netGEX: number }> = [];
+  for (let k = 745; k <= 770; k++) {
+    if (k === 750) {
+      exposures.push({ strike: k, netGEX: 1e4 }); // thin in-corridor strike
+    } else {
+      exposures.push({ strike: k, netGEX: 1e7 * (k === 755 ? 1 : 0.5) });
+    }
+  }
+  const out = detectPocketsAcrossExpirations(
+    [{ expiration: '2026-07-17', dte: 14, exposures }],
+    750,
+    { callWall: 755, putWall: 745 },
+  );
+  const k750 = out.filter((p) => Math.abs(p.strike - 750) < 1e-6);
+  const isVoid = k750.some((p) => p.type === 'void');
+  const isDeadZone = k750.some((p) => p.type === 'dead_zone');
+  console.log();
+  console.log('Test 3 — in-corridor strike rejection:');
+  console.log(`  $750 fires as void (in-corridor thin):`, isVoid ? 'OK' : 'FAIL');
+  console.log(`  $750 NOT classified as dead_zone:`, !isDeadZone ? 'OK' : 'FAIL');
+}
