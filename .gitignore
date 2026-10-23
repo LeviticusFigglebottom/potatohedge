@@ -12,3 +12,6 @@ data/*.db
 data/*.db-journal
 data/*.db-wal
 entropy_engine.log
+
+# Python bytecode
+__pycache__/

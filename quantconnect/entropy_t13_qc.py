@@ -2,32 +2,39 @@
 from AlgorithmImports import *
 # endregion
 """
-Entropy T13 — QuantConnect (LEAN) backtest.
+Entropy — QuantConnect (LEAN) backtest. Defaults to QC v2 + Gallacher.
 
-Runs the strategy described in EntropyIntegration/New Text Document.txt
-("T13 spec") on QuantConnect's historical SPY option data, which includes
-per-contract daily volume — the input the website never archived.
+Runs on QuantConnect's historical SPY option data (daily bars with
+per-contract volume). No parameters are needed: the default reproduces the
+QC v2 + Gallacher algorithm as closely as it can be recovered.
 
 Parameter `variant` (Project → Parameters):
-  "spec"     (default) Everything as the T13 spec states it: metric
-             definitions, IV solver, d1cv bookkeeping, sizing with margin
-             checks, spreads executed, September still records metrics,
-             no same-day re-entry.
-  "website"  What potatohedge's TypeScript engine did before the Oct-2026
-             fixes: its metric definitions (prem uses max(vol,1), dollar
-             gamma without mid/volume, summed spreads, different moneyness/
-             charm buckets, puts-only skew), the erf-instead-of-CDF bug,
-             0.95*pv sizing without margin checks, spreads never executed,
-             September skipped before metrics are stored, same-day re-entry
-             allowed.
+  "v2"       (default) QC v2 + Gallacher defense, ported from entropy_engine.py
+             on branch claude/sync-qc-framework-LWVUy (synced line-by-line to
+             the QC v2 source in March 2026, never merged):
+               - P30 entropy thresholds, z-score strength, MIN_STRENGTH 0.20
+               - pcr_vol contrarian, VolCollapse = drop > P85 of daily drops
+               - metric definitions of v2 (relative spreads, BSM charm, ...)
+               - sizing 6% + 8% x strength, max 20 contracts, credit margin 2x
+               - exits: debit TP +80% / SL -60%, credit TP +50% / SL -150%, 5 DTE
+               - Gallacher: IV percentile/floor + SPY MAD regime; STRESSED halves
+                 credit size, EXTREME blocks credit entries; sticky decay
+             RECONSTRUCTED where the port was incomplete:
+               - spreads are executed (the port only logged them), sized like singles
+               - positions stack up to 3 per signal / 8 total (v2's caps); set
+                 parameter one_per_signal=true for the port's 1-per-strategy gate
+               - September stores metrics and manages positions, no new entries
+  "spec"     The superseded T13 spec (EntropyIntegration/New Text Document.txt).
+  "website"  What potatohedge's live TypeScript engine did before the Oct-2026
+             fixes (T13 port with its own metric quirks, the erf-instead-of-CDF
+             bug, no spreads, 0.95*pv sizing).
 
 Other parameters: start (YYYY-MM-DD, default 2026-04-17), end (default
 2026-10-22), strike_levels (default 150 strike levels each side of ATM).
 
-Timing: chains are daily bars (end-of-day bid/ask + the day's volume), so
-metrics are computed from the close and orders are sent the next morning a
-minute after the open — the same next-open timing the live site had. LEAN
-fills them against the latest available quote.
+Timing: metrics come from each day's closing chain; orders are sent the next
+morning. On daily data LEAN converts them to market-on-close, so fills land at
+the next day's close.
 
 Results: logged at the end and saved to the Object Store as
 entropy_t13_<variant>_trades.csv and entropy_t13_<variant>_metrics.csv.
@@ -512,15 +519,324 @@ def compute_contracts(alloc, mid, strike, qty_sign, pv):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  QC v2 + GALLACHER (default variant)
+#  Source: entropy_engine.py on branch claude/sync-qc-framework-LWVUy,
+#  which a March-2026 session synced line-by-line to the QC v2 algorithm
+#  (commits 8c4246a, 5bc3594, 5f66247). Reconstructions where that port was
+#  incomplete are marked "RECONSTRUCTED".
+# ═══════════════════════════════════════════════════════════════════
+
+V2_BASE_ALLOC = 0.06
+V2_MAX_ALLOC = 0.14
+V2_MAX_CONTRACTS = 20
+V2_MAX_POSITIONS = 8
+V2_MAX_PER_SIGNAL_TYPE = 3
+V2_ENTROPY_PERCENTILE = 30
+V2_VOLCOLLAPSE_PERCENTILE = 85
+V2_PCR_PERCENTILE = 80
+V2_MIN_STRENGTH = 0.20
+V2_TP_DEBIT, V2_TP_CREDIT = 0.80, 0.50
+V2_SL_DEBIT, V2_SL_CREDIT = -0.60, -1.50
+
+# Gallacher defense
+IV_STRESSED_PCT, IV_EXTREME_PCT = 80, 95
+IV_STRESSED_FLOOR, IV_EXTREME_FLOOR = 0.18, 0.25
+MAD_STRESSED_MULT, MAD_EXTREME_MULT = 1.5, 2.5
+MAD_STRESSED_FLOOR, MAD_EXTREME_FLOOR = 0.008, 0.015
+MAD_WINDOW = 10
+MAD_BASELINE_LOOKBACK = 42
+STRESSED_SIZE_MULT = 0.50
+REGIME_COOLDOWN_DAYS = 5
+REGIME_LEVELS = {"NORMAL": 0, "STRESSED": 1, "EXTREME": 2}
+CREDIT_TYPES = ("sell_put", "sell_put_spread")
+
+
+def build_records_v2(contracts, spot):
+    recs = []
+    for c in contracts:
+        mid, bid = c["mid"], c["bid"]
+        if mid <= 0 or bid <= 0 or c["dte"] <= 0:
+            continue
+        K, T, is_call = c["strike"], c["dte"] / 365.0, c["is_call"]
+        iv = bsm_iv(mid, spot, K, T, RISK_FREE, is_call)
+        if iv is None:
+            continue
+        g = bsm_greeks(spot, K, T, RISK_FREE, iv, is_call)
+        sq = math.sqrt(T)
+        d1 = (math.log(spot / K) + (RISK_FREE + 0.5 * iv * iv) * T) / (iv * sq)
+        d2 = d1 - iv * sq
+        charm = -npdf(d1) * (2 * RISK_FREE * T - d2 * iv * sq) / (2 * T * iv * sq)
+        recs.append({
+            "symbol": c["symbol"], "strike": K, "expiry": c["expiry"], "dte": c["dte"],
+            "is_call": is_call, "mid": mid, "bid": bid, "ask": c["ask"],
+            "spread": (c["ask"] - bid) / mid,   # relative spread in v2
+            "volume": c["volume"], "iv": iv, "delta": g["delta"], "gamma": g["gamma"],
+            "vega": g["vega"], "theta": g["theta"], "charm": charm, "moneyness": K / spot,
+        })
+    return recs
+
+
+def compute_entropy_v2(recs, spot):
+    m = {}
+    ve = _by_key(recs, "expiry", lambda r: r["volume"])
+    m["H_vol_term_n"] = h_norm(ve) if ve.sum() > 0 else None
+    vk = _by_key(recs, "strike", lambda r: r["volume"])
+    m["H_vol_k_n"] = h_norm(vk) if vk.sum() > 0 else None
+    pe = np.abs(_by_key(recs, "expiry", lambda r: r["mid"] * r["volume"] * 100))
+    m["H_prem_term_n"] = h_norm(pe) if pe.sum() > 0 else None
+    vv = _by_key(recs, "strike", lambda r: abs(r["vega"]) * r["volume"])
+    m["H_vegavol_n"] = h_norm(vv) if vv.sum() > 0 else None
+
+    da = _by_key(recs, "strike", lambda r: abs(r["gamma"]) * r["volume"] * spot * 100)
+    if da.sum() > 0:
+        m["dgamma_conc5"] = float(sum(np.sort(da)[::-1][:5]) / da.sum())
+        m["H_dgamma_n"] = h_norm(da)
+    else:
+        m["dgamma_conc5"] = m["H_dgamma_n"] = None
+
+    gv = _by_key(recs, "strike", lambda r: abs(r["gamma"]) * r["volume"])
+    m["H_gvx_n"] = h_norm(gv) if gv.sum() > 0 else None
+
+    edges = np.linspace(0, 1, 11)
+    dflow = np.zeros(10)
+    for r in recs:
+        ad = abs(r["delta"])
+        for b in range(10):
+            if edges[b] <= ad < edges[b + 1]:
+                dflow[b] += r["volume"]
+                break
+    m["H_dflow_n"] = h_norm(dflow) if dflow.sum() > 0 else None
+
+    sl = {}
+    for r in recs:
+        if r["spread"] > 0 and r["volume"] > 0:
+            sl[r["strike"]] = sl.get(r["strike"], 0.0) + r["volume"] / r["spread"]
+    sps = np.array(list(sl.values())) if sl else np.array([])
+    m["H_spread_k_n"] = h_norm(sps) if len(sps) > 0 and sps.sum() > 0 else 0.5
+
+    mb = [0.85 + i * 0.02 for i in range(16)]
+    mv = np.zeros(len(mb) - 1)
+    for r in recs:
+        for b in range(len(mb) - 1):
+            if mb[b] <= r["moneyness"] < mb[b + 1]:
+                mv[b] += r["volume"]
+                break
+    m["H_moneyness_n"] = h_norm(mv) if mv.sum() > 0 else None
+
+    cb = list(range(MIN_DTE, MAX_DTE + 2, 5))
+    cv = np.zeros(len(cb) - 1)
+    for r in recs:
+        for b in range(len(cb) - 1):
+            if cb[b] <= r["dte"] < cb[b + 1]:
+                cv[b] += abs(r["charm"])
+                break
+    m["H_charm_n"] = h_norm(cv) if cv.sum() > 0 else None
+
+    atm_near = [r for r in recs if 0.97 <= r["moneyness"] <= 1.03 and r["dte"] <= 30]
+    m["iv_mean"] = float(np.mean([r["iv"] for r in (atm_near or recs)]))
+
+    near_puts = [r for r in recs if not r["is_call"] and 14 <= r["dte"] <= 45]
+    atm = [r["iv"] for r in near_puts if 0.98 <= r["moneyness"] <= 1.02]
+    otm = [r["iv"] for r in near_puts if 0.90 <= r["moneyness"] <= 0.95]
+    m["put_skew"] = float(np.mean(otm) - np.mean(atm)) if atm and otm else None
+
+    calls = [r for r in recs if r["is_call"]]
+    puts = [r for r in recs if not r["is_call"]]
+    cprem = sum(r["mid"] * r["volume"] for r in calls)
+    pprem = sum(r["mid"] * r["volume"] for r in puts)
+    m["pcr_dollar"] = float(pprem / cprem) if cprem > 0 else None
+    cvol = sum(r["volume"] for r in calls)
+    pvol = sum(r["volume"] for r in puts)
+    m["pcr_vol"] = float(pvol / cvol) if cvol > 0 else None
+
+    cv_vals = [m[k] for k in ("H_vol_term_n", "H_vol_k_n", "H_prem_term_n", "H_dflow_n")
+               if m.get(k) is not None]
+    m["comp_volume"] = _mean_or_none(cv_vals)
+    cg_vals = [m[k] for k in ("H_vegavol_n", "H_dgamma_n", "H_gvx_n", "H_spread_k_n", "H_charm_n")
+               if m.get(k) is not None]
+    m["comp_greek"] = _mean_or_none(cg_vals)
+    all_v = [m[k] for k in ENTROPY_KEYS if m.get(k) is not None]
+    m["composite"] = _mean_or_none(all_v)
+    return m
+
+
+def _std(history, key):
+    vals = [h[key] for h in list(history)[-LOOKBACK:] if h.get(key) is not None]
+    return float(np.std(vals)) if len(vals) > 1 else 0.01
+
+
+def _zstrength(val, key, history):
+    m, s = med(history, key), _std(history, key)
+    if m is None or s < 1e-8:
+        return 0.0
+    return max(0.0, min(1.0, (m - val) / s / 3.0))
+
+
+def evaluate_signals_v2(metrics, history):
+    sigs = {}
+    ep = V2_ENTROPY_PERCENTILE
+    cv, cg, co = metrics.get("comp_volume"), metrics.get("comp_greek"), metrics.get("composite")
+    iv, ps, pcr = metrics.get("iv_mean"), metrics.get("put_skew"), metrics.get("pcr_vol")
+    t_cv, t_cg = pct(history, "comp_volume", ep), pct(history, "comp_greek", ep)
+    t_cc, t_iv = pct(history, "composite", ep), pct(history, "iv_mean", ep)
+    ps_m, iv_m = med(history, "put_skew"), med(history, "iv_mean")
+
+    def sig(fire, s, tt, why):
+        return {"fire": bool(fire and s >= V2_MIN_STRENGTH), "strength": float(s),
+                "trade_type": tt, "rationale": why}
+
+    if cv is not None and t_cv is not None:
+        fire = cv < t_cv
+        s = _zstrength(cv, "comp_volume", history) if fire else 0.0
+        tt = "buy_call" if (iv and iv_m and iv < iv_m) else "sell_put"
+        sigs["S_LowVolEnt"] = sig(fire, s, tt, f"cv={cv:.4f} p{ep}={t_cv:.4f}")
+
+    h = list(history)
+    if len(h) >= 2:
+        vals = [x.get("comp_volume") for x in h if x.get("comp_volume") is not None]
+        curr = metrics.get("comp_volume")
+        prev = vals[-2] if len(vals) >= 2 else None   # history includes today
+        if prev is not None and curr is not None:
+            drop = prev - curr
+            hv = [x.get("comp_volume") for x in h]
+            drops = [hv[i - 1] - hv[i] for i in range(1, len(hv))
+                     if hv[i - 1] is not None and hv[i] is not None]
+            if drops and drop > 0:
+                thresh = float(np.percentile(drops, V2_VOLCOLLAPSE_PERCENTILE))
+                fire = drop > thresh
+                s = max(V2_MIN_STRENGTH, min(1.0, drop / (thresh + 1e-8) - 1.0)) if fire else 0.0
+                sigs["S_VolCollapse"] = sig(fire, s, "bull_call_spread",
+                                            f"drop={drop:.4f} p85={thresh:.4f}")
+
+    if None not in (co, t_cc, iv, t_iv):
+        fire = co < t_cc and iv < t_iv
+        s = _zstrength(co, "composite", history) if fire else 0.0
+        sigs["S_LowEntLowIV"] = sig(fire, s, "buy_call_longer", f"co={co:.4f} iv={iv:.4f}")
+
+    if cg is not None and t_cg is not None:
+        fire = cg < t_cg
+        s = _zstrength(cg, "comp_greek", history) if fire else 0.0
+        sigs["S_LowGreekEnt"] = sig(fire, s, "sell_put", f"cg={cg:.4f} p{ep}={t_cg:.4f}")
+
+    if None not in (cv, t_cv, ps, ps_m):
+        fire = cv < t_cv and ps > ps_m and ps > 0.01
+        s = _zstrength(cv, "comp_volume", history) if fire else 0.0
+        sigs["S_SkewFlow"] = sig(fire, s, "sell_put_spread", f"cv={cv:.4f} sk={ps:.4f}")
+
+    if pcr is not None:
+        p80 = pct(history, "pcr_vol", V2_PCR_PERCENTILE)
+        if p80 is not None:
+            fire = pcr > p80
+            s = min(1.0, (pcr - p80) / (_std(history, "pcr_vol") + 1e-8)) if fire else 0.0
+            sigs["S_PCRContrarian"] = sig(fire, s, "sell_put", f"pcr_vol={pcr:.4f} p80={p80:.4f}")
+    return sigs
+
+
+def select_contract_v2(recs, tt, used):
+    avail = [r for r in recs if r["symbol"] not in used]
+    elig = [r for r in avail if MIN_DTE <= r["dte"] <= MAX_DTE]
+    if not elig:
+        return None
+    elig.sort(key=lambda r: abs(r["dte"] - TARGET_DTE))
+    best_exp = elig[0]["expiry"]
+    ae = [r for r in elig if r["expiry"] == best_exp]
+    ca = sorted([r for r in ae if r["is_call"]], key=lambda r: r["strike"])
+    pa = sorted([r for r in ae if not r["is_call"]], key=lambda r: r["strike"])
+    atm_k = min(ae, key=lambda r: abs(r["moneyness"] - 1.0))["strike"]
+
+    if tt == "buy_call":
+        cs = [r for r in ca if 0.99 <= r["moneyness"] <= 1.01 and r["mid"] > 0.10]
+        if not cs:
+            cs = [r for r in ca if abs(r["strike"] - atm_k) <= 2 and r["mid"] > 0]
+        if cs:
+            c = min(cs, key=lambda r: abs(r["moneyness"] - 1.0))
+            if c["spread"] < SPREAD_FILTER:
+                return {"type": "single", "contract": c, "qty_sign": 1}
+    elif tt == "buy_call_longer":
+        lo = [r for r in avail if r["is_call"] and 25 <= r["dte"] <= 45
+              and 0.99 <= r["moneyness"] <= 1.01 and r["mid"] > 0.10]
+        if lo:
+            # v2 picks DTE closest to 35; ties broken by moneyness (chain order is arbitrary in LEAN)
+            c = min(lo, key=lambda r: (abs(r["dte"] - 35), abs(r["moneyness"] - 1.0)))
+            if c["spread"] < SPREAD_FILTER:
+                return {"type": "single", "contract": c, "qty_sign": 1}
+    elif tt == "sell_put":
+        ot = [r for r in pa if 0.96 <= r["moneyness"] <= 0.98 and r["mid"] > 0.10]
+        if ot:
+            # v2 takes min(|dte-28|) within one expiry, i.e. the first (lowest-strike) candidate
+            c = min(ot, key=lambda r: abs(r["dte"] - TARGET_DTE))
+            if c["spread"] < SPREAD_FILTER:
+                return {"type": "single", "contract": c, "qty_sign": -1}
+    elif tt == "bull_call_spread":
+        lc = [r for r in ca if 0.99 <= r["moneyness"] <= 1.01 and r["mid"] > 0]
+        sc = [r for r in ca if 1.02 <= r["moneyness"] <= 1.04 and r["mid"] > 0]
+        if lc and sc:
+            l = min(lc, key=lambda r: abs(r["moneyness"] - 1.0))
+            s = min(sc, key=lambda r: abs(r["moneyness"] - 1.03))
+            if l["expiry"] == s["expiry"] and l["mid"] > s["mid"]:
+                return {"type": "spread", "long": l, "short": s}
+    elif tt == "sell_put_spread":
+        spl = [r for r in pa if 0.97 <= r["moneyness"] <= 0.99 and r["mid"] > 0.10]
+        lp = [r for r in pa if 0.94 <= r["moneyness"] <= 0.96 and r["mid"] > 0.05]
+        if spl and lp:
+            s = min(spl, key=lambda r: abs(r["moneyness"] - 0.98))
+            l = min(lp, key=lambda r: abs(r["moneyness"] - 0.95))
+            if s["expiry"] == l["expiry"] and s["strike"] > l["strike"] and s["mid"] > l["mid"]:
+                return {"type": "spread", "short": s, "long": l}
+    return None
+
+
+def assess_regime(iv_mean, history, closes, current, trading_days, last_change_day):
+    """Gallacher defense: IV percentile + absolute floor, SPY mean-absolute-return
+    vs its baseline, with sticky one-level-per-cooldown decay."""
+    raw = "NORMAL"
+    h = list(history)
+    if len(h) >= LOOKBACK:
+        iv_hist = [x.get("iv_mean") for x in h[-LOOKBACK:] if x.get("iv_mean") is not None]
+        if len(iv_hist) >= LOOKBACK // 2:
+            p80 = float(np.percentile(iv_hist, IV_STRESSED_PCT))
+            p95 = float(np.percentile(iv_hist, IV_EXTREME_PCT))
+            if iv_mean > p95 and iv_mean > IV_EXTREME_FLOOR:
+                raw = "EXTREME"
+            elif iv_mean > p80 and iv_mean > IV_STRESSED_FLOOR:
+                raw = "STRESSED"
+
+    closes = list(closes)
+    if len(closes) >= MAD_WINDOW + MAD_BASELINE_LOOKBACK:
+        rets = [abs(closes[i] / closes[i - 1] - 1) for i in range(1, len(closes))]
+        cur_mad = float(np.mean(rets[-MAD_WINDOW:]))
+        mad_hist = [float(np.mean(rets[j - MAD_WINDOW:j])) for j in range(MAD_WINDOW, len(rets))]
+        base_len = min(len(mad_hist), MAD_BASELINE_LOOKBACK)
+        if base_len >= LOOKBACK:
+            mad_med = float(np.median(mad_hist[-base_len:]))
+            if mad_med > 0:
+                ratio = cur_mad / mad_med
+                if ratio > MAD_EXTREME_MULT and cur_mad > MAD_EXTREME_FLOOR:
+                    raw = "EXTREME"
+                elif ratio > MAD_STRESSED_MULT and cur_mad > MAD_STRESSED_FLOOR and raw != "EXTREME":
+                    raw = "STRESSED"
+
+    cur_lvl, raw_lvl = REGIME_LEVELS.get(current, 0), REGIME_LEVELS[raw]
+    if raw_lvl >= cur_lvl:
+        return raw
+    if trading_days - last_change_day >= REGIME_COOLDOWN_DAYS:
+        lvl = max(raw_lvl, cur_lvl - 1)
+        return {0: "NORMAL", 1: "STRESSED", 2: "EXTREME"}[lvl]
+    return current
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  ALGORITHM
 # ═══════════════════════════════════════════════════════════════════
 
 class EntropyT13(QCAlgorithm):
 
     def initialize(self):
-        self.variant = (self.get_parameter("variant") or "spec").strip().lower()
-        if self.variant not in ("spec", "website"):
-            raise ValueError("variant must be 'spec' or 'website'")
+        self.variant = (self.get_parameter("variant") or "v2").strip().lower()
+        if self.variant not in ("v2", "spec", "website"):
+            raise ValueError("variant must be 'v2', 'spec' or 'website'")
+        # v2 only: "true" restores the website port's one-open-position-per-strategy gate
+        self.one_per_signal = (self.get_parameter("one_per_signal") or "false").strip().lower() == "true"
         start = datetime.strptime(self.get_parameter("start") or "2026-04-17", "%Y-%m-%d")
         end = datetime.strptime(self.get_parameter("end") or "2026-10-22", "%Y-%m-%d")
         strike_levels = int(self.get_parameter("strike_levels") or 150)
@@ -536,7 +852,27 @@ class EntropyT13(QCAlgorithm):
                           .expiration(MIN_DTE, MAX_DTE))
         self.option_symbol = option.symbol
 
-        self.cdf = ncdf if self.variant == "spec" else ncdf_website_bug
+        self.cdf = ncdf_website_bug if self.variant == "website" else ncdf
+        if self.variant == "v2":
+            self.tp_debit, self.sl_debit = V2_TP_DEBIT, V2_SL_DEBIT
+            self.tp_credit, self.sl_credit = V2_TP_CREDIT, V2_SL_CREDIT
+        else:
+            self.tp_debit, self.sl_debit = 1.0, -(STOP_MULT - 1)
+            self.tp_credit, self.sl_credit = PROFIT_PCT, -STOP_MULT
+
+        # Gallacher state (v2). SPY closes seeded from history so the MAD
+        # check (needs 52 closes) is live from the first trading day.
+        self.closes = deque(maxlen=MAD_WINDOW + MAD_BASELINE_LOOKBACK + 5)
+        try:
+            seed = self.history(self.spy, MAD_WINDOW + MAD_BASELINE_LOOKBACK + 5, Resolution.DAILY)
+            for close in seed["close"].values:
+                self.closes.append(float(close))
+        except Exception as err:
+            self.debug(f"close-history seed failed: {err}")
+        self.regime = "NORMAL"
+        self.trading_days = 0
+        self.last_regime_change_day = 0
+        self.regime_days = {}
         self.history = deque(maxlen=HISTORY_DAYS)
         self.positions = []          # strategy book (spec Section 15 "positions")
         self.next_id = 1
@@ -561,6 +897,7 @@ class EntropyT13(QCAlgorithm):
             return
         self.last_data_date = day
         spot = float(bar.close)
+        self.closes.append(spot)
 
         contracts = []
         for c in chain:
@@ -579,11 +916,16 @@ class EntropyT13(QCAlgorithm):
             self.manage_positions(day, spot)
             return
 
-        recs = build_records(contracts, spot, self.cdf)
+        if self.variant == "v2":
+            recs = build_records_v2(contracts, spot)
+        else:
+            recs = build_records(contracts, spot, self.cdf)
         if len(recs) < 10:
             self.debug(f"{day}: only {len(recs)} valid records, skipping")
             return
-        m = (compute_entropy_spec if self.variant == "spec" else compute_entropy_website)(recs, spot)
+        compute = {"v2": compute_entropy_v2, "spec": compute_entropy_spec,
+                   "website": compute_entropy_website}[self.variant]
+        m = compute(recs, spot)
         self.history.append(dict(m))
         self.metric_rows.append((day, spot, len(recs), m))
 
@@ -594,11 +936,28 @@ class EntropyT13(QCAlgorithm):
         if september:
             return
 
-        sigs = evaluate_signals(m, self.history, self.variant)
+        if self.variant == "v2":
+            sigs = evaluate_signals_v2(m, self.history)
+        else:
+            sigs = evaluate_signals(m, self.history, self.variant)
         for name, s in sigs.items():
             if s["fire"]:
                 self.signal_counts[name] = self.signal_counts.get(name, 0) + 1
-        self.enter_positions(day, recs, {k: v for k, v in sigs.items() if v["fire"]})
+        firing = {k: v for k, v in sigs.items() if v["fire"]}
+
+        if self.variant == "v2":
+            self.trading_days += 1
+            if m.get("iv_mean") is not None:
+                new = assess_regime(m["iv_mean"], self.history, self.closes, self.regime,
+                                    self.trading_days, self.last_regime_change_day)
+                if new != self.regime:
+                    self.last_regime_change_day = self.trading_days
+                    self.debug(f"{day}: regime {self.regime} -> {new}")
+                    self.regime = new
+            self.regime_days[self.regime] = self.regime_days.get(self.regime, 0) + 1
+            self.enter_positions_v2(day, recs, firing)
+        else:
+            self.enter_positions(day, recs, firing)
 
     # ── position book helpers ──────────────────────────────────────
 
@@ -646,15 +1005,15 @@ class EntropyT13(QCAlgorithm):
             if basis <= 0:
                 continue
             if pos["is_credit"]:
-                if pnl >= basis * PROFIT_PCT:
+                if pnl >= basis * self.tp_credit:
                     self.close(pos, day, "TP")
-                elif pnl < -basis * STOP_MULT:
+                elif pnl < basis * self.sl_credit:
                     self.close(pos, day, "SL")
             else:
-                if pnl < -basis * (STOP_MULT - 1):
-                    self.close(pos, day, "SL")
-                elif pnl >= basis:
+                if pnl >= basis * self.tp_debit:
                     self.close(pos, day, "TP")
+                elif pnl < basis * self.sl_debit:
+                    self.close(pos, day, "SL")
 
     def close(self, pos, day, reason):
         pos["closing"] = True
@@ -745,6 +1104,83 @@ class EntropyT13(QCAlgorithm):
             if tt in LONG_CALL_TYPES:
                 active_lc.add(name)
 
+    def open_position(self, day, name, tt, legs, entry_price, is_credit, strike, expiry, width):
+        pos = {
+            "id": self.next_id, "strategy": name, "trade_type": tt, "legs": legs,
+            "strike": strike, "expiry": expiry, "width": width, "is_credit": is_credit,
+            "entry_date": day, "entry_price": entry_price,
+            "entry_cost": entry_price * 100 * abs(legs[0][1]),
+            "open": True, "closing": False, "close_date": None, "close_reason": None,
+            "cash_open": 0.0, "cash_close": 0.0, "open_filled": False,
+            "open_fills": 0, "close_fills": 0,
+        }
+        self.next_id += 1
+        self.positions.append(pos)
+        for sym, qty in legs:
+            self.pending.append((sym, qty, f"{pos['id']}:open"))
+        return pos
+
+    def enter_positions_v2(self, day, recs, firing):
+        """QC v2 entries: strength-scaled allocation, position caps, Gallacher
+        filter on credit trades."""
+        if not firing:
+            return
+        active = [p for p in self.positions if p["open"] and not p["closing"]]
+        blocked = {p["strategy"] for p in active} if self.one_per_signal else set()
+        actionable = [k for k in firing if k not in blocked]
+        pv = float(self.portfolio.total_portfolio_value)
+        used = {sym for p in active for sym, _ in p["legs"]}
+
+        for name in sorted(actionable, key=lambda k: firing[k]["strength"], reverse=True):
+            sig = firing[name]
+            tt = sig["trade_type"]
+            if len(active) >= V2_MAX_POSITIONS:
+                break
+            if sum(1 for p in active if p["strategy"] == name) >= V2_MAX_PER_SIGNAL_TYPE:
+                continue
+            if tt in LONG_CALL_TYPES and \
+                    sum(1 for p in active if p["trade_type"] in LONG_CALL_TYPES) >= MAX_LONG_CALLS:
+                continue
+            sel = select_contract_v2(recs, tt, used)
+            if sel is None:
+                continue
+
+            budget = pv * (V2_BASE_ALLOC + (V2_MAX_ALLOC - V2_BASE_ALLOC) * sig["strength"])
+            if sel["type"] == "single":
+                c, qs = sel["contract"], sel["qty_sign"]
+                net = c["mid"] * qs * 100
+                n = int(budget / net) if net > 0 else int(budget / (abs(net) * 2))
+                legs_src = [(c, qs)]
+                entry_price, is_credit = c["mid"], qs < 0
+                strike, expiry, width = c["strike"], c["expiry"], 0.0
+            else:
+                # RECONSTRUCTED: the website port only logged spreads. Sized like
+                # singles: debit = net debit, credit = 2x net credit as margin.
+                lng, sht = sel["long"], sel["short"]
+                is_credit = tt == "sell_put_spread"
+                net = (sht["mid"] - lng["mid"]) if is_credit else (lng["mid"] - sht["mid"])
+                if net <= 0:
+                    continue
+                n = int(budget / (net * 100 * (2 if is_credit else 1)))
+                primary, secondary = (sht, lng) if is_credit else (lng, sht)
+                ps = -1 if is_credit else 1
+                legs_src = [(primary, ps), (secondary, -ps)]
+                entry_price = net
+                strike, expiry = primary["strike"], primary["expiry"]
+                width = abs(lng["strike"] - sht["strike"])
+            n = max(1, min(n, V2_MAX_CONTRACTS))
+
+            if tt in CREDIT_TYPES:
+                if self.regime == "EXTREME":
+                    continue
+                if self.regime == "STRESSED":
+                    n = max(1, int(n * STRESSED_SIZE_MULT))
+
+            legs = [(r["symbol"], n * sign) for r, sign in legs_src]
+            pos = self.open_position(day, name, tt, legs, entry_price, is_credit, strike, expiry, width)
+            active.append(pos)
+            used.update(sym for sym, _ in legs)
+
     # ── execution + fills ──────────────────────────────────────────
 
     def send_pending_orders(self):
@@ -821,6 +1257,8 @@ class EntropyT13(QCAlgorithm):
         if total_n:
             self.log(f"{'TOTAL':16s} trades={total_n:3d} win%={100 * total_w / total_n:.0f} "
                      f"pnl={total_p:+,.2f}")
+        if self.variant == "v2":
+            self.log("Regime days: " + ", ".join(f"{k}={v}" for k, v in sorted(self.regime_days.items())))
         self.log("Signals fired (days): " + ", ".join(f"{k}={v}" for k, v in sorted(self.signal_counts.items())))
         self.log(f"Open positions at end: {sum(1 for p in self.positions if p['open'])}")
         self.set_runtime_statistic("Variant", self.variant)
