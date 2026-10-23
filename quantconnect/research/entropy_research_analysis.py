@@ -187,12 +187,12 @@ class EntropyResearch(QCAlgorithm):
             pnl = (val - entry) * 100 - (cost + xcost) * 100
             r = pnl / basis
             if dte <= CLOSE_DTE:
-                return r, pnl, basis
+                return r, pnl, basis, j, lk
             if is_credit:
                 if r >= e["tp_c"] or r < e["sl_c"]:
-                    return r, pnl, basis
+                    return r, pnl, basis, j, lk
             elif r >= e["tp_d"] or r < e["sl_d"]:
-                return r, pnl, basis
+                return r, pnl, basis, j, lk
         return None
 
     def trade_table(self):
@@ -433,6 +433,260 @@ class EntropyResearch(QCAlgorithm):
                                  "same_sign_periods", "periods", "spread_2024_26"], out)
         self._screen_rows = rows
 
+    def targets(self):
+        t = self.trade_table()
+        n = len(self.dates)
+        S = self.spot
+        fwd = {}
+        for h in (5, 21):
+            f = np.full(n, np.nan)
+            f[:-h] = S[h:] / S[:-h] - 1
+            fwd[f"ret{h}"] = f
+        lr = np.full(n, np.nan)
+        lr[1:] = np.log(S[1:] / S[:-1])
+        rv = np.full(n, np.nan)
+        for i in range(n - 21):
+            rv[i] = np.std(lr[i + 1:i + 22]) * math.sqrt(252)
+        fwd["rv21"] = rv
+        iv30 = self.col("atm_iv_30")
+        div = np.full(n, np.nan)
+        div[:-5] = iv30[5:] - iv30[:-5]
+        fwd["div5"] = div
+        fwd["vrp21"] = iv30 - rv
+        for s_ in STRUCTURES:
+            fwd[f"tr_{s_}"] = t[(s_, "t13")]
+        return fwd
+
+    def quintiles(self):
+        """Point-in-time quintile (0..4) of every feature x transform."""
+        n = len(self.dates)
+        features = [k for k in self.rows[0].keys() if k not in ("date", "spot", "t13_n", "w_n",
+                                                                  "s_n", "a_n")]
+        out = {}
+        for fname in features:
+            x = self.col(fname)
+            if np.isfinite(x).sum() < 500:
+                continue
+            for tname, z in self.transforms(x).items():
+                q = np.full(n, -1, dtype=np.int8)
+                for i in range(252, n):
+                    w = z[i - 252:i + 1]
+                    w = w[np.isfinite(w)]
+                    if len(w) >= 100 and np.isfinite(z[i]):
+                        q[i] = min(int((w < z[i]).mean() * 5), 4)
+                out[(fname, tname)] = q
+        return out
+
+    def run_null(self):
+        """Family-wise calibration: circularly shift every feature's quintile series
+        against the targets (keeps autocorrelation, breaks any real link) and record
+        the best consistency score found by chance. Real results must beat it."""
+        fwd = self.targets()
+        Q = self.quintiles()
+        yrs = self.years()
+        pmask = [(yrs >= a) & (yrs <= b) for _, a, b in PERIODS]
+        keys = list(Q)
+        n = len(self.dates)
+
+        def scores(shift):
+            best = {}
+            for tg, arr in fwd.items():
+                fin = np.isfinite(arr)
+                top = []
+                for k in keys:
+                    q = np.roll(Q[k], shift) if shift else Q[k]
+                    vals = []
+                    for pm in pmask:
+                        lo = pm & fin & (q == 0)
+                        hi = pm & fin & (q == 4)
+                        if lo.sum() > 10 and hi.sum() > 10:
+                            vals.append(arr[lo].mean() - arr[hi].mean())
+                    if len(vals) < 5:
+                        continue
+                    vals = np.array(vals)
+                    if not (np.all(vals > 0) or np.all(vals < 0)):
+                        continue
+                    top.append((abs(vals.mean()) / (vals.std() + 1e-12), k, float(vals.mean()),
+                                float(vals[-1])))
+                top.sort(reverse=True)
+                best[tg] = top
+            return best
+
+        real = scores(0)
+        rng = np.random.default_rng(7)
+        nshift = int(self.get_parameter("shifts") or 40)
+        null_max = defaultdict(list)
+        for _ in range(nshift):
+            sh = int(rng.integers(252, n - 252))
+            b = scores(sh)
+            for tg in fwd:
+                null_max[tg].append(b[tg][0][0] if b[tg] else 0.0)
+        rows = []
+        for tg in fwd:
+            nm = np.array(null_max[tg])
+            for sc, k, m, rec in real[tg][:8]:
+                rows.append([tg, k[0], k[1], sc, float((nm >= sc).mean()), float(np.percentile(nm, 95)),
+                             m, rec])
+        self.emit("null", ["target", "feature", "transform", "score", "familywise_p", "null_p95",
+                           "mean_q1_q5", "spread_2024_26"], rows)
+
+    def run_strategies(self):
+        """Portfolio simulations of pre-registered rules. Entries on a fixed
+        5-trading-day ladder; each entry commits RISK_PCT of current equity as
+        margin (naked put: 15% of strike notional; spread: width). Equity is
+        marked on realised P&L at each trade's exit."""
+        RISK_PCT = 0.10
+        n = len(self.dates)
+        yrs = self.years()
+        ivz = self.transforms(self.col("a_iv_mean"))["z63"]
+        ent = self.transforms(self.col("s_H_callvol_k_n"))["dt252"]
+        # point-in-time tercile of the entropy filter (lower third = favourable for short puts)
+        ent_low = np.zeros(n, bool)
+        for i in range(252, n):
+            w = ent[i - 252:i + 1]
+            w = w[np.isfinite(w)]
+            if len(w) >= 100 and np.isfinite(ent[i]):
+                ent_low[i] = (w < ent[i]).mean() <= 0.4
+        rules = {
+            "A_put_every5": ("short_put", lambda i: True),
+            "B_put_ivhigh": ("short_put", lambda i: np.isfinite(ivz[i]) and ivz[i] > 0),
+            "C_put_entlow": ("short_put", lambda i: ent_low[i]),
+            "D_put_iv_ent": ("short_put", lambda i: np.isfinite(ivz[i]) and ivz[i] > 0 and ent_low[i]),
+            "E_spread_every5": ("put_spread", lambda i: True),
+            "E_spread_ivhigh": ("put_spread", lambda i: np.isfinite(ivz[i]) and ivz[i] > 0),
+            "Z_longcall_every5": ("long_call", lambda i: True),
+        }
+        cache = {}
+        rows, yrows = [], []
+        for name, (struct, ok) in rules.items():
+            for exits in ("t13", "v2"):
+                equity = 100_000.0
+                pending = defaultdict(float)   # exit index -> pnl
+                curve = np.full(n, np.nan)
+                trades = 0
+                wins = 0
+                for i in range(260, n - 1):
+                    equity += pending.pop(i, 0.0)
+                    curve[i] = equity
+                    if (i - 260) % 5 or not ok(i):
+                        continue
+                    key = (i, struct, exits)
+                    if key not in cache:
+                        cache[key] = self.simulate(i, struct, exits)
+                    res = cache[key]
+                    if res is None:
+                        continue
+                    r, pnl1, basis1, j, lk = res
+                    S0 = self.spot[i]
+                    if struct == "short_put":
+                        margin1 = lk[0][0] * 100 * 0.15
+                    elif struct == "put_spread":
+                        margin1 = abs(lk[0][0] - lk[1][0]) * 100
+                    else:
+                        margin1 = basis1
+                    qty = max(int(equity * RISK_PCT / margin1), 0)
+                    if qty == 0:
+                        continue
+                    pending[j] += pnl1 * qty
+                    trades += 1
+                    wins += pnl1 > 0
+                fin = np.isfinite(curve)
+                c = curve[fin]
+                ys = yrs[fin]
+                peak = np.maximum.accumulate(c)
+                dd = float((1 - c / peak).max())
+                total_years = fin.sum() / 252
+                cagr = (c[-1] / c[0]) ** (1 / total_years) - 1
+                daily = np.diff(c) / c[:-1]
+                sharpe = float(daily.mean() / (daily.std() + 1e-12) * math.sqrt(252))
+                rows.append([name, exits, trades, float(wins / max(trades, 1)), float(c[-1]),
+                             float(cagr), sharpe, dd])
+                for pname, a, b in PERIODS:
+                    sel = (ys >= a) & (ys <= b)
+                    if sel.sum() > 20:
+                        seg = c[sel]
+                        yrows.append([name, exits, pname, float(seg[-1] / seg[0] - 1),
+                                      float((1 - seg / np.maximum.accumulate(seg)).max())])
+        self.emit("strategies", ["rule", "exits", "trades", "win", "end_equity", "cagr", "sharpe",
+                                 "max_dd"], rows)
+        self.emit("strategies_periods", ["rule", "exits", "period", "return", "max_dd"], yrows)
+
+    def ladder(self, struct, exits, mask, risk_pct=0.10, cache=None):
+        """Same portfolio engine as run_strategies for an arbitrary entry mask."""
+        n = len(self.dates)
+        cache = self._ladder_cache if cache is None else cache
+        equity = 100_000.0
+        pending = defaultdict(float)
+        curve = []
+        for i in range(260, n - 1):
+            equity += pending.pop(i, 0.0)
+            curve.append(equity)
+            if (i - 260) % 5 or not mask[i]:
+                continue
+            key = (i, struct, exits)
+            if key not in cache:
+                cache[key] = self.simulate(i, struct, exits)
+            res = cache[key]
+            if res is None:
+                continue
+            r, pnl1, basis1, j, lk = res
+            margin1 = lk[0][0] * 100 * 0.15 if struct == "short_put" else abs(lk[0][0] - lk[1][0]) * 100
+            qty = max(int(equity * risk_pct / margin1), 0)
+            pending[j] += pnl1 * qty
+        c = np.array(curve)
+        daily = np.diff(c) / c[:-1]
+        sharpe = float(daily.mean() / (daily.std() + 1e-12) * math.sqrt(252))
+        dd = float((1 - c / np.maximum.accumulate(c)).max())
+        cagr = (c[-1] / c[0]) ** (252 / len(c)) - 1
+        return sharpe, dd, cagr
+
+    def low_tercile_mask(self, x, frac):
+        n = len(x)
+        m = np.zeros(n, bool)
+        for i in range(252, n):
+            w = x[i - 252:i + 1]
+            w = w[np.isfinite(w)]
+            if len(w) >= 100 and np.isfinite(x[i]):
+                m[i] = (w < x[i]).mean() <= frac
+        return m
+
+    def run_robust(self):
+        """Is the entropy filter better than trading on random days at the same
+        frequency? And how sensitive is it to its parameters?"""
+        self._ladder_cache = {}
+        n = len(self.dates)
+        rows = []
+        base = self.ladder("short_put", "t13", np.ones(n, bool))
+        rows.append(["A_all_days", "", "", base[0], base[1], base[2], ""])
+        variants = []
+        for feat in ["s_H_callvol_k_n", "a_H_callvol_k_n", "w_H_callvol_k_n", "t13_H_callvol_k_n",
+                     "s_H_vol_k_n", "s_H_putvol_k_n"]:
+            for tr in ["dt252", "pr252", "z63", "lvl"]:
+                for frac in (0.3, 0.4, 0.5):
+                    variants.append((feat, tr, frac))
+        rng = np.random.default_rng(11)
+        for feat, tr, frac in variants:
+            x = self.col(feat)
+            if np.isfinite(x).sum() < 500:
+                continue
+            z = self.transforms(x)[tr]
+            mask = self.low_tercile_mask(z, frac)
+            sh, dd, cg = self.ladder("short_put", "t13", mask)
+            # null: random masks with the same entry frequency
+            p = mask[260:].mean()
+            null_sh, null_dd = [], []
+            for _ in range(30):
+                rm = rng.random(n) < p
+                a, b, _ = self.ladder("short_put", "t13", rm)
+                null_sh.append(a)
+                null_dd.append(b)
+            rows.append([feat, tr, frac, sh, dd, cg,
+                         f"p_sharpe={np.mean(np.array(null_sh) >= sh):.2f} "
+                         f"p_dd={np.mean(np.array(null_dd) <= dd):.2f} "
+                         f"null_sh={np.median(null_sh):.2f} null_dd={np.median(null_dd):.3f}"])
+        self.emit("robust", ["feature", "transform", "low_frac", "sharpe", "max_dd", "cagr",
+                             "vs_random_same_freq"], rows)
+
     def on_end_of_algorithm(self):
         self.load()
         sec = self.section
@@ -444,3 +698,9 @@ class EntropyResearch(QCAlgorithm):
             self.run_signals()
         if sec in ("all", "screen"):
             self.run_screen()
+        if sec == "null":
+            self.run_null()
+        if sec == "strategies":
+            self.run_strategies()
+        if sec == "robust":
+            self.run_robust()
