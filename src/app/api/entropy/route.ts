@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import path from 'path';
 import fs from 'fs';
+import { initSchema } from '@/lib/entropy/schema';
 
 export const dynamic = 'force-dynamic';
 
@@ -19,64 +20,6 @@ function resolveDbPath(): string {
     if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
     return path.join(tmpDir, 'entropy_engine.db');
   }
-}
-
-function initSchema(db: ReturnType<typeof getDb>) {
-  if (!db) return;
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS entropy_history (
-      date TEXT PRIMARY KEY,
-      spot REAL,
-      metrics_json TEXT,
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS positions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      strategy TEXT NOT NULL,
-      symbol TEXT NOT NULL,
-      trade_type TEXT,
-      qty INTEGER,
-      entry_price REAL,
-      entry_cost REAL,
-      entry_date TEXT,
-      strike REAL,
-      expiry TEXT,
-      is_credit INTEGER,
-      is_open INTEGER DEFAULT 1,
-      close_date TEXT,
-      close_reason TEXT,
-      close_pnl REAL,
-      fill_corrected INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS trades_log (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      date TEXT,
-      strategy TEXT,
-      action TEXT,
-      symbol TEXT,
-      qty INTEGER,
-      price REAL,
-      details TEXT,
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS equity_curve (
-      date TEXT PRIMARY KEY,
-      portfolio_value REAL,
-      cash REAL,
-      positions_value REAL,
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS signals_log (
-      date TEXT,
-      strategy TEXT,
-      fired INTEGER,
-      strength REAL,
-      trade_type TEXT,
-      rationale TEXT,
-      executed INTEGER DEFAULT 0,
-      PRIMARY KEY (date, strategy)
-    );
-  `);
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -301,7 +244,7 @@ export async function GET(request: NextRequest) {
           date: r.date,
           spot: r.spot,
           composite: m.composite ?? null,
-          records: m._n_records ?? null,
+          records: m.n_records ?? m._n_records ?? null,
         };
       });
 
@@ -344,10 +287,17 @@ export async function GET(request: NextRequest) {
 
 /**
  * DELETE /api/entropy — Clear all entropy data (clean slate).
- * This is an internal admin action triggered from the dashboard UI.
- * No CRON_SECRET required — the two-step UI confirmation is the guard.
+ * Destructive and the site is public, so it requires `Authorization: Bearer <CRON_SECRET>`
+ * (the dashboard asks for it during the two-step confirmation).
  */
-export async function DELETE() {
+export async function DELETE(request: NextRequest) {
+  const cronSecret = process.env.CRON_SECRET;
+  if (!cronSecret) {
+    return NextResponse.json({ error: 'CRON_SECRET not configured — purge disabled' }, { status: 403 });
+  }
+  if (request.headers.get('authorization') !== `Bearer ${cronSecret}`) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
 
   try {
     const { clearAllRedisData } = await import('@/lib/entropy/persistence');

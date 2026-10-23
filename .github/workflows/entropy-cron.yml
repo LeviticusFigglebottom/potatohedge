@@ -17,7 +17,7 @@ jobs:
           DEPLOY_URL: ${{ secrets.DEPLOY_URL }}
         run: |
           # Default to production URL if DEPLOY_URL not set
-          URL="${DEPLOY_URL:-https://potatohedge.vercel.app}"
+          URL="${DEPLOY_URL:-https://fsdfsd-6soi.vercel.app}"
 
           echo "Triggering entropy engine at ${URL}/api/entropy/cron"
 

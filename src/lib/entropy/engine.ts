@@ -5,7 +5,7 @@
  * reuses BSM math from @/lib/math/blackScholes.ts and Tradier APIs
  * from @/lib/providers/tradier.ts and tradierPaper.ts.
  *
- * Run via cron or API trigger at 3:50pm ET daily.
+ * Run via cron or API trigger after the close (Vercel cron 21:05 UTC; guard requires >= 3:55pm ET).
  */
 
 import path from 'path';
@@ -20,11 +20,16 @@ import {
 import { getQuote } from '@/lib/providers/tradier';
 import {
   placeSingleOrder,
-  getOptionQuote,
-  getBalances,
-  closePosition as tradierClosePosition,
+  placeMultiLegOrder,
+  getOptionQuotes,
+  getPositions,
+  getAllGainLoss,
+  parseOCCSymbol,
+  type OptionQuote,
+  type GainLossEntry,
 } from '@/lib/providers/tradierPaper';
 import { restoreFromRedis, persistToRedis } from '@/lib/entropy/persistence';
+import { initSchema } from '@/lib/entropy/schema';
 
 // ═══════════════════════════════════════════════════════════════════
 //  CONFIG — matches T13 exactly
@@ -45,6 +50,19 @@ const WARMUP_DAYS = 30;
 const MAX_LONG_CALLS = 2;
 const SPREAD_FILTER = 0.15;
 const INITIAL_CASH = 100_000;
+
+/**
+ * Version of the IV/greek math stored with each history row.
+ *   1 — normCDF was missing the 1/√2 scaling, understating every IV (~0.15 → ~0.117)
+ *       and skewing all greek-based entropies.
+ *   2 — corrected normCDF.
+ * Signals only compare against rows of the current version, so after an
+ * upgrade they stay silent until LOOKBACK/2 new rows exist.
+ */
+const CALC_VERSION = 2;
+
+/** Tag on every broker order so other tools (e.g. the stale-order sweeper) can tell them apart. */
+const ORDER_TAG = 'entropy';
 
 const TRADIER_BASE_URL = 'https://api.tradier.com/v1';
 const FETCH_TIMEOUT = 12_000;
@@ -184,7 +202,11 @@ interface PositionRow {
   close_date: string | null;
   close_reason: string | null;
   close_pnl: number | null;
+  /** 0 = snapshot mid, 1 = entry corrected to broker fill, 2 = entry + exit corrected */
   fill_corrected: number;
+  leg2_symbol: string | null;
+  leg2_qty: number | null;
+  leg2_strike: number | null;
 }
 
 export interface RunResult {
@@ -240,60 +262,7 @@ function getDb(): BetterSqlite3Database {
 }
 
 function initDb(db: BetterSqlite3Database): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS entropy_history (
-      date TEXT PRIMARY KEY,
-      spot REAL,
-      metrics_json TEXT,
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS positions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      strategy TEXT NOT NULL,
-      symbol TEXT NOT NULL,
-      trade_type TEXT,
-      qty INTEGER,
-      entry_price REAL,
-      entry_cost REAL,
-      entry_date TEXT,
-      strike REAL,
-      expiry TEXT,
-      is_credit INTEGER,
-      is_open INTEGER DEFAULT 1,
-      close_date TEXT,
-      close_reason TEXT,
-      close_pnl REAL,
-      fill_corrected INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS trades_log (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      date TEXT,
-      strategy TEXT,
-      action TEXT,
-      symbol TEXT,
-      qty INTEGER,
-      price REAL,
-      details TEXT,
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS equity_curve (
-      date TEXT PRIMARY KEY,
-      portfolio_value REAL,
-      cash REAL,
-      positions_value REAL,
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS signals_log (
-      date TEXT,
-      strategy TEXT,
-      fired INTEGER,
-      strength REAL,
-      trade_type TEXT,
-      rationale TEXT,
-      executed INTEGER DEFAULT 0,
-      PRIMARY KEY (date, strategy)
-    );
-  `);
+  initSchema(db);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -417,8 +386,9 @@ async function fetchRawChain(): Promise<RawContract[]> {
   let exps: string[] = expData.expirations?.date ?? [];
   if (typeof exps === 'string') exps = [exps];
 
-  const today = new Date();
-  const todayDate = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  // DTE relative to the ET trading date (server clock is UTC)
+  const [ty, tm, td] = todayET().split('-').map(Number);
+  const todayDate = new Date(ty, tm - 1, td);
 
   const validExps = exps.filter((expStr) => {
     const [y, m, d] = expStr.split('-').map(Number);
@@ -657,7 +627,7 @@ function computeEntropy(
   const cvSum = cvArr.reduce((a: number, b: number) => a + b, 0);
   m.H_charm_n = cvSum > 0 ? hNorm(cvArr) : null;
 
-  // IV mean (near-term ATM)
+  // IV mean — all solved contracts 7-45 DTE, every strike (per T13 spec; not ATM-only)
   const nearRecs = recs.filter((r) => r.dte >= 7 && r.dte <= 45);
   const ivs = nearRecs.filter((r) => r.iv > 0).map((r) => r.iv);
   m.iv_mean = ivs.length > 5 ? mean(ivs) : null;
@@ -728,11 +698,22 @@ interface HistoryEntry {
   [key: string]: number | null | undefined;
 }
 
-function getHistory(db: BetterSqlite3Database, days: number = 60): HistoryEntry[] {
+/**
+ * Last `days` history rows, oldest first. Signals pass `currentCalcOnly` so
+ * medians/percentiles never mix rows computed with different math
+ * (see CALC_VERSION).
+ */
+function getHistory(
+  db: BetterSqlite3Database,
+  days: number = 60,
+  currentCalcOnly: boolean = false,
+): HistoryEntry[] {
   const rows = db
     .prepare('SELECT date, metrics_json FROM entropy_history ORDER BY date DESC LIMIT ?')
     .all(days) as { date: string; metrics_json: string }[];
-  return rows.reverse().map((r) => JSON.parse(r.metrics_json) as HistoryEntry);
+  const history = rows.reverse().map((r) => JSON.parse(r.metrics_json) as HistoryEntry);
+  if (!currentCalcOnly) return history;
+  return history.filter((h) => (h.calc_version ?? 1) === CALC_VERSION);
 }
 
 function med(history: HistoryEntry[], key: string, lookback: number = LOOKBACK): number | null {
@@ -998,13 +979,84 @@ function selectContract(
 //  POSITION MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════
 
+interface Leg {
+  symbol: string;
+  qty: number;
+}
+
+function legsOf(pos: PositionRow): Leg[] {
+  const legs: Leg[] = [{ symbol: pos.symbol, qty: pos.qty }];
+  if (pos.leg2_symbol && pos.leg2_qty) {
+    legs.push({ symbol: pos.leg2_symbol, qty: pos.leg2_qty });
+  }
+  return legs;
+}
+
+/** Dollars received (+, credit) or paid (−, debit) to open the position. */
+function openCashflow(pos: PositionRow): number {
+  const cost = Math.abs(pos.entry_cost);
+  return pos.is_credit ? cost : -cost;
+}
+
+function quoteMid(q: OptionQuote | undefined): number | null {
+  if (!q) return null;
+  const mid = (q.bid + q.ask) / 2;
+  return mid > 0 ? mid : null;
+}
+
+function intrinsicValue(symbol: string, spot: number): number | null {
+  const p = parseOCCSymbol(symbol);
+  if (!p) return null;
+  return p.type === 'C' ? Math.max(0, spot - p.strike) : Math.max(0, p.strike - spot);
+}
+
+/**
+ * Dollars received (+) or paid (−) to close every leg at the current mid.
+ * Falls back to intrinsic value when `spot` is given and a leg has no quote.
+ */
+function markValue(
+  pos: PositionRow,
+  quotes: Map<string, OptionQuote>,
+  spot?: number,
+): number | null {
+  let value = 0;
+  for (const leg of legsOf(pos)) {
+    let px = quoteMid(quotes.get(leg.symbol));
+    if (px == null && spot != null) px = intrinsicValue(leg.symbol, spot);
+    if (px == null) return null;
+    value += leg.qty * px * 100;
+  }
+  return value;
+}
+
+async function fetchLegQuotes(positions: PositionRow[]): Promise<Map<string, OptionQuote>> {
+  const symbols = [...new Set(positions.flatMap((p) => legsOf(p).map((l) => l.symbol)))];
+  if (symbols.length === 0) return new Map();
+  try {
+    return await getOptionQuotes(symbols);
+  } catch {
+    return new Map();
+  }
+}
+
+/** Capital tied up by an open position (debit paid, or margin proxy for credit). */
+function committedCapital(pos: PositionRow): number {
+  if (!pos.is_credit) return Math.abs(pos.entry_cost);
+  if (pos.leg2_strike != null) {
+    return Math.abs(pos.strike - pos.leg2_strike) * 100 * Math.abs(pos.qty);
+  }
+  return pos.strike * 100 * 0.15 * Math.abs(pos.qty);
+}
+
 async function managePositions(
   db: BetterSqlite3Database,
   todayStr: string,
+  spot: number,
 ): Promise<void> {
   const positions = db
     .prepare('SELECT * FROM positions WHERE is_open = 1')
     .all() as PositionRow[];
+  const quotes = await fetchLegQuotes(positions);
 
   const [ty, tm, td] = todayStr.split('-').map(Number);
   const todayDate = new Date(ty, tm - 1, td);
@@ -1016,51 +1068,40 @@ async function managePositions(
       (expiryDate.getTime() - todayDate.getTime()) / (1000 * 60 * 60 * 24),
     );
 
-    // DTE close
+    // DTE close — record the mark (intrinsic if unquoted); broker reconciliation
+    // later replaces it with the realized fill.
     if (dte <= CLOSE_DTE) {
-      await closePositionDb(db, pos, todayStr, 'DTE', 0);
+      const mark = markValue(pos, quotes, spot);
+      await closePositionDb(db, pos, todayStr, 'DTE', mark == null ? 0 : openCashflow(pos) + mark);
       continue;
     }
 
-    // Get current price
-    const quote = await getOptionQuote(pos.symbol);
-    if (!quote) continue;
-
-    const currentMid = (quote.bid + quote.ask) / 2;
-    if (currentMid <= 0 && quote.bid <= 0) continue;
-
-    const entryCost = pos.entry_cost;
-    const currentValue = currentMid * 100 * Math.abs(pos.qty);
-    const pnl = pos.qty > 0 ? currentValue - entryCost : entryCost - currentValue;
+    const mark = markValue(pos, quotes);
+    if (mark == null) continue;
+    const pnl = openCashflow(pos) + mark;
+    const basis = Math.abs(pos.entry_cost);
+    if (basis <= 0) continue;
 
     if (pos.is_credit) {
-      const credit = Math.abs(entryCost);
-      if (credit > 0) {
-        if (pnl >= credit * PROFIT_PCT) {
-          await closePositionDb(db, pos, todayStr, 'TP', pnl);
-          continue;
-        }
-        if (pnl < -credit * STOP_MULT) {
-          await closePositionDb(db, pos, todayStr, 'SL', pnl);
-          continue;
-        }
+      if (pnl >= basis * PROFIT_PCT) {
+        await closePositionDb(db, pos, todayStr, 'TP', pnl);
+      } else if (pnl < -basis * STOP_MULT) {
+        await closePositionDb(db, pos, todayStr, 'SL', pnl);
       }
     } else {
-      const debit = Math.abs(entryCost);
-      if (debit > 0) {
-        if (pnl < -debit * (STOP_MULT - 1)) {
-          await closePositionDb(db, pos, todayStr, 'SL', pnl);
-          continue;
-        }
-        if (pnl >= debit * 1.0) {
-          await closePositionDb(db, pos, todayStr, 'TP', pnl);
-          continue;
-        }
+      if (pnl < -basis * (STOP_MULT - 1)) {
+        await closePositionDb(db, pos, todayStr, 'SL', pnl);
+      } else if (pnl >= basis * 1.0) {
+        await closePositionDb(db, pos, todayStr, 'TP', pnl);
       }
     }
   }
 }
 
+/**
+ * Send the closing order and mark the position closed. If the broker rejects
+ * the order the position stays open and is retried on the next run.
+ */
 async function closePositionDb(
   db: BetterSqlite3Database,
   pos: PositionRow,
@@ -1068,11 +1109,45 @@ async function closePositionDb(
   reason: string,
   pnl: number = 0,
 ): Promise<void> {
-  // Place close order via paper trading
+  const legs = legsOf(pos);
   try {
-    await tradierClosePosition(TICKER, pos.symbol, pos.qty);
+    if (legs.length === 1) {
+      await placeSingleOrder({
+        symbol: TICKER,
+        optionSymbol: pos.symbol,
+        side: pos.qty > 0 ? 'sell_to_close' : 'buy_to_close',
+        quantity: Math.abs(pos.qty),
+        type: 'market',
+        duration: 'gtc',
+        tag: ORDER_TAG,
+      });
+    } else {
+      await placeMultiLegOrder({
+        symbol: TICKER,
+        type: 'market',
+        tag: ORDER_TAG,
+        legs: legs.map((l) => ({
+          optionSymbol: l.symbol,
+          side: l.qty > 0 ? 'sell_to_close' : 'buy_to_close',
+          quantity: Math.abs(l.qty),
+        })),
+      });
+    }
   } catch (err) {
     console.error(`[entropy] Failed to close position ${pos.symbol}:`, err);
+    db.prepare(
+      `INSERT INTO trades_log (date, strategy, action, symbol, qty, price, details)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      dateStr,
+      pos.strategy,
+      `CLOSE_FAILED_${reason}`,
+      pos.symbol,
+      pos.qty,
+      pnl,
+      err instanceof Error ? err.message.slice(0, 200) : 'order error',
+    );
+    return;
   }
 
   db.prepare(
@@ -1095,8 +1170,221 @@ async function closePositionDb(
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  BROKER RECONCILIATION
+// ═══════════════════════════════════════════════════════════════════
+
+/** Days from a to b (YYYY-MM-DD). */
+function daysBetween(a: string, b: string): number {
+  const [ay, am, ad] = a.slice(0, 10).split('-').map(Number);
+  const [by, bm, bd] = b.slice(0, 10).split('-').map(Number);
+  return Math.round(
+    (new Date(by, bm - 1, bd).getTime() - new Date(ay, am - 1, ad).getTime()) / 86_400_000,
+  );
+}
+
+/** Orders go in after the close, so the broker fills a day or more after the engine's date. */
+const FILL_WINDOW_DAYS = 7;
+
+/**
+ * Match a position's legs to the broker's closed-position (gain/loss) records.
+ * Returns the realized P/L and the actual opening cashflow, or null if any leg is missing.
+ */
+function matchGainLoss(
+  pos: PositionRow,
+  entries: GainLossEntry[],
+  closeDate: string | null,
+): { pnl: number; openCf: number; closeDate: string } | null {
+  let pnl = 0;
+  let openCf = 0;
+  let lastClose = '';
+  for (const leg of legsOf(pos)) {
+    const rows = entries.filter((g) => {
+      if (g.symbol !== leg.symbol || Math.sign(g.quantity) !== Math.sign(leg.qty)) return false;
+      const openLag = daysBetween(pos.entry_date, g.open_date);
+      if (openLag < 0 || openLag > FILL_WINDOW_DAYS) return false;
+      if (closeDate == null) return true;
+      const closeLag = daysBetween(closeDate, g.close_date);
+      return closeLag >= 0 && closeLag <= FILL_WINDOW_DAYS;
+    });
+    if (rows.length === 0) return null;
+    for (const g of rows) {
+      pnl += g.gain_loss;
+      // Shorts: proceeds = premium received at open. Longs: cost = premium paid.
+      openCf += leg.qty < 0 ? g.proceeds : -g.cost;
+      if (g.close_date.slice(0, 10) > lastClose) lastClose = g.close_date.slice(0, 10);
+    }
+  }
+  return { pnl, openCf, closeDate: lastClose };
+}
+
+function setEntryFromCashflow(
+  db: BetterSqlite3Database,
+  pos: PositionRow,
+  openCf: number,
+  fillCorrected: number,
+): void {
+  const cost = Math.abs(openCf);
+  db.prepare(
+    'UPDATE positions SET entry_cost = ?, entry_price = ?, fill_corrected = ? WHERE id = ?',
+  ).run(cost, cost / (100 * Math.abs(pos.qty)), fillCorrected, pos.id);
+}
+
+/**
+ * Replace snapshot-mid estimates with what the broker actually did:
+ *   - open positions: entry cost from the broker position's cost basis
+ *   - closed positions: realized P/L (and entry) from the broker's gain/loss history
+ *   - positions the broker never held: closed as UNFILLED
+ * Also back-fills history recorded before this existed.
+ */
+async function reconcileWithBroker(db: BetterSqlite3Database, todayStr: string): Promise<void> {
+  const pending = db
+    .prepare('SELECT * FROM positions WHERE COALESCE(fill_corrected, 0) < 2')
+    .all() as PositionRow[];
+  if (pending.length === 0) return;
+
+  let held: Map<string, { quantity: number; cost_basis: number }>;
+  try {
+    held = new Map((await getPositions()).map((p) => [p.symbol, p]));
+  } catch (err) {
+    console.error('[entropy] Reconcile skipped — broker positions unavailable:', err);
+    return;
+  }
+
+  let gainLoss: GainLossEntry[] | null | undefined;
+  const loadGainLoss = async (): Promise<GainLossEntry[] | null> => {
+    if (gainLoss === undefined) {
+      try {
+        gainLoss = await getAllGainLoss();
+      } catch (err) {
+        console.error('[entropy] Broker gain/loss unavailable:', err);
+        gainLoss = null;
+      }
+    }
+    return gainLoss;
+  };
+
+  for (const pos of pending) {
+    const legs = legsOf(pos);
+
+    if (pos.is_open) {
+      const brokerLegs = legs.map((l) => held.get(l.symbol));
+      if (brokerLegs.every((b) => b)) {
+        if (!pos.fill_corrected) {
+          // cost_basis is + for longs (paid) and − for shorts (received)
+          const openCf = -brokerLegs.reduce(
+            (sum, b, i) =>
+              sum + b!.cost_basis * (Math.abs(legs[i].qty) / Math.max(Math.abs(b!.quantity), 1)),
+            0,
+          );
+          setEntryFromCashflow(db, pos, openCf, 1);
+        }
+        continue;
+      }
+
+      // Not held: still waiting for the fill, closed outside the engine, or never filled
+      if (daysBetween(pos.entry_date, todayStr) < 3) continue;
+      const entries = await loadGainLoss();
+      if (!entries) continue;
+      const match = matchGainLoss(pos, entries, null);
+      db.prepare(
+        `UPDATE positions SET is_open = 0, close_date = ?, close_reason = ?, close_pnl = ?,
+         fill_corrected = 2 WHERE id = ?`,
+      ).run(
+        match ? match.closeDate : todayStr,
+        match ? 'BROKER_CLOSED' : 'UNFILLED',
+        match ? match.pnl : 0,
+        pos.id,
+      );
+      if (match) setEntryFromCashflow(db, pos, match.openCf, 2);
+      continue;
+    }
+
+    if (pos.close_reason === 'UNFILLED' || !pos.close_date) continue;
+    const entries = await loadGainLoss();
+    if (!entries) return;
+    const match = matchGainLoss(pos, entries, pos.close_date);
+    if (!match) continue;
+    db.prepare('UPDATE positions SET close_pnl = ? WHERE id = ?').run(match.pnl, pos.id);
+    setEntryFromCashflow(db, pos, match.openCf, 2);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  STRATEGY EQUITY
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Equity of the entropy strategy alone: INITIAL_CASH + realized + open marks.
+ * (The broker account balance can include unrelated trades.)
+ */
+async function strategyEquity(
+  db: BetterSqlite3Database,
+): Promise<{ equity: number; realized: number; unrealized: number; committed: number }> {
+  const realized = (
+    db
+      .prepare('SELECT COALESCE(SUM(close_pnl), 0) AS total FROM positions WHERE is_open = 0')
+      .get() as { total: number }
+  ).total;
+  const open = db.prepare('SELECT * FROM positions WHERE is_open = 1').all() as PositionRow[];
+  const quotes = await fetchLegQuotes(open);
+  let unrealized = 0;
+  let committed = 0;
+  for (const pos of open) {
+    const mark = markValue(pos, quotes);
+    if (mark != null) unrealized += openCashflow(pos) + mark;
+    committed += committedCapital(pos);
+  }
+  return { equity: INITIAL_CASH + realized + unrealized, realized, unrealized, committed };
+}
+
+async function recordEquity(db: BetterSqlite3Database, todayStr: string): Promise<number> {
+  const { equity, realized, unrealized } = await strategyEquity(db);
+  db.prepare(
+    `INSERT OR REPLACE INTO equity_curve (date, portfolio_value, cash, positions_value, basis)
+     VALUES (?, ?, ?, ?, 'strategy')`,
+  ).run(todayStr, equity, INITIAL_CASH + realized, unrealized);
+  return equity;
+}
+
+/**
+ * Rows written before strategy-only accounting hold the broker sandbox balance.
+ * The sandbox carried only entropy trades from the first such row on, so
+ * shifting by (first row − INITIAL_CASH) converts them to strategy equity.
+ */
+function rebaseLegacyEquity(db: BetterSqlite3Database): void {
+  const first = db
+    .prepare('SELECT portfolio_value FROM equity_curve WHERE basis IS NULL ORDER BY date LIMIT 1')
+    .get() as { portfolio_value: number } | undefined;
+  if (!first) return;
+  const offset = first.portfolio_value - INITIAL_CASH;
+  db.prepare(
+    `UPDATE equity_curve SET portfolio_value = portfolio_value - ?, cash = cash - ?,
+     basis = 'rebased' WHERE basis IS NULL`,
+  ).run(offset, offset);
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  MAIN ENGINE
 // ═══════════════════════════════════════════════════════════════════
+
+/** Spec compute_contracts: contracts for one leg. */
+function computeContracts(
+  alloc: number,
+  mid: number,
+  strike: number,
+  qtySign: number,
+  maxContracts: number,
+): number {
+  const prem = mid * 100;
+  let n: number;
+  if (qtySign > 0) {
+    n = Math.max(1, Math.floor(alloc / prem));
+  } else {
+    const margin = Math.max(prem * 3, strike * 100 * 0.15);
+    n = Math.max(1, Math.floor(alloc / margin));
+  }
+  return Math.min(n, maxContracts);
+}
 
 export async function runEntropyEngine(): Promise<RunResult> {
   const todayStr = todayET();
@@ -1157,18 +1445,9 @@ export async function runEntropyEngine(): Promise<RunResult> {
       };
     }
 
-    // September skip — still manage existing positions
-    if (etMonth === 9) {
-      await managePositions(db, todayStr);
-      await persistToRedis(db);
-      db.close();
-      return {
-        success: true,
-        date: todayStr,
-        status: 'september_skip',
-        message: 'September skip — no new entries, managed existing positions',
-      };
-    }
+    // Bring entries/exits in line with actual broker fills before any P/L decisions
+    rebaseLegacyEquity(db);
+    await reconcileWithBroker(db, todayStr);
 
     // 1. Get market data
     const quote = await getQuote(TICKER);
@@ -1211,13 +1490,17 @@ export async function runEntropyEngine(): Promise<RunResult> {
     for (const [k, v] of Object.entries(metrics)) {
       if (!k.startsWith('_')) store[k] = v;
     }
+    store.n_records = metrics._n_records;
+    store.calc_version = CALC_VERSION;
     db.prepare(
       'INSERT OR REPLACE INTO entropy_history (date, spot, metrics_json) VALUES (?, ?, ?)',
     ).run(todayStr, spot, JSON.stringify(store));
 
-    // 3. Load history
-    const history = getHistory(db);
-    if (history.length < WARMUP_DAYS) {
+    // 3. Warmup (counts all stored days)
+    const historyCount = (
+      db.prepare('SELECT COUNT(*) AS cnt FROM entropy_history').get() as { cnt: number }
+    ).cnt;
+    if (historyCount < WARMUP_DAYS) {
       // Persist to Redis so data survives redeployments
       await persistToRedis(db);
       db.close();
@@ -1225,15 +1508,31 @@ export async function runEntropyEngine(): Promise<RunResult> {
         success: true,
         date: todayStr,
         status: 'warmup',
-        message: `Warming up: ${history.length}/${WARMUP_DAYS} days`,
+        message: `Warming up: ${historyCount}/${WARMUP_DAYS} days`,
         metrics: store as Record<string, number | null>,
       };
     }
 
     // 4. Manage existing positions
-    await managePositions(db, todayStr);
+    await managePositions(db, todayStr, spot);
 
-    // 5. Evaluate signals
+    // September skip — metrics are still stored and positions managed, no new entries
+    if (etMonth === 9) {
+      const portfolioValue = await recordEquity(db, todayStr);
+      await persistToRedis(db);
+      db.close();
+      return {
+        success: true,
+        date: todayStr,
+        status: 'september_skip',
+        message: 'September skip — metrics stored, existing positions managed, no new entries',
+        metrics: store as Record<string, number | null>,
+        portfolioValue,
+      };
+    }
+
+    // 5. Evaluate signals against history computed with the same math
+    const history = getHistory(db, 60, true);
     const signals = evaluateSignals(metrics, history);
     const signalsFired: string[] = [];
 
@@ -1251,51 +1550,59 @@ export async function runEntropyEngine(): Promise<RunResult> {
       if (v.fire) firing[k] = v;
     }
 
-    // 6. Get active strategies
-    const activeStrats = new Set<string>();
-    const openPositions = db
-      .prepare('SELECT DISTINCT strategy FROM positions WHERE is_open = 1')
-      .all() as { strategy: string }[];
-    for (const row of openPositions) activeStrats.add(row.strategy);
+    // 6. Strategies blocked from entry: open position, or opened/closed today (no same-day re-entry)
+    const blockedStrats = new Set<string>();
+    const blockedRows = db
+      .prepare(
+        'SELECT DISTINCT strategy FROM positions WHERE is_open = 1 OR entry_date = ? OR close_date = ?',
+      )
+      .all(todayStr, todayStr) as { strategy: string }[];
+    for (const row of blockedRows) blockedStrats.add(row.strategy);
 
+    const openPositions = db
+      .prepare('SELECT * FROM positions WHERE is_open = 1')
+      .all() as PositionRow[];
     const usedSymbols = new Set<string>();
-    const openSyms = db
-      .prepare('SELECT symbol FROM positions WHERE is_open = 1')
-      .all() as { symbol: string }[];
-    for (const row of openSyms) usedSymbols.add(row.symbol);
+    for (const pos of openPositions) {
+      for (const leg of legsOf(pos)) usedSymbols.add(leg.symbol);
+    }
 
     // Count active long calls
     const longCallTypes = ['buy_call', 'buy_call_longer', 'bull_call_spread'];
-    const activeLc = db
-      .prepare(
-        'SELECT strategy FROM positions WHERE is_open = 1 AND trade_type IN (?, ?, ?)',
-      )
-      .all('buy_call', 'buy_call_longer', 'bull_call_spread') as { strategy: string }[];
-    const activeLcStrats = new Set(activeLc.map((r) => r.strategy));
+    const activeLcStrats = new Set(
+      openPositions.filter((p) => longCallTypes.includes(p.trade_type)).map((p) => p.strategy),
+    );
 
     // 7. Execute actionable signals
     const tradesExecuted: string[] = [];
-    const actionable = Object.keys(firing).filter((sn) => !activeStrats.has(sn));
+    const actionable = Object.keys(firing).filter((sn) => !blockedStrats.has(sn));
 
     if (actionable.length > 0) {
-      let pv: number;
-      try {
-        const bal = await getBalances();
-        pv = bal.total_equity || INITIAL_CASH;
-      } catch {
-        pv = INITIAL_CASH;
-      }
-      const avail = pv * 0.95;
-      const alloc = Math.min(avail / actionable.length, pv * MAX_ALLOC);
-      const maxContracts = Math.min(Math.max(8, Math.floor(pv / 12500)), MAX_CONTRACTS);
+      // Spec sizing (Section 11) on strategy-only equity
+      const { equity: pv, committed } = await strategyEquity(db);
+      const avail = Math.max(pv * 0.85 - committed, 0);
+      const alloc = Math.min(avail / Math.max(actionable.length, 1), pv * MAX_ALLOC);
+      const maxContracts = Math.max(8, Math.min(Math.floor(pv / 12500), MAX_CONTRACTS));
+      let freeMargin = Math.max(pv - committed, 0);
 
       const recs = metrics._chain;
       const sorted = [...actionable].sort(
         (a, b) => firing[b].strength - firing[a].strength,
       );
 
+      const insertPosition = db.prepare(
+        `INSERT INTO positions (strategy, symbol, trade_type, qty, entry_price, entry_cost,
+          entry_date, strike, expiry, is_credit, leg2_symbol, leg2_qty, leg2_strike)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      const insertTrade = db.prepare(
+        `INSERT INTO trades_log (date, strategy, action, symbol, qty, price, details)
+         VALUES (?, ?, 'OPEN', ?, ?, ?, ?)`,
+      );
+
       for (const sn of sorted) {
         const sig = firing[sn];
+        if (alloc <= 0) break;
 
         // Long-call cap
         if (longCallTypes.includes(sig.trade_type)) {
@@ -1308,84 +1615,105 @@ export async function runEntropyEngine(): Promise<RunResult> {
         if (selection.type === 'single' && selection.contract && selection.qty_sign != null) {
           const c = selection.contract;
           const qs = selection.qty_sign;
-          const prem = c.mid * 100;
-          let n: number;
-          if (qs > 0) {
-            n = Math.max(1, Math.floor(alloc / prem));
-          } else {
-            const margin = Math.max(prem * 3, c.strike * 100 * 0.15);
-            n = Math.max(1, Math.floor(alloc / margin));
+          let n = computeContracts(alloc, c.mid, c.strike, qs, maxContracts);
+          if (qs < 0) {
+            const estimatedMargin = n * c.strike * 100 * 0.15;
+            if (estimatedMargin > freeMargin * 0.80) {
+              n = Math.max(1, Math.floor((freeMargin * 0.60) / (c.strike * 100 * 0.15)));
+            }
           }
-          n = Math.min(n, maxContracts);
 
           const qty = n * qs;
-          const side: 'buy_to_open' | 'sell_to_open' =
-            qs < 0 ? 'sell_to_open' : 'buy_to_open';
-
           try {
             await placeSingleOrder({
               symbol: TICKER,
               optionSymbol: c.symbol,
-              side,
-              quantity: Math.abs(qty),
+              side: qs < 0 ? 'sell_to_open' : 'buy_to_open',
+              quantity: n,
               type: 'market',
+              tag: ORDER_TAG,
             });
           } catch (err) {
             console.error(`[entropy] Order failed for ${sn}:`, err);
             continue;
           }
 
-          db.prepare(
-            `INSERT INTO positions (strategy, symbol, trade_type, qty, entry_price,
-              entry_cost, entry_date, strike, expiry, is_credit)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          ).run(
-            sn,
-            c.symbol,
-            sig.trade_type,
-            qty,
-            c.mid,
-            c.mid * 100 * Math.abs(qty),
-            todayStr,
-            c.strike,
-            c.expiry,
-            qs < 0 ? 1 : 0,
+          const entryCost = c.mid * 100 * n;
+          insertPosition.run(
+            sn, c.symbol, sig.trade_type, qty, c.mid, entryCost, todayStr,
+            c.strike, c.expiry, qs < 0 ? 1 : 0, null, null, null,
           );
-
-          db.prepare(
-            'UPDATE signals_log SET executed = 1 WHERE date = ? AND strategy = ?',
-          ).run(todayStr, sn);
-
+          insertTrade.run(todayStr, sn, c.symbol, qty, c.mid, `mid entry, ${n} contracts`);
+          freeMargin -= qs < 0 ? c.strike * 100 * 0.15 * n : entryCost;
           usedSymbols.add(c.symbol);
-          if (longCallTypes.includes(sig.trade_type)) {
-            activeLcStrats.add(sn);
-          }
 
-          const sideStr = qs < 0 ? 'SELL' : 'BUY';
           const kind = c.is_call ? 'C' : 'P';
           tradesExecuted.push(
-            `${sn}: ${sideStr} ${Math.abs(qty)}x ${kind} K=${c.strike} exp=${c.expiry} mid=$${c.mid.toFixed(2)}`,
+            `${sn}: ${qs < 0 ? 'SELL' : 'BUY'} ${n}x ${kind} K=${c.strike} exp=${c.expiry} mid=$${c.mid.toFixed(2)}`,
           );
-        } else if (selection.type === 'spread') {
-          // Spread execution — log for paper trading
-          tradesExecuted.push(`${sn}: spread execution (simplified for paper)`);
+        } else if (selection.type === 'spread' && selection.long && selection.short) {
+          const l = selection.long;
+          const s = selection.short;
+          const isCredit = sig.trade_type === 'sell_put_spread';
+          let n = Math.min(
+            computeContracts(alloc, l.mid, l.strike, 1, maxContracts),
+            computeContracts(alloc, s.mid, s.strike, -1, maxContracts),
+          );
+          const width = Math.abs(l.strike - s.strike);
+          if (width * 100 * n > freeMargin * 0.70) {
+            n = Math.max(1, Math.floor((freeMargin * 0.50) / (width * 100)));
+            n = Math.min(n, maxContracts);
+          }
+
+          try {
+            await placeMultiLegOrder({
+              symbol: TICKER,
+              type: 'market',
+              tag: ORDER_TAG,
+              legs: [
+                { optionSymbol: l.symbol, side: 'buy_to_open', quantity: n },
+                { optionSymbol: s.symbol, side: 'sell_to_open', quantity: n },
+              ],
+            });
+          } catch (err) {
+            console.error(`[entropy] Spread order failed for ${sn}:`, err);
+            continue;
+          }
+
+          // Primary leg = the side that defines the trade (long call / short put)
+          const [primary, secondary, primaryQty] = isCredit ? [s, l, -n] : [l, s, n];
+          const netPrice = isCredit ? s.mid - l.mid : l.mid - s.mid;
+          const entryCost = netPrice * 100 * n;
+          insertPosition.run(
+            sn, primary.symbol, sig.trade_type, primaryQty, netPrice, entryCost, todayStr,
+            primary.strike, primary.expiry, isCredit ? 1 : 0,
+            secondary.symbol, -primaryQty, secondary.strike,
+          );
+          insertTrade.run(
+            todayStr, sn, primary.symbol, primaryQty, netPrice,
+            `spread with ${secondary.symbol}, ${n} contracts`,
+          );
+          freeMargin -= isCredit ? width * 100 * n : entryCost;
+          usedSymbols.add(l.symbol);
+          usedSymbols.add(s.symbol);
+
+          tradesExecuted.push(
+            `${sn}: ${isCredit ? 'SELL' : 'BUY'} ${n}x ${sig.trade_type} ` +
+              `${l.strike}/${s.strike} exp=${l.expiry} net=$${netPrice.toFixed(2)}`,
+          );
+        } else {
+          continue;
         }
+
+        db.prepare(
+          'UPDATE signals_log SET executed = 1 WHERE date = ? AND strategy = ?',
+        ).run(todayStr, sn);
+        if (longCallTypes.includes(sig.trade_type)) activeLcStrats.add(sn);
       }
     }
 
-    // 8. Record equity
-    let portfolioValue: number;
-    try {
-      const bal = await getBalances();
-      portfolioValue = bal.total_equity || INITIAL_CASH;
-    } catch {
-      portfolioValue = INITIAL_CASH;
-    }
-
-    db.prepare(
-      `INSERT OR REPLACE INTO equity_curve (date, portfolio_value, cash, positions_value)
-       VALUES (?, ?, ?, ?)`,
-    ).run(todayStr, portfolioValue, portfolioValue, 0);
+    // 8. Record strategy equity
+    const portfolioValue = await recordEquity(db, todayStr);
 
     // Persist all data to Redis for cross-deployment survival
     await persistToRedis(db);
@@ -1583,11 +1911,11 @@ function normCDFInline(x: number): number {
   const p = 0.3275911;
 
   const sign = x < 0 ? -1 : 1;
-  const absX = Math.abs(x);
+  const absX = Math.abs(x) / Math.SQRT2;
   const t = 1.0 / (1.0 + p * absX);
   const y =
     1.0 -
-    (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp((-absX * absX) / 2));
+    (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-absX * absX));
 
   return 0.5 * (1.0 + sign * y);
 }

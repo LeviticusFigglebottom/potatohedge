@@ -103,6 +103,7 @@ export interface SingleLegOrder {
   type: 'market' | 'limit';
   price?: number;         // required for limit orders
   duration?: 'day' | 'gtc';
+  tag?: string;           // free-form order tag (alphanumeric + dashes)
 }
 
 export interface MultiLegOrder {
@@ -110,6 +111,7 @@ export interface MultiLegOrder {
   type: 'market' | 'debit' | 'credit' | 'even';
   price?: number;         // net debit/credit
   duration?: 'day' | 'gtc';
+  tag?: string;
   legs: {
     optionSymbol: string;
     side: 'buy_to_open' | 'sell_to_open' | 'buy_to_close' | 'sell_to_close';
@@ -141,6 +143,7 @@ export async function placeSingleOrder(order: SingleLegOrder): Promise<OrderResu
   if (order.type === 'limit' && order.price != null) {
     params.set('price', String(order.price));
   }
+  if (order.tag) params.set('tag', order.tag);
 
   const res = await fetch(`${SANDBOX_URL}/accounts/${accountId}/orders`, {
     method: 'POST',
@@ -176,6 +179,7 @@ export async function placeMultiLegOrder(order: MultiLegOrder): Promise<OrderRes
   if (order.price != null) {
     params.set('price', String(order.price));
   }
+  if (order.tag) params.set('tag', order.tag);
   for (let i = 0; i < order.legs.length; i++) {
     params.set(`option_symbol[${i}]`, order.legs[i].optionSymbol);
     params.set(`side[${i}]`, order.legs[i].side);
@@ -248,6 +252,7 @@ export interface TradierOrder {
   create_date: string;
   transaction_date?: string;
   class: string;
+  tag?: string;
   // Multileg legs
   leg?: TradierOrder[];
 }
@@ -340,11 +345,11 @@ export interface GainLossEntry {
   proceeds: number;
 }
 
-export async function getGainLoss(limit: number = 50): Promise<GainLossEntry[]> {
+export async function getGainLoss(limit: number = 50, page: number = 1): Promise<GainLossEntry[]> {
   const accountId = await getAccountId();
 
   const res = await fetch(
-    `${SANDBOX_URL}/accounts/${accountId}/gainloss?limit=${limit}&sortBy=closeDate&sort=desc`,
+    `${SANDBOX_URL}/accounts/${accountId}/gainloss?limit=${limit}&page=${page}&sortBy=closeDate&sort=desc`,
     {
       headers: getHeaders(),
       signal: AbortSignal.timeout(FETCH_TIMEOUT),
@@ -360,6 +365,20 @@ export async function getGainLoss(limit: number = 50): Promise<GainLossEntry[]> 
   const entries = data.gainloss?.closed_position;
   if (!entries) return [];
   return Array.isArray(entries) ? entries : [entries];
+}
+
+/**
+ * Fetch the full closed-position history by paging through /gainloss.
+ */
+export async function getAllGainLoss(maxPages: number = 20): Promise<GainLossEntry[]> {
+  const pageSize = 100;
+  const all: GainLossEntry[] = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const batch = await getGainLoss(pageSize, page);
+    all.push(...batch);
+    if (batch.length < pageSize) break;
+  }
+  return all;
 }
 
 // ─── Option Quote (for current pricing) ────────────────────
@@ -438,9 +457,11 @@ export async function closePosition(
   quantity: number,
   orderType: 'market' | 'limit' = 'market',
   limitPrice?: number,
+  tag?: string,
 ): Promise<OrderResult> {
   const side = quantity > 0 ? 'sell_to_close' : 'buy_to_close';
   return placeSingleOrder({
+    tag,
     symbol: underlying,
     optionSymbol: occSymbol,
     side,

@@ -175,10 +175,18 @@ export default function EntropyTab() {
 
   const purgeAllData = useCallback(async () => {
     if (!purgeConfirm || purging) return;
+    const secret = window.prompt('Enter CRON_SECRET to confirm purge');
+    if (!secret) {
+      setPurgeConfirm(false);
+      return;
+    }
     setPurging(true);
     setPurgeResult(null);
     try {
-      const res = await fetch('/api/entropy', { method: 'DELETE' });
+      const res = await fetch('/api/entropy', {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${secret}` },
+      });
       const json = await res.json();
       if (json.success) {
         setPurgeResult('All entropy data purged. Refresh to reinitialize.');

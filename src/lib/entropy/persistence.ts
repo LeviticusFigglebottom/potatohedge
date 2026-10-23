@@ -58,6 +58,9 @@ interface PositionRow {
   close_reason: string | null;
   close_pnl: number | null;
   fill_corrected: number;
+  leg2_symbol?: string | null;
+  leg2_qty?: number | null;
+  leg2_strike?: number | null;
 }
 
 interface TradeRow {
@@ -76,6 +79,7 @@ interface EquityRow {
   portfolio_value: number;
   cash: number;
   positions_value: number;
+  basis?: string | null;
 }
 
 interface SignalRow {
@@ -152,14 +156,15 @@ export async function restoreFromRedis(db: BetterSqlite3Database): Promise<void>
     if (positions && positions.length > 0) {
       const stmt = db.prepare(
         `INSERT OR IGNORE INTO positions (id, strategy, symbol, trade_type, qty, entry_price,
-         entry_cost, entry_date, strike, expiry, is_credit, is_open, close_date, close_reason, close_pnl, fill_corrected)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         entry_cost, entry_date, strike, expiry, is_credit, is_open, close_date, close_reason, close_pnl, fill_corrected,
+         leg2_symbol, leg2_qty, leg2_strike)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       for (const row of positions) {
         stmt.run(row.id, row.strategy, row.symbol, row.trade_type, row.qty,
           row.entry_price, row.entry_cost, row.entry_date, row.strike, row.expiry,
           row.is_credit, row.is_open, row.close_date, row.close_reason, row.close_pnl,
-          row.fill_corrected);
+          row.fill_corrected, row.leg2_symbol ?? null, row.leg2_qty ?? null, row.leg2_strike ?? null);
       }
     }
 
@@ -174,10 +179,10 @@ export async function restoreFromRedis(db: BetterSqlite3Database): Promise<void>
 
     if (equity && equity.length > 0) {
       const stmt = db.prepare(
-        'INSERT OR IGNORE INTO equity_curve (date, portfolio_value, cash, positions_value) VALUES (?, ?, ?, ?)'
+        'INSERT OR IGNORE INTO equity_curve (date, portfolio_value, cash, positions_value, basis) VALUES (?, ?, ?, ?, ?)'
       );
       for (const row of equity) {
-        stmt.run(row.date, row.portfolio_value, row.cash, row.positions_value);
+        stmt.run(row.date, row.portfolio_value, row.cash, row.positions_value, row.basis ?? null);
       }
     }
 

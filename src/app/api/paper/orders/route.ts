@@ -15,11 +15,13 @@ export async function GET() {
     const orders = await getOrders();
 
     // Auto-cancel stale pending/open orders older than 5 minutes
-    // Sandbox orders outside market hours sometimes stay pending indefinitely
+    // Sandbox orders outside market hours sometimes stay pending indefinitely.
+    // Entropy engine orders are placed after the close on purpose and fill at
+    // the next open, so they are left alone.
     const now = Date.now();
     const cancelledIds: number[] = [];
     for (const o of orders) {
-      if (o.status === 'pending' || o.status === 'open') {
+      if ((o.status === 'pending' || o.status === 'open') && o.tag !== 'entropy') {
         const createdAt = o.create_date ? new Date(o.create_date).getTime() : 0;
         if (createdAt > 0 && now - createdAt > 5 * 60 * 1000) {
           try {

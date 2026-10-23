@@ -10,7 +10,11 @@
 
 // ─── Standard Normal Distribution ──────────────────────────────────
 
-/** Cumulative standard normal distribution (Abramowitz & Stegun approximation) */
+/**
+ * Cumulative standard normal distribution.
+ * A&S 7.1.26 approximates erf(z); Φ(x) = ½(1 + erf(x/√2)), so the input is
+ * scaled by 1/√2 and the exponent is −z² (not −x²/2).
+ */
 export function normCDF(x: number): number {
   const a1 = 0.254829592;
   const a2 = -0.284496736;
@@ -20,9 +24,9 @@ export function normCDF(x: number): number {
   const p = 0.3275911;
 
   const sign = x < 0 ? -1 : 1;
-  const absX = Math.abs(x);
+  const absX = Math.abs(x) / Math.SQRT2;
   const t = 1.0 / (1.0 + p * absX);
-  const y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-absX * absX / 2);
+  const y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-absX * absX);
 
   return 0.5 * (1.0 + sign * y);
 }
