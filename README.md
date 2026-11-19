@@ -45,6 +45,10 @@ Or connect your GitHub repo → Vercel will auto-deploy on push.
 
 > **Important:** Add `TRADIER_API_KEY` in Vercel → Settings → Environment Variables.
 
+## Flow Desk
+
+Options-flow desk (flow, tables, strike×expiry heatmap, dealer greeks, vol, tape, MSI, daily summary) plus the ELMo-D multi-timeframe indicator. See [FLOW_DESK.md](FLOW_DESK.md) and [DATA_SOURCES.md](DATA_SOURCES.md). Every panel has a demo mode: `/?tab=flowdesk&demo=1`.
+
 ## Architecture
 
 ```
