@@ -45,18 +45,19 @@ export function MsiPanel({ symbol, chain, trades }: { symbol: string; chain: Cha
   const el = useRef<HTMLDivElement>(null);
   const series = useRef<ISeriesApi<'Line'> | null>(null);
   const chart = useRef<IChartApi | null>(null);
+  const ready = !!config;
   useEffect(() => {
-    if (!el.current) return;
+    if (!ready || !el.current) return;
     const c = deskChart(el.current);
     chart.current = c;
     series.current = c.addLineSeries({ color: C.cyan, lineWidth: 2, title: 'MSI' });
     series.current.createPriceLine({ price: 50, color: C.muted, lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: 'neutral' });
     return () => { c.remove(); chart.current = null; series.current = null; };
-  }, []);
+  }, [ready]);
   useEffect(() => {
     series.current?.setData(msi.map((p) => ({ time: etTime(p.time), value: p.value })));
     chart.current?.timeScale().fitContent();
-  }, [msi]);
+  }, [msi, ready]);
 
   const startEdit = () => { setDraft(JSON.stringify(config, null, 2)); setDraftErr(null); setEditing(true); };
   const apply = () => {

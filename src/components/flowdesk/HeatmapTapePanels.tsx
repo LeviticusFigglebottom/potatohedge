@@ -26,7 +26,7 @@ export function FlowHeatmapPanel({ symbol, trades, spot }: { symbol: string; tra
     .filter((k) => Math.abs(k / spot - 1) <= range / 100).sort((a, b) => b - a), [cells, spot, range]);
   const byKey = useMemo(() => new Map(cells.map((c) => [`${c.expiry}|${c.strike}`, c])), [cells]);
 
-  const cw = Math.max(48, Math.min(90, 900 / Math.max(1, expiries.length)));
+  const cw = Math.max(48, Math.min(140, 1300 / Math.max(1, expiries.length)));
   const ch = 16;
   const left = 56, top = 22;
   const width = left + cw * expiries.length + 8;

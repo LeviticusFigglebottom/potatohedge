@@ -130,7 +130,8 @@ export class Segments extends Base {
         ctx.stroke();
         if (s.label && s.to == null) {
           ctx.fillStyle = s.color;
-          ctx.fillText(s.label, Math.max(x0, 4) + 2, y - 3);
+          const w = ctx.measureText(s.label).width;
+          ctx.fillText(s.label, x1 - w - 6, y - 3);
         }
       }
       ctx.setLineDash([]);

@@ -90,7 +90,7 @@ export function LinesChart({ series, height = 260, xFmt, yFmt, marker, independe
 }) {
   const [ref, width] = useWidth();
   const [hx, setHx] = useState<number | null>(null);
-  const axisW = independentY ? 52 : 56;
+  const axisW = independentY ? 66 : 56;
   const nLeft = independentY ? Math.ceil(series.length / 2) : 1;
   const nRight = independentY ? Math.floor(series.length / 2) : 0;
   const pad = { l: axisW * nLeft + 8, r: axisW * nRight + 12, t: 12, b: 26 };
@@ -101,7 +101,8 @@ export function LinesChart({ series, height = 260, xFmt, yFmt, marker, independe
   const scales = useMemo(() => {
     const mk = (pts: number[]) => {
       let lo = Math.min(...pts), hi = Math.max(...pts);
-      if (independentY) { const m = Math.max(Math.abs(lo), Math.abs(hi)) || 1; if (lo < 0) { lo = -m; hi = m; } }
+      // independent axes are symmetric so every series' zero sits on the shared mid line
+      if (independentY) { const m = Math.max(Math.abs(lo), Math.abs(hi)) || 1; lo = -m; hi = m; }
       if (hi === lo) { hi += 1; lo -= 1; }
       const padY = (hi - lo) * 0.06;
       return { lo: lo - padY, hi: hi + padY };

@@ -100,6 +100,12 @@ describe('demo data → greeks, vol, MSI', () => {
   const chain = demoChain('SPY', session);
   const trades = enrich(demoTrades('SPY', session, demoNowMs(session)), DEFAULT_FLOW_SETTINGS);
 
+  it('demo quotes are never locked or crossed (so far-OTM prints can classify as sells)', () => {
+    const raw = demoTrades('SPY', session);
+    expect(raw.every((t) => t.ask! > t.bid!)).toBe(true);
+    expect(trades.filter((t) => t.expiry === session && t.side === 'sell').length).toBeGreaterThan(0);
+  });
+
   it('demo data is deterministic', () => {
     expect(demoTrades('SPY', session).slice(0, 5)).toEqual(demoTrades('SPY', session).slice(0, 5));
     expect(demoBars('QQQ', '1h', session).length).toBeGreaterThan(100);

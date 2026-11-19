@@ -92,7 +92,7 @@ export function ElmoDPanel({ symbol }: { symbol: string }) {
     const entpSeries = reg.ma0 as ISeriesApi<'Line'>;
     entpSeries.createPriceLine({ price: 80, color: '#ff3d5766', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: '' });
     entpSeries.createPriceLine({ price: 20, color: '#00e67666', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: '' });
-    pane.priceScale('right').applyOptions({ autoScale: false, scaleMargins: { top: 0.05, bottom: 0.05 } });
+    pane.priceScale('right').applyOptions({ autoScale: true, scaleMargins: { top: 0.06, bottom: 0.06 } });
     reg.lhh = lhh.addHistogramSeries({ color: '#8888a066', priceLineVisible: false, lastValueVisible: false });
     reg.lhh20 = lhh.addLineSeries({ color: C.cyan, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
     reg.lhh50 = lhh.addLineSeries({ color: C.amber, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
@@ -183,7 +183,6 @@ export function ElmoDPanel({ symbol }: { symbol: string }) {
     (reg.lhh as ISeriesApi<'Histogram'>).setData(line(times, res.lhh) as never);
     reg.lhh20.setData(line(times, res.lhhSma20));
     reg.lhh50.setData(line(times, res.lhhSma50));
-    charts.current[1].priceScale('right').applyOptions({ autoScale: false });
     (reg.ma0 as ISeriesApi<'Line'>).applyOptions({ autoscaleInfoProvider: () => ({ priceRange: { minValue: -2, maxValue: 102 } }) });
 
     prims.current.bands.set(times, [0, 1, 2, 3].map((b) => ({
@@ -191,7 +190,12 @@ export function ElmoDPanel({ symbol }: { symbol: string }) {
     })));
     prims.current.rects.set(show.boxes ? res.boxes.map((bx) => ({ from: times[bx.startIndex], to: times[bx.endIndex], top: bx.top, bottom: bx.bottom, fill: 'rgba(179,136,255,0.08)', stroke: 'rgba(179,136,255,0.45)' })) : []);
     const lastIdx = bars.length - 1;
-    const recent = res.shelves.filter((sh) => sh.brokenAt == null || sh.brokenAt > lastIdx - 150).slice(-40);
+    // Active shelves (not yet traded through) plus any broken in the last 40 bars, nearest to price first.
+    const lastClose = bars[lastIdx].close;
+    const recent = res.shelves
+      .filter((sh) => sh.brokenAt == null || sh.brokenAt > lastIdx - 40)
+      .sort((a, b) => Math.abs(a.price - lastClose) - Math.abs(b.price - lastClose))
+      .slice(0, 14);
     prims.current.segs.set(show.shelves ? recent.map((sh) => ({
       from: times[sh.fromIndex], to: sh.brokenAt == null ? null : times[sh.brokenAt], price: sh.price,
       color: sh.kind === 'pivot_high' ? '#ff3d5799' : sh.kind === 'pivot_low' ? '#00e67699' : '#ffaa0099',

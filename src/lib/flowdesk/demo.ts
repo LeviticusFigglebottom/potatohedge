@@ -172,7 +172,7 @@ export function demoChain(symbol: string, date: string, asOfMs?: number): ChainS
         const oi = Math.round(p.tradesPerDay * 30 * tWeight * round * skewW * Math.exp(-dist * dist / 0.0018) * (0.5 + r.next()));
         contracts.push({
           root: sym, expiry, strike: K, right,
-          bid: +Math.max(0, mid - spread / 2).toFixed(2), ask: +(mid + spread / 2).toFixed(2), last: +mid.toFixed(2),
+          bid: +Math.max(0, mid - spread / 2).toFixed(2), ask: +Math.max(+Math.max(0, mid - spread / 2).toFixed(2) + 0.01, mid + spread / 2).toFixed(2), last: +mid.toFixed(2),
           volume: 0, openInterest: oi, iv: +iv.toFixed(4), delta: +th.delta.toFixed(4), gamma: +th.gamma.toFixed(6), vega: +th.vega.toFixed(4),
         });
       }
@@ -226,7 +226,7 @@ export function demoTrades(symbol: string, date: string, untilMs?: number): Opti
     const mid = Math.max(0.01, th.price);
     const spread = Math.max(0.01, mid * (0.03 + 0.05 * r.next()));
     const bid = +Math.max(0, mid - spread / 2).toFixed(2);
-    const ask = +(mid + spread / 2).toFixed(2);
+    const ask = +Math.max(bid + 0.01, mid + spread / 2).toFixed(2); // never a locked market
     // aggressor: call-heavy days lean to call buys and put sells
     const pBuy = 0.5 + (right === 'C' ? bias : -bias) * 0.8;
     const side = r.next() < pBuy ? 'buy' : 'sell';
