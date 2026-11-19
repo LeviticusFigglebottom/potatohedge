@@ -46,6 +46,25 @@ async function main() {
 
   app.get('/health', async () => ({ ok: true, ts: Date.now(), dryRun: cfg.DRY_RUN }));
 
+  // ── Flow Desk daily per-root summary (data only; no trading). Writes need
+  // FLOW_SUMMARY_TOKEN as a Bearer token; if the token is unset, writes are disabled.
+  app.get<{ Querystring: { root?: string; days?: string; source?: string } }>('/flow-summary', async (req) => {
+    const { listFlowSummaries } = await import('./flowSummary.js');
+    const source = req.query.source === 'demo' ? 'demo' : 'live';
+    return { rows: await listFlowSummaries({ root: req.query.root, days: Number(req.query.days ?? 30) || 30, source }) };
+  });
+  app.post<{ Body: { source?: string; rows?: unknown[] } }>('/flow-summary', async (req, reply) => {
+    const token = process.env.FLOW_SUMMARY_TOKEN;
+    if (!token || req.headers.authorization !== `Bearer ${token}`) {
+      reply.code(401);
+      return { error: 'flow-summary writes require FLOW_SUMMARY_TOKEN' };
+    }
+    const { upsertFlowSummaries } = await import('./flowSummary.js');
+    const rows = Array.isArray(req.body?.rows) ? (req.body.rows as import('./flowSummary.js').FlowSummaryRow[]) : [];
+    const written = await upsertFlowSummaries(rows, req.body?.source === 'demo' ? 'demo' : 'live');
+    return { written };
+  });
+
   // Manual run trigger (useful for the dashboard "run now" button or
   // ad-hoc curl/PowerShell from a terminal). GET-or-POST so callers don't
   // have to set Content-Type for empty bodies.
