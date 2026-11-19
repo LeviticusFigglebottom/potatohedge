@@ -1,0 +1,17 @@
+{
+  "name": "MSI – Market Stability Index",
+  "version": 1,
+  "status": "uncalibrated placeholder — weights are illustrative until the research repo publishes a calibrated definition",
+  "description": "Higher = more stable (long dealer gamma, dispersed flow, call-leaning flow, little premium about to expire).",
+  "normalize": "expanding_zscore",
+  "components": [
+    { "id": "gamma_all", "weight": 0.35 },
+    { "id": "dex_5pct", "weight": 0.10 },
+    { "id": "exp_prem_today", "weight": 0.10, "invert": true },
+    { "id": "exp_prem_week", "weight": 0.05, "invert": true },
+    { "id": "entropy_strike", "weight": 0.15 },
+    { "id": "entropy_expiry", "weight": 0.10 },
+    { "id": "flow_skew", "weight": 0.15 }
+  ],
+  "output": { "transform": "logistic", "scale": 100 }
+}
