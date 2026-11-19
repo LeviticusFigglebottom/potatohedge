@@ -24,6 +24,7 @@ import SignalTrackerTab from '@/components/dashboard/SignalTrackerTab';
 import DiagnosticsTab from '@/components/dashboard/DiagnosticsTab';
 import EntropyTab from '@/components/dashboard/EntropyTab';
 import AVWAPTab from '@/components/avwap/AVWAPTab';
+import FlowDeskTab from '@/components/flowdesk/FlowDeskTab';
 import PaperMonitor from '@/components/dashboard/PaperMonitor';
 import TrackerMonitor from '@/components/dashboard/TrackerMonitor';
 import CorrelationPanel from '@/components/dashboard/CorrelationPanel';
@@ -138,9 +139,14 @@ function ChainTab() {
 }
 
 export default function DashboardPage() {
-  const { loadSymbol, symbol, fetchQuote, activeTab } = useDashboardStore();
+  const { loadSymbol, symbol, fetchQuote, activeTab, setActiveTab } = useDashboardStore();
 
   useEffect(() => { loadSymbol('SPY'); }, [loadSymbol]);
+  // Deep link: /?tab=flowdesk (&panel=…&demo=1 handled by the Flow Desk itself)
+  useEffect(() => {
+    const tab = new URLSearchParams(window.location.search).get('tab');
+    if (tab === 'flowdesk') setActiveTab('flowdesk');
+  }, [setActiveTab]);
   useEffect(() => {
     const iv = setInterval(fetchQuote, 30000);
     return () => clearInterval(iv);
@@ -179,6 +185,7 @@ export default function DashboardPage() {
         <TabNav />
         <div className="min-h-[500px]">
           {activeTab === 'overview' && <OverviewTab />}
+          {activeTab === 'flowdesk' && <FlowDeskTab />}
           {activeTab === 'dealer' && <DealerTab />}
           {activeTab === 'volatility' && <VolatilityTab />}
           {activeTab === 'analytics' && <AnalyticsTab />}
